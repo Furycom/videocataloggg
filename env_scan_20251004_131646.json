@@ -1,0 +1,133 @@
+﻿{
+    "timestamp":  "2025-10-04T13:16:50",
+    "baseFolder":  "C:\\Users\\Administrator\\VideoCatalog",
+    "computer":  {
+                     "productName":  "Windows 10 Education",
+                     "version":  "2009",
+                     "osBuild":  "26100",
+                     "isAdmin":  true,
+                     "executionPolicyLocalMachine":  5,
+                     "wslStatus":  [
+                                       "D\u0000e\u0000f\u0000a\u0000u\u0000l\u0000t\u0000 \u0000D\u0000i\u0000s\u0000t\u0000r\u0000i\u0000b\u0000u\u0000t\u0000i\u0000o\u0000n\u0000:\u0000 \u0000d\u0000o\u0000c\u0000k\u0000e\u0000r\u0000-\u0000d\u0000e\u0000s\u0000k\u0000t\u0000o\u0000p\u0000",
+                                       "\u0000",
+                                       "\u0000D\u0000e\u0000f\u0000a\u0000u\u0000l\u0000t\u0000 \u0000V\u0000e\u0000r\u0000s\u0000i\u0000o\u0000n\u0000:\u0000 \u00002\u0000",
+                                       "\u0000",
+                                       "\u0000"
+                                   ]
+                 },
+    "env":  {
+                "path":  "C:\\Python310\\Scripts\\;C:\\Python310\\;C:\\Program Files (x86)\\Common Files\\Intel\\Shared Libraries\\redist\\intel64\\compiler;C:\\WINDOWS\\system32;C:\\WINDOWS;C:\\WINDOWS\\System32\\Wbem;C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\;C:\\WINDOWS\\System32\\OpenSSH\\;C:\\Program Files\\NVIDIA Corporation\\NVIDIA app\\NvDLISR;C:\\Program Files (x86)\\NVIDIA Corporation\\PhysX\\Common;C:\\Program Files\\Docker\\Docker\\resources\\bin;C:\\Program Files\\Topaz Labs LLC\\Topaz Gigapixel AI\\bin\\;C:\\Program Files\\dotnet\\;C:\\Program Files\\Git\\cmd;C:\\Program Files\\nodejs\\;C:\\ProgramData\\chocolatey\\bin;C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python313\\Scripts\\;C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python313\\;C:\\Users\\Administrator\\AppData\\Local\\Microsoft\\WindowsApps;;C:\\Users\\Administrator\\AppData\\Local\\Programs\\Ollama;C:\\Users\\Administrator\\AppData\\Local\\Programs\\cursor\\resources\\app\\bin;C:\\Users\\Administrator\\AppData\\Roaming\\npm",
+                "user":  "Administrator",
+                "host":  "WIN-SKKNGPMS1C5"
+            },
+    "tools":  {
+                  "python":  {
+                                 "name":  "python",
+                                 "found":  true,
+                                 "path":  "C:\\Python310\\python.exe",
+                                 "version":  "Python 3.10.11",
+                                 "raw":  "Python 3.10.11"
+                             },
+                  "py":  {
+                             "name":  "py",
+                             "found":  true,
+                             "path":  "C:\\WINDOWS\\py.exe",
+                             "version":  "Python 3.13.5",
+                             "raw":  "Python 3.13.5"
+                         },
+                  "pip":  {
+                              "name":  "pip",
+                              "found":  true,
+                              "path":  "C:\\Python310\\Scripts\\pip.exe",
+                              "version":  "pip 23.0.1 from C:\\Python310\\lib\\site-packages\\pip (python 3.10)",
+                              "raw":  "pip 23.0.1 from C:\\Python310\\lib\\site-packages\\pip (python 3.10)"
+                          },
+                  "ffmpeg":  {
+                                 "name":  "ffmpeg",
+                                 "found":  true,
+                                 "path":  "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe",
+                                 "version":  "ffmpeg version 7.1.1-essentials_build-www.gyan.dev Copyright (c) 2000-2025 the FFmpeg developers",
+                                 "raw":  "ffmpeg version 7.1.1-essentials_build-www.gyan.dev Copyright (c) 2000-2025 the FFmpeg developers\r\nbuilt with gcc 14.2.0 (Rev1, Built by MSYS2 project)\r\nconfiguration: --enable-gpl --enable-version3 --enable-static --disable-w32threads --disable-autodetect --enable-fontconfig --enable-iconv --enable-gnutls --enable-libxml2 --enable-gmp --enable-bzlib --enable-lzma --enable-zlib --enable-libsrt --enable-libssh --enable-libzmq --enable-avisynth --enable-sdl2 --enable-libwebp --enable-libx264 --enable-libx265 --enable-libxvid --enable-libaom --enable-libopenjpeg --enable-libvpx --enable-mediafoundation --enable-libass --enable-libfreetype --enable-libfribidi --enable-libharfbuzz --enable-libvidstab --enable-libvmaf --enable-libzimg --enable-amf --enable-cuda-llvm --enable-cuvid --enable-dxva2 --enable-d3d11va --enable-d3d12va --enable-ffnvcodec --enable-libvpl --enable-nvdec --enable-nvenc --enable-vaapi --enable-libgme --enable-libopenmpt --enable-libopencore-amrwb --enable-libmp3lame --enable-libtheora --enable-libvo-amrwbenc --enable-libgsm --enable-libopencore-amrnb --enable-libopus --enable-libspeex --enable-libvorbis --enable-librubberband\r\nlibavutil      59. 39.100 / 59. 39.100\r\nlibavcodec     61. 19.101 / 61. 19.101\r\nlibavformat    61.  7.100 / 61.  7.100\r\nlibavdevice    61.  3.100 / 61.  3.100\r\nlibavfilter    10.  4.100 / 10.  4.100\r\nlibswscale      8.  3.100 /  8.  3.100\r\nlibswresample   5.  3.100 /  5.  3.100\r\nlibpostproc    58.  3.100 / 58.  3.100"
+                             },
+                  "mediainfo":  {
+                                    "name":  "mediainfo",
+                                    "found":  false,
+                                    "path":  null,
+                                    "version":  null,
+                                    "raw":  null
+                                },
+                  "blake3":  {
+                                 "name":  "blake3",
+                                 "found":  false,
+                                 "path":  null,
+                                 "version":  null,
+                                 "raw":  null
+                             },
+                  "smartctl":  {
+                                   "name":  "smartctl",
+                                   "found":  false,
+                                   "path":  null,
+                                   "version":  null,
+                                   "raw":  null
+                               },
+                  "sqlite3":  {
+                                  "name":  "sqlite3",
+                                  "found":  false,
+                                  "path":  null,
+                                  "version":  null,
+                                  "raw":  null
+                              }
+              },
+    "volumes":  [
+                    {
+                        "driveLetter":  null,
+                        "label":  "",
+                        "fileSystem":  "NTFS",
+                        "sizeBytes":  641724416,
+                        "freeBytes":  113659904
+                    },
+                    {
+                        "driveLetter":  null,
+                        "label":  "",
+                        "fileSystem":  "FAT32",
+                        "sizeBytes":  100663296,
+                        "freeBytes":  65839104
+                    },
+                    {
+                        "driveLetter":  "C",
+                        "label":  "Win11",
+                        "fileSystem":  "NTFS",
+                        "sizeBytes":  999438675968,
+                        "freeBytes":  603458826240
+                    },
+                    {
+                        "driveLetter":  "D",
+                        "label":  "D-drive",
+                        "fileSystem":  "NTFS",
+                        "sizeBytes":  6001175089152,
+                        "freeBytes":  3652609118208
+                    }
+                ],
+    "diskMap":  [
+                    {
+                        "logicalDrive":  "C:",
+                        "volumeLabel":  "Win11",
+                        "diskModel":  "Lexar SSD NQ790 1TB",
+                        "diskSerial":  "0000_0006_2403_2331_CAF2_5B05_2000_1110.",
+                        "diskSizeBytes":  1000202273280,
+                        "interface":  "SCSI",
+                        "mediaType":  "Fixed hard disk media",
+                        "pnpId":  "SCSI\\DISK\u0026VEN_NVME\u0026PROD_LEXAR_SSD_NQ790\\5\u0026294FA90F\u00260\u0026000000"
+                    },
+                    {
+                        "logicalDrive":  "D:",
+                        "volumeLabel":  "D-drive",
+                        "diskModel":  "ST6000DM003-2CY186",
+                        "diskSerial":  "            ZF303JYB",
+                        "diskSizeBytes":  6001172513280,
+                        "interface":  "IDE",
+                        "mediaType":  "Fixed hard disk media",
+                        "pnpId":  "SCSI\\DISK\u0026VEN_\u0026PROD_ST6000DM003-2CY1\\4\u002611742CA2\u00260\u0026060000"
+                    }
+                ]
+}

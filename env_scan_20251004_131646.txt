@@ -1,0 +1,25 @@
+﻿ENV DIAGNOSTIC - 2025-10-04 13:16:50Z
+Base folder: C:\Users\Administrator\VideoCatalog
+
+Windows: Windows 10 Education v2009 (Build 26100)
+Admin: True   ExecutionPolicy(LocalMachine): Undefined
+
+TOOLS:
+ - python     found=True path=C:\Python310\python.exe  v='Python 3.10.11'
+ - py         found=True path=C:\WINDOWS\py.exe  v='Python 3.13.5'
+ - pip        found=True path=C:\Python310\Scripts\pip.exe  v='pip 23.0.1 from C:\Python310\lib\site-packages\pip (python 3.10)'
+ - ffmpeg     found=True path=C:\ProgramData\chocolatey\bin\ffmpeg.exe  v='ffmpeg version 7.1.1-essentials_build-www.gyan.dev Copyright (c) 2000-2025 the FFmpeg developers'
+ - mediainfo  found=False path=  v=''
+ - blake3     found=False path=  v=''
+ - smartctl   found=False path=  v=''
+ - sqlite3    found=False path=  v=''
+
+VOLUMES:
+ - : '' FS=NTFS Size=0,6GB Free=0,11GB
+ - : '' FS=FAT32 Size=0,09GB Free=0,06GB
+ - C: 'Win11' FS=NTFS Size=930,8GB Free=562,01GB
+ - D: 'D-drive' FS=NTFS Size=5589,03GB Free=3401,76GB
+
+DISK MAP (letter -> physical disk):
+ - C: (label='Win11') -> Lexar SSD NQ790 1TB | SN=0000_0006_2403_2331_CAF2_5B05_2000_1110. | SCSI | 931,51GB
+ - D: (label='D-drive') -> ST6000DM003-2CY186 | SN=            ZF303JYB | IDE | 5589,03GB

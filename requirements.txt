@@ -1,0 +1,4 @@
+﻿blake3
+tqdm
+rich
+sqlite-utils
