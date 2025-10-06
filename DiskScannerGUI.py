@@ -171,6 +171,10 @@ def init_shard(shard_path: str):
     CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
     CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_blake3);
     """)
+    # integrity_ok semantics:
+    #   1 → MediaInfo/scan succeeded (or non-A/V file)
+    #   0 → MediaInfo reported an error for the file
+    #   NULL → MediaInfo not executed (tool missing/disabled)
     con.commit()
     con.close()
 
@@ -280,7 +284,10 @@ class ScannerWorker(threading.Thread):
                         if ext in AV_EXTS:
                             mi = mediainfo_json(fp)
                             hb3 = blake3_hash(fp) if self.blake_for_av else None
-                            ok = 1 if (mi is not None and "error" not in mi) else 0
+                            if mi is None:
+                                ok = None
+                            else:
+                                ok = 1 if "error" not in mi else 0
                             batch.append((fp, size, 1, hb3, json.dumps(mi, ensure_ascii=False) if mi else None, ok, mtime))
                             done_av += 1
                         else:
