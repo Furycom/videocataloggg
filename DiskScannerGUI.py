@@ -2,7 +2,7 @@
 # Requiert: Python 3.10+, mediainfo (CLI), sqlite3 (intégré), smartctl/ffmpeg optionnels, blake3 (pip)
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
-import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile
+import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -175,11 +175,11 @@ def init_shard(shard_path: str):
     con.close()
 
 # ---------------- Scanner worker ----------------
-class ScannerThread(threading.Thread):
+class ScannerWorker(threading.Thread):
     def __init__(self, label: str, mount: str, notes: str, dtype: str,
                  db_catalog: str, blake_for_av: bool, stop_evt: threading.Event,
-                 progress_cb=None):
-        super().__init__(daemon=True)
+                 event_queue: "queue.Queue[dict]"):
+        super().__init__(daemon=False)
         self.label = label
         self.mount = mount
         self.notes = notes
@@ -187,103 +187,133 @@ class ScannerThread(threading.Thread):
         self.db_catalog = db_catalog
         self.blake_for_av = blake_for_av
         self.stop_evt = stop_evt
-        self.progress_cb = progress_cb
+        self.queue = event_queue
         self.job_id: Optional[int] = None
 
+    def _put(self, payload: dict):
+        try:
+            self.queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
     def run(self):
+        try:
+            self._run()
+        except Exception as exc:
+            log(f"[ScannerWorker] fatal error: {exc}")
+            self._put({"type": "error", "title": "Scan error", "message": str(exc)})
+            self._put({"type": "done", "status": "Error"})
+
+    def _run(self):
         mount = Path(self.mount)
         if not mount.exists():
-            messagebox.showerror("Scan error", f"Mount path not found: {self.mount}")
+            self._put({"type": "error", "title": "Scan error", "message": f"Mount path not found: {self.mount}"})
+            self._put({"type": "done", "status": "Error"})
             return
-
-        catalog = sqlite3.connect(self.db_catalog, check_same_thread=False)
-        ccur = catalog.cursor()
 
         shard_path = Path(SHARDS_DIR) / f"{self.label}.db"
         os.makedirs(SHARDS_DIR, exist_ok=True)
-        init_shard(str(shard_path))
-        shard = sqlite3.connect(str(shard_path), check_same_thread=False)
-        scur = shard.cursor()
 
-        # 1) Pré-scan
+        self._put({"type": "status", "message": "Enumerating files…"})
         all_files = []
-        for root, _, files in os.walk(mount):
+        for root_dir, _, files in os.walk(mount):
             for f in files:
-                all_files.append(os.path.join(root, f))
+                all_files.append(os.path.join(root_dir, f))
         total_all = len(all_files)
         total_av = sum(1 for p in all_files if Path(p).suffix.lower() in AV_EXTS)
 
-        # 2) Mise à jour du drive
-        total_bytes, free_bytes = disk_usage_bytes(mount)
+        started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         smart_blob = try_smart_overview()
-        ccur.execute("""
-        INSERT INTO drives(label, mount_path, fs_format, total_bytes, free_bytes, smart_scan, scanned_at, drive_type, notes, scan_mode)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(label) DO UPDATE SET
-            mount_path=excluded.mount_path, fs_format=excluded.fs_format, total_bytes=excluded.total_bytes,
-            free_bytes=excluded.free_bytes, smart_scan=excluded.smart_scan, scanned_at=excluded.scanned_at,
-            drive_type=excluded.drive_type, notes=excluded.notes, scan_mode=excluded.scan_mode
-        """, (self.label, str(mount), None, total_bytes, free_bytes, smart_blob,
-              datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), self.dtype, self.notes, "Auto"))
-        catalog.commit()
+        total_bytes, free_bytes = disk_usage_bytes(mount)
 
-        # 3) Job
-        ccur.execute("""INSERT INTO jobs(drive_label, started_at, status, total_av, total_all, done_av, duration_sec, message)
-                        VALUES(?, datetime('now'), 'Running', ?, ?, 0, NULL, ?)""",
-                     (self.label, total_av, total_all, f"Found AV {total_av} / Total {total_all}"))
-        self.job_id = ccur.lastrowid
-        catalog.commit()
+        with sqlite3.connect(self.db_catalog) as catalog:
+            ccur = catalog.cursor()
+            ccur.execute("""
+            INSERT INTO drives(label, mount_path, fs_format, total_bytes, free_bytes, smart_scan, scanned_at, drive_type, notes, scan_mode)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(label) DO UPDATE SET
+                mount_path=excluded.mount_path, fs_format=excluded.fs_format, total_bytes=excluded.total_bytes,
+                free_bytes=excluded.free_bytes, smart_scan=excluded.smart_scan, scanned_at=excluded.scanned_at,
+                drive_type=excluded.drive_type, notes=excluded.notes, scan_mode=excluded.scan_mode
+            """, (self.label, str(mount), None, total_bytes, free_bytes, smart_blob,
+                  started_at, self.dtype, self.notes, "Auto"))
 
-        log(f"[Job {self.job_id}] Found AV {total_av} of TOTAL {total_all} at {self.mount}")
+            ccur.execute("""INSERT INTO jobs(drive_label, started_at, status, total_av, total_all, done_av, duration_sec, message)
+                            VALUES(?, datetime('now'), 'Running', ?, ?, 0, NULL, ?)""",
+                         (self.label, total_av, total_all, f"Found AV {total_av} / Total {total_all}"))
+            self.job_id = ccur.lastrowid
+            catalog.commit()
 
-        t0 = time.perf_counter()
-        done_av = 0
+            log(f"[Job {self.job_id}] Found AV {total_av} of TOTAL {total_all} at {self.mount}")
+            self._put({"type": "refresh_jobs"})
 
-        # Nettoyage shard et écriture par batch
-        scur.execute("DELETE FROM files")
-        shard.commit()
-        batch = []
-        BATCH_SIZE = 200
+            init_shard(str(shard_path))
+            self._put({"type": "status", "message": "Scanning files…"})
 
-        def flush():
-            if not batch: return
-            scur.executemany("""INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc)
-                                VALUES(?,?,?,?,?,?,?)""", batch)
-            shard.commit()
-            batch.clear()
+            t0 = time.perf_counter()
+            done_av = 0
+            batch = []
+            BATCH_SIZE = 200
 
-        for idx, fp in enumerate(all_files, start=1):
-            if self.stop_evt.is_set(): break
-            try:
-                p = Path(fp); ext = p.suffix.lower()
-                st = p.stat(); size = st.st_size
-                mtime = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with sqlite3.connect(str(shard_path)) as shard:
+                scur = shard.cursor()
+                scur.execute("DELETE FROM files")
 
-                if ext in AV_EXTS:
-                    mi = mediainfo_json(fp)
-                    hb3 = blake3_hash(fp) if self.blake_for_av else None
-                    ok = 1 if (mi is not None and "error" not in mi) else 0
-                    batch.append((fp, size, 1, hb3, json.dumps(mi, ensure_ascii=False) if mi else None, ok, mtime))
-                    done_av += 1
-                else:
-                    batch.append((fp, size, 0, None, None, 1, mtime))
+                def flush():
+                    if not batch:
+                        return
+                    scur.executemany("""INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc)
+                                        VALUES(?,?,?,?,?,?,?)""", batch)
+                    shard.commit()
+                    batch.clear()
 
-                if len(batch) >= BATCH_SIZE: flush()
-                if self.progress_cb and (idx % 500 == 0 or idx == total_all):
-                    self.progress_cb(done_av, total_av, idx, total_all)
-            except Exception as e:
-                log(f"[job {self.job_id}] error on {fp}: {e}")
-                batch.append((fp, None, 0, None, json.dumps({"error":str(e)}), 0, None))
+                for idx, fp in enumerate(all_files, start=1):
+                    if self.stop_evt.is_set():
+                        break
+                    try:
+                        p = Path(fp)
+                        ext = p.suffix.lower()
+                        st = p.stat()
+                        size = st.st_size
+                        mtime = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        flush()
-        duration = int(time.perf_counter() - t0)
-        status = "Stopped" if self.stop_evt.is_set() else "Done"
-        ccur.execute("""UPDATE jobs SET finished_at=datetime('now'), status=?, done_av=?, duration_sec=?, message=?
-                        WHERE id=?""",
-                     (status, done_av, duration, f"Completed ({done_av}/{total_av}); scanned {total_all} files total", self.job_id))
-        catalog.commit()
-        shard.close()
-        catalog.close()
+                        if ext in AV_EXTS:
+                            mi = mediainfo_json(fp)
+                            hb3 = blake3_hash(fp) if self.blake_for_av else None
+                            ok = 1 if (mi is not None and "error" not in mi) else 0
+                            batch.append((fp, size, 1, hb3, json.dumps(mi, ensure_ascii=False) if mi else None, ok, mtime))
+                            done_av += 1
+                        else:
+                            batch.append((fp, size, 0, None, None, 1, mtime))
+
+                        if len(batch) >= BATCH_SIZE:
+                            flush()
+
+                        if idx % 500 == 0 or idx == total_all:
+                            self._put({
+                                "type": "progress",
+                                "done_av": done_av,
+                                "total_av": total_av,
+                                "done_all": idx,
+                                "total_all": total_all
+                            })
+                    except Exception as e:
+                        log(f"[job {self.job_id}] error on {fp}: {e}")
+                        batch.append((fp, None, 0, None, json.dumps({"error": str(e)}), 0, None))
+
+                flush()
+
+            duration = int(time.perf_counter() - t0)
+            status = "Stopped" if self.stop_evt.is_set() else "Done"
+            ccur.execute("""UPDATE jobs SET finished_at=datetime('now'), status=?, done_av=?, duration_sec=?, message=?
+                            WHERE id=?""",
+                         (status, done_av, duration, f"Completed ({done_av}/{total_av}); scanned {total_all} files total", self.job_id))
+            catalog.commit()
+
+            self._put({"type": "refresh_jobs"})
+            final_msg = "Scan stopped." if self.stop_evt.is_set() else "Scan complete."
+            self._put({"type": "status", "message": final_msg})
+            self._put({"type": "done", "status": status})
 
 # ---------------- GUI ----------------
 class App:
@@ -301,11 +331,16 @@ class App:
 
         # worker state
         self.stop_evt: Optional[threading.Event] = None
-        self.worker:   Optional[ScannerThread]   = None
+        self.worker: Optional[ScannerWorker] = None
+        self.worker_queue: "queue.Queue[dict]" = queue.Queue()
+        self._closing = False
 
         self._build_menu()
         self._build_form()
         self._build_tables()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(200, self._poll_worker_queue)
 
         for d in (SCANS_DIR, LOGS_DIR, EXPORTS_DIR, SHARDS_DIR):
             os.makedirs(d, exist_ok=True)
@@ -539,7 +574,8 @@ class App:
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Busy", "A scan is already running."); return
         self.stop_evt = threading.Event()
-        self.worker = ScannerThread(
+        self._clear_worker_queue()
+        self.worker = ScannerWorker(
             label=self.label_var.get().strip(),
             mount=self.path_var.get().strip(),
             notes=self.notes_var.get().strip(),
@@ -547,20 +583,71 @@ class App:
             db_catalog=self.db_path.get(),
             blake_for_av=bool(self.blake_var.get()),
             stop_evt=self.stop_evt,
-            progress_cb=self._on_progress
+            event_queue=self.worker_queue
         )
-        self.status_var.set("Scanning…"); self.progress["value"] = 0
+        self.status_var.set("Scanning…")
+        self.progress["value"] = 0
+        self.progress["maximum"] = 1
         self.worker.start()
         self.root.after(800, self.refresh_jobs)
 
     def stop_scan(self):
-        if self.stop_evt: self.stop_evt.set()
+        if self.stop_evt:
+            self.stop_evt.set()
         self.status_var.set("Stopping…")
 
     # ----- Progress & refresh
-    def _on_progress(self, done_av: int, total_av: int, done_all: int, total_all: int):
-        self.status_var.set(f"Scanned AV {done_av}/{total_av} | ALL {done_all}/{total_all}")
-        self.progress["maximum"] = max(1, total_all); self.progress["value"] = done_all
+    def _clear_worker_queue(self):
+        try:
+            while True:
+                self.worker_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _poll_worker_queue(self):
+        try:
+            while True:
+                event = self.worker_queue.get_nowait()
+                self._handle_worker_event(event)
+        except queue.Empty:
+            pass
+        finally:
+            if not self._closing:
+                self.root.after(200, self._poll_worker_queue)
+
+    def _handle_worker_event(self, event: dict):
+        etype = event.get("type")
+        if etype == "progress":
+            self.progress["maximum"] = max(1, event.get("total_all", 1))
+            self.progress["value"] = event.get("done_all", 0)
+            total_av = event.get("total_av", 0)
+            done_av = event.get("done_av", 0)
+            done_all = event.get("done_all", 0)
+            total_all = event.get("total_all", 0)
+            self.status_var.set(f"Scanned AV {done_av}/{total_av} | ALL {done_all}/{total_all}")
+        elif etype == "status":
+            self.status_var.set(event.get("message", ""))
+        elif etype == "refresh_jobs":
+            self.refresh_jobs()
+        elif etype == "error":
+            messagebox.showerror(event.get("title", "Error"), event.get("message", ""))
+        elif etype == "done":
+            self._await_worker_completion()
+            status = event.get("status", "Ready")
+            if status == "Done":
+                self.status_var.set("Ready.")
+            elif status == "Stopped":
+                self.status_var.set("Scan stopped.")
+            else:
+                self.status_var.set(status)
+            self.progress["value"] = 0
+            self.progress["maximum"] = 1
+
+    def _try_finalize_worker(self):
+        if self.worker and not self.worker.is_alive():
+            self.worker.join()
+            self.worker = None
+            self.stop_evt = None
 
     def refresh_all(self):
         self.refresh_drives(); self.refresh_jobs()
@@ -588,8 +675,30 @@ class App:
         con.close()
         if self.worker and self.worker.is_alive():
             self.root.after(1200, self.refresh_jobs)
+        elif not (self.worker and self.worker.is_alive()):
+            if self.worker is None:
+                self.status_var.set("Ready.")
+
+    def on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        if self.worker and self.worker.is_alive():
+            if self.stop_evt:
+                self.stop_evt.set()
+            self.status_var.set("Stopping…")
+            self._await_worker_completion(self.root.destroy)
         else:
-            self.status_var.set("Ready.")
+            self.root.destroy()
+
+    def _await_worker_completion(self, on_complete=None):
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=0.1)
+            self.root.after(100, lambda: self._await_worker_completion(on_complete))
+        else:
+            self._try_finalize_worker()
+            if on_complete:
+                on_complete()
 
 # ---------------- main ----------------
 def main():
