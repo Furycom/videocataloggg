@@ -1,8 +1,18 @@
-﻿import os, sys, sqlite3, json, time, shutil, subprocess
+import os, sys, sqlite3, json, time, shutil, subprocess, importlib
+import importlib.util
 from pathlib import Path
 from typing import Optional
-from tqdm import tqdm
-from blake3 import blake3
+import hashlib
+
+_tqdm_spec = importlib.util.find_spec("tqdm")
+if _tqdm_spec is None:
+    def tqdm(iterable, **kwargs):
+        return iterable
+else:
+    tqdm = importlib.import_module("tqdm").tqdm
+
+_blake3_spec = importlib.util.find_spec("blake3")
+_blake3_hash = importlib.import_module("blake3").blake3 if _blake3_spec is not None else None
 
 VIDEO_EXTS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.ts','.m2ts','.webm','.mpg','.mpeg'}
 
@@ -28,11 +38,15 @@ def ffmpeg_verify(file_path: str) -> bool:
     return code == 0
 
 def hash_blake3(file_path: str, chunk: int = 1024*1024) -> str:
-    h = blake3()
+    if _blake3_hash is None:
+        h = hashlib.sha256()
+    else:
+        h = _blake3_hash()
     with open(file_path, "rb") as f:
         while True:
             b = f.read(chunk)
-            if not b: break
+            if not b:
+                break
             h.update(b)
     return h.hexdigest()
 
