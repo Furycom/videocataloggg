@@ -21,21 +21,34 @@ def _has_cmd(cmd: str) -> bool:
 
 
 _ffmpeg_available = _has_cmd("ffmpeg")
+_mediainfo_available = _has_cmd("mediainfo")
 
 VIDEO_EXTS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.ts','.m2ts','.webm','.mpg','.mpeg'}
 
 def run(cmd:list[str]) -> tuple[int,str,str]:
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
-    out, err = p.communicate()
-    return p.returncode, out, err
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
+        out, err = p.communicate()
+        return p.returncode, out, err
+    except FileNotFoundError as exc:
+        # Mirror the return signature while preventing the whole scan from
+        # crashing when optional CLI dependencies (mediainfo/smartctl/ffmpeg)
+        # are not installed.
+        return 127, "", str(exc)
 
 def mediainfo_json(file_path: str) -> Optional[dict]:
+    if not _mediainfo_available:
+        return None
     code, out, err = run(["mediainfo", "--Output=JSON", file_path])
     if code == 0 and out.strip():
         try:
             return json.loads(out)
         except Exception:
             return None
+    if code == 127:
+        # Command missing – treat as unavailable for the remainder of the scan
+        global _mediainfo_available
+        _mediainfo_available = False
     return None
 
 def ffmpeg_verify(file_path: str) -> bool:
