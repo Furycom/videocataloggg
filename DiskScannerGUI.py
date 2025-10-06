@@ -219,12 +219,18 @@ class ScannerWorker(threading.Thread):
         os.makedirs(SHARDS_DIR, exist_ok=True)
 
         self._put({"type": "status", "message": "Enumerating files…"})
-        all_files = []
-        for root_dir, _, files in os.walk(mount):
-            for f in files:
-                all_files.append(os.path.join(root_dir, f))
-        total_all = len(all_files)
-        total_av = sum(1 for p in all_files if Path(p).suffix.lower() in AV_EXTS)
+
+        def iter_files(base: Path):
+            for root_dir, _, files in os.walk(base):
+                for name in files:
+                    yield os.path.join(root_dir, name)
+
+        total_all = 0
+        total_av = 0
+        for fp in iter_files(mount):
+            total_all += 1
+            if Path(fp).suffix.lower() in AV_EXTS:
+                total_av += 1
 
         started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         smart_blob = try_smart_overview()
@@ -271,7 +277,7 @@ class ScannerWorker(threading.Thread):
                     shard.commit()
                     batch.clear()
 
-                for idx, fp in enumerate(all_files, start=1):
+                for idx, fp in enumerate(iter_files(mount), start=1):
                     if self.stop_evt.is_set():
                         break
                     try:
