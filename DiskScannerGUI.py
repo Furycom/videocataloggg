@@ -3,14 +3,16 @@
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
 import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from tkinter import (
     Tk, Label, Entry, Button, StringVar, IntVar, END, N, S, E, W,
-    filedialog, messagebox, ttk, Menu
+    filedialog, messagebox, ttk, Menu, Spinbox
 )
+from tkinter.scrolledtext import ScrolledText
 
 # ---------------- Config & constantes ----------------
 BASE_DIR   = r"C:\Users\Administrator\VideoCatalog"
@@ -31,11 +33,33 @@ AUDIO_EXTS = {
 AV_EXTS = VIDEO_EXTS | AUDIO_EXTS
 
 # ---------------- Utilitaires ----------------
+_LOG_LISTENERS: list = []
+_LOG_LISTENERS_LOCK = threading.Lock()
+
+def register_log_listener(callback):
+    with _LOG_LISTENERS_LOCK:
+        _LOG_LISTENERS.append(callback)
+
+def unregister_log_listener(callback):
+    with _LOG_LISTENERS_LOCK:
+        try:
+            _LOG_LISTENERS.remove(callback)
+        except ValueError:
+            pass
+
 def log(s: str):
     os.makedirs(LOGS_DIR, exist_ok=True)
     line = f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%SZ')}] {s}"
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+    listeners = []
+    with _LOG_LISTENERS_LOCK:
+        listeners = list(_LOG_LISTENERS)
+    for cb in listeners:
+        try:
+            cb(line)
+        except Exception:
+            pass
 
 @lru_cache(maxsize=None)
 def has_cmd(cmd: str) -> bool:
@@ -155,14 +179,19 @@ def init_catalog(db_path: str):
     con.commit()
     con.close()
 
-def init_shard(shard_path: str):
-    con = sqlite3.connect(shard_path)
+def _ensure_shard_schema(con: sqlite3.Connection):
     cur = con.cursor()
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS files(
           id INTEGER PRIMARY KEY,
-          path TEXT NOT NULL
+          path TEXT NOT NULL,
+          size_bytes INTEGER,
+          is_av INTEGER,
+          hash_blake3 TEXT,
+          media_json TEXT,
+          integrity_ok INTEGER,
+          mtime_utc TEXT
         )
     """)
 
@@ -189,13 +218,20 @@ def init_shard(shard_path: str):
     #   0 → MediaInfo reported an error for the file
     #   NULL → MediaInfo not executed (tool missing/disabled)
     con.commit()
-    con.close()
+
+
+def init_shard(shard_path: str):
+    con = sqlite3.connect(shard_path)
+    try:
+        _ensure_shard_schema(con)
+    finally:
+        con.close()
 
 # ---------------- Scanner worker ----------------
 class ScannerWorker(threading.Thread):
     def __init__(self, label: str, mount: str, notes: str, dtype: str,
-                 db_catalog: str, blake_for_av: bool, stop_evt: threading.Event,
-                 event_queue: "queue.Queue[dict]"):
+                 db_catalog: str, blake_for_av: bool, max_workers: int,
+                 stop_evt: threading.Event, event_queue: "queue.Queue[dict]"):
         super().__init__(daemon=False)
         self.label = label
         self.mount = mount
@@ -203,6 +239,7 @@ class ScannerWorker(threading.Thread):
         self.dtype = dtype
         self.db_catalog = db_catalog
         self.blake_for_av = blake_for_av
+        self.max_workers = max(1, int(max_workers))
         self.stop_evt = stop_evt
         self.queue = event_queue
         self.job_id: Optional[int] = None
@@ -248,12 +285,13 @@ class ScannerWorker(threading.Thread):
                 for name in files:
                     yield os.path.join(root_dir, name)
 
-        total_all = 0
+        all_files: list[str] = []
         total_av = 0
         for fp in iter_files(mount):
-            total_all += 1
+            all_files.append(fp)
             if Path(fp).suffix.lower() in AV_EXTS:
                 total_av += 1
+        total_all = len(all_files)
 
         started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         smart_blob = try_smart_overview()
@@ -285,10 +323,14 @@ class ScannerWorker(threading.Thread):
 
             t0 = time.perf_counter()
             done_av = 0
+            processed_all = 0
             batch = []
             BATCH_SIZE = 200
+            max_workers = max(1, min(self.max_workers, 32))
+            log(f"[Job {self.job_id}] scanning with {max_workers} worker thread(s)")
 
             with sqlite3.connect(str(shard_path)) as shard:
+                _ensure_shard_schema(shard)
                 scur = shard.cursor()
                 scur.execute("DELETE FROM files")
 
@@ -299,43 +341,73 @@ class ScannerWorker(threading.Thread):
                                         VALUES(?,?,?,?,?,?,?)""", batch)
                     shard.commit()
                     batch.clear()
+                
+                def handle_result(result):
+                    nonlocal processed_all, done_av
+                    if not result:
+                        return
+                    row, av_inc = result
+                    if row is None:
+                        return
+                    batch.append(row)
+                    if len(batch) >= BATCH_SIZE:
+                        flush()
+                    processed_all += 1
+                    if av_inc:
+                        done_av += av_inc
+                    if processed_all % 200 == 0 or processed_all == total_all:
+                        self._put({
+                            "type": "progress",
+                            "done_av": done_av,
+                            "total_av": total_av,
+                            "done_all": processed_all,
+                            "total_all": total_all
+                        })
 
-                for idx, fp in enumerate(iter_files(mount), start=1):
+                def process_file(fp: str):
                     if self.stop_evt.is_set():
-                        break
+                        return None
                     try:
                         p = Path(fp)
                         ext = p.suffix.lower()
                         st = p.stat()
                         size = st.st_size
                         mtime = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
-
                         if ext in AV_EXTS:
                             mi = mediainfo_json(fp)
                             hb3 = blake3_hash(fp) if self.blake_for_av else None
                             if mi is None:
                                 ok = None
+                                media_blob = None
                             else:
                                 ok = 1 if "error" not in mi else 0
-                            batch.append((fp, size, 1, hb3, json.dumps(mi, ensure_ascii=False) if mi else None, ok, mtime))
-                            done_av += 1
-                        else:
-                            batch.append((fp, size, 0, None, None, 1, mtime))
-
-                        if len(batch) >= BATCH_SIZE:
-                            flush()
-
-                        if idx % 500 == 0 or idx == total_all:
-                            self._put({
-                                "type": "progress",
-                                "done_av": done_av,
-                                "total_av": total_av,
-                                "done_all": idx,
-                                "total_all": total_all
-                            })
+                                media_blob = json.dumps(mi, ensure_ascii=False)
+                            return ((fp, size, 1, hb3, media_blob, ok, mtime), 1 if ok in (0, 1) else 0)
+                        return ((fp, size, 0, None, None, 1, mtime), 0)
                     except Exception as e:
                         log(f"[job {self.job_id}] error on {fp}: {e}")
-                        batch.append((fp, None, 0, None, json.dumps({"error": str(e)}), 0, None))
+                        return ((fp, None, 0, None, json.dumps({"error": str(e)}, ensure_ascii=False), 0, None), 0)
+
+                if max_workers > 1 and len(all_files) > 1:
+                    def _iter_inputs():
+                        for fp in all_files:
+                            if self.stop_evt.is_set():
+                                break
+                            yield fp
+
+                    executor = ThreadPoolExecutor(max_workers=max_workers)
+                    try:
+                        for result in executor.map(process_file, _iter_inputs(), chunksize=8):
+                            handle_result(result)
+                            if self.stop_evt.is_set():
+                                break
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    for fp in all_files:
+                        if self.stop_evt.is_set():
+                            break
+                        handle_result(process_file(fp))
 
                 flush()
 
@@ -364,6 +436,10 @@ class App:
         self.type_var  = StringVar()
         self.notes_var = StringVar()
         self.blake_var = IntVar(value=0)
+        cpu_count = os.cpu_count() or 1
+        default_threads = min(8, max(1, (cpu_count // 2) or 1))
+        self.threads_var = IntVar(value=default_threads)
+        self.log_lines: list[str] = []
 
         # worker state
         self.stop_evt: Optional[threading.Event] = None
@@ -374,6 +450,9 @@ class App:
         self._build_menu()
         self._build_form()
         self._build_tables()
+
+        register_log_listener(self._log_enqueue)
+        self._load_existing_logs()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self._poll_worker_queue)
@@ -429,6 +508,10 @@ class App:
         Entry(self.root, textvariable=self.notes_var, width=70).grid(row=r, column=1, columnspan=3, sticky=W, padx=6)
         r+=1
 
+        Label(self.root, text="Worker threads:").grid(row=r, column=0, sticky=E, padx=6, pady=4)
+        Spinbox(self.root, from_=1, to=max(32, (os.cpu_count() or 8)), textvariable=self.threads_var, width=5).grid(row=r, column=1, sticky=W, padx=6)
+        r+=1
+
         ttk.Checkbutton(self.root, text="BLAKE3 for A/V (optional, slower)", variable=self.blake_var).grid(row=r, column=0, sticky=W, padx=10)
         Button(self.root, text="Scan (Auto)", command=self.start_scan).grid(row=r, column=1, sticky=W, padx=6)
         Button(self.root, text="Rescan (Delete shard + Scan)", command=self.rescan).grid(row=r, column=2, sticky=W, padx=6)
@@ -458,6 +541,48 @@ class App:
         self.progress = ttk.Progressbar(self.root, orient="horizontal", mode="determinate", length=600)
         self.progress.grid(row=12, column=0, columnspan=3, padx=6, pady=6, sticky=W)
         Label(self.root, textvariable=self.status_var).grid(row=12, column=4, sticky=E, padx=6)
+
+        Label(self.root, text="Live log (latest 1000 lines):").grid(row=13, column=0, columnspan=5, sticky=W, padx=6)
+        self.log_widget = ScrolledText(self.root, height=10, width=110, state="disabled")
+        self.log_widget.grid(row=14, column=0, columnspan=5, sticky=(N,S,E,W), padx=6, pady=(0,6))
+        self.root.grid_rowconfigure(14, weight=1)
+
+    def _log_enqueue(self, line: str):
+        if line is None:
+            return
+        line = str(line)
+        try:
+            self.worker_queue.put_nowait({"type": "log", "line": line})
+        except queue.Full:
+            pass
+
+    def _append_log(self, line: str):
+        if line is None:
+            return
+        line = str(line)
+        self.log_lines.append(line)
+        max_keep = 1000
+        if len(self.log_lines) > max_keep:
+            self.log_lines = self.log_lines[-max_keep:]
+        if hasattr(self, "log_widget"):
+            self.log_widget.configure(state="normal")
+            self.log_widget.delete("1.0", END)
+            text = "\n".join(self.log_lines)
+            if text:
+                self.log_widget.insert(END, text + "\n")
+            self.log_widget.see(END)
+            self.log_widget.configure(state="disabled")
+
+    def _load_existing_logs(self, max_lines: int = 200):
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                lines = [line.rstrip("\n") for line in f.readlines()[-max_lines:]]
+            for line in lines:
+                self._append_log(line)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self._append_log(f"[log tail error] {exc}")
 
     # ----- Presets
     def _load_types(self) -> list[str]:
@@ -611,6 +736,11 @@ class App:
             messagebox.showwarning("Busy", "A scan is already running."); return
         self.stop_evt = threading.Event()
         self._clear_worker_queue()
+        try:
+            threads = int(self.threads_var.get())
+        except (TypeError, ValueError):
+            threads = 1
+        threads = max(1, min(32, threads))
         self.worker = ScannerWorker(
             label=self.label_var.get().strip(),
             mount=self.path_var.get().strip(),
@@ -618,6 +748,7 @@ class App:
             dtype=self.type_var.get().strip(),
             db_catalog=self.db_path.get(),
             blake_for_av=bool(self.blake_var.get()),
+            max_workers=threads,
             stop_evt=self.stop_evt,
             event_queue=self.worker_queue
         )
@@ -667,6 +798,8 @@ class App:
             self.refresh_jobs()
         elif etype == "error":
             messagebox.showerror(event.get("title", "Error"), event.get("message", ""))
+        elif etype == "log":
+            self._append_log(event.get("line", ""))
         elif etype == "done":
             self._await_worker_completion()
             status = event.get("status", "Ready")
@@ -719,6 +852,7 @@ class App:
         if self._closing:
             return
         self._closing = True
+        unregister_log_listener(self._log_enqueue)
         if self.worker and self.worker.is_alive():
             if self.stop_evt:
                 self.stop_evt.set()
