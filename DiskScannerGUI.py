@@ -3,6 +3,7 @@
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
 import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -36,6 +37,7 @@ def log(s: str):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
+@lru_cache(maxsize=None)
 def has_cmd(cmd: str) -> bool:
     try:
         subprocess.check_output([cmd, "--version"], stderr=subprocess.STDOUT)
