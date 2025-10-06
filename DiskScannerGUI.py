@@ -210,7 +210,7 @@ def _ensure_shard_schema(con: sqlite3.Connection):
         if col_name not in existing_columns:
             cur.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_type}")
 
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_files_path ON files(path);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_blake3);")
 
     # integrity_ok semantics:
@@ -332,29 +332,63 @@ class ScannerWorker(threading.Thread):
             with sqlite3.connect(str(shard_path)) as shard:
                 _ensure_shard_schema(shard)
                 scur = shard.cursor()
-                scur.execute("DELETE FROM files")
+
+                existing_rows: dict[str, dict] = {}
+                scur.execute("SELECT path, size_bytes, is_av, integrity_ok, mtime_utc FROM files")
+                for path, size_bytes, is_av, integrity_ok, mtime_utc in scur.fetchall():
+                    existing_rows[path] = {
+                        "size_bytes": size_bytes,
+                        "is_av": int(is_av or 0),
+                        "integrity_ok": integrity_ok,
+                        "mtime_utc": mtime_utc,
+                    }
+
+                stale_paths = [p for p in list(existing_rows.keys()) if p not in all_files]
+                if stale_paths:
+                    scur.executemany("DELETE FROM files WHERE path=?", [(p,) for p in stale_paths])
+                    shard.commit()
+                    for p in stale_paths:
+                        existing_rows.pop(p, None)
 
                 def flush():
                     if not batch:
                         return
-                    scur.executemany("""INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc)
-                                        VALUES(?,?,?,?,?,?,?)""", batch)
+                    scur.executemany(
+                        """
+                        INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc)
+                        VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(path) DO UPDATE SET
+                            size_bytes=excluded.size_bytes,
+                            is_av=excluded.is_av,
+                            hash_blake3=excluded.hash_blake3,
+                            media_json=excluded.media_json,
+                            integrity_ok=excluded.integrity_ok,
+                            mtime_utc=excluded.mtime_utc
+                        """,
+                        batch,
+                    )
                     shard.commit()
                     batch.clear()
-                
+
                 def handle_result(result):
                     nonlocal processed_all, done_av
                     if not result:
                         return
-                    row, av_inc = result
-                    if row is None:
-                        return
-                    batch.append(row)
-                    if len(batch) >= BATCH_SIZE:
-                        flush()
-                    processed_all += 1
-                    if av_inc:
-                        done_av += av_inc
+                    if isinstance(result, tuple) and result and result[0] == "skip":
+                        _, av_inc = result
+                        processed_all += 1
+                        if av_inc:
+                            done_av += av_inc
+                    else:
+                        row, av_inc = result
+                        if row is None:
+                            return
+                        batch.append(row)
+                        if len(batch) >= BATCH_SIZE:
+                            flush()
+                        processed_all += 1
+                        if av_inc:
+                            done_av += av_inc
                     if processed_all % 200 == 0 or processed_all == total_all:
                         self._put({
                             "type": "progress",
@@ -373,6 +407,10 @@ class ScannerWorker(threading.Thread):
                         st = p.stat()
                         size = st.st_size
                         mtime = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        prev = existing_rows.get(fp)
+                        if prev and prev.get("size_bytes") == size and prev.get("mtime_utc") == mtime:
+                            av_inc = 1 if prev.get("is_av") == 1 and prev.get("integrity_ok") in (0, 1) else 0
+                            return ("skip", av_inc)
                         if ext in AV_EXTS:
                             mi = mediainfo_json(fp)
                             hb3 = blake3_hash(fp) if self.blake_for_av else None
