@@ -158,21 +158,32 @@ def init_catalog(db_path: str):
 def init_shard(shard_path: str):
     con = sqlite3.connect(shard_path)
     cur = con.cursor()
-    cur.executescript("""
-    PRAGMA journal_mode=WAL;
-    CREATE TABLE IF NOT EXISTS files(
-      id INTEGER PRIMARY KEY,
-      path TEXT NOT NULL,
-      size_bytes INTEGER,
-      is_av INTEGER,
-      hash_blake3 TEXT,
-      media_json TEXT,
-      integrity_ok INTEGER,
-      mtime_utc TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
-    CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_blake3);
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS files(
+          id INTEGER PRIMARY KEY,
+          path TEXT NOT NULL
+        )
     """)
+
+    # Ensure all expected columns exist (backward compatibility with older shards).
+    required_columns = [
+        ("size_bytes", "INTEGER"),
+        ("is_av", "INTEGER"),
+        ("hash_blake3", "TEXT"),
+        ("media_json", "TEXT"),
+        ("integrity_ok", "INTEGER"),
+        ("mtime_utc", "TEXT"),
+    ]
+    cur.execute("PRAGMA table_info(files)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    for col_name, col_type in required_columns:
+        if col_name not in existing_columns:
+            cur.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_type}")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_blake3);")
+
     # integrity_ok semantics:
     #   1 → MediaInfo/scan succeeded (or non-A/V file)
     #   0 → MediaInfo reported an error for the file
@@ -207,6 +218,16 @@ class ScannerWorker(threading.Thread):
             self._run()
         except Exception as exc:
             log(f"[ScannerWorker] fatal error: {exc}")
+            if self.job_id is not None:
+                try:
+                    with sqlite3.connect(self.db_catalog) as catalog:
+                        catalog.execute(
+                            "UPDATE jobs SET status='Error', message=?, finished_at=datetime('now') WHERE id=?",
+                            (str(exc), self.job_id)
+                        )
+                        catalog.commit()
+                except Exception as db_exc:
+                    log(f"[ScannerWorker] failed to mark job error: {db_exc}")
             self._put({"type": "error", "title": "Scan error", "message": str(exc)})
             self._put({"type": "done", "status": "Error"})
 
