@@ -3,6 +3,7 @@
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
 import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile
+import queue
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -175,10 +176,10 @@ def init_shard(shard_path: str):
     con.close()
 
 # ---------------- Scanner worker ----------------
-class ScannerThread(threading.Thread):
+class ScannerWorker(threading.Thread):
     def __init__(self, label: str, mount: str, notes: str, dtype: str,
-                 db_catalog: str, blake_for_av: bool, stop_evt: threading.Event,
-                 progress_cb=None):
+                 db_catalog: str, blake_for_av: bool,
+                 stop_evt: threading.Event, result_queue: "queue.Queue[dict]"):
         super().__init__(daemon=True)
         self.label = label
         self.mount = mount
@@ -187,103 +188,148 @@ class ScannerThread(threading.Thread):
         self.db_catalog = db_catalog
         self.blake_for_av = blake_for_av
         self.stop_evt = stop_evt
-        self.progress_cb = progress_cb
+        self.result_queue = result_queue
         self.job_id: Optional[int] = None
+
+    def _put(self, payload: dict):
+        try:
+            self.result_queue.put_nowait(payload)
+        except queue.Full:
+            pass
 
     def run(self):
         mount = Path(self.mount)
         if not mount.exists():
-            messagebox.showerror("Scan error", f"Mount path not found: {self.mount}")
+            self._put({
+                "type": "error",
+                "title": "Scan error",
+                "message": f"Mount path not found: {self.mount}"
+            })
+            self._put({"type": "finished", "status": "error"})
             return
-
-        catalog = sqlite3.connect(self.db_catalog, check_same_thread=False)
-        ccur = catalog.cursor()
 
         shard_path = Path(SHARDS_DIR) / f"{self.label}.db"
         os.makedirs(SHARDS_DIR, exist_ok=True)
         init_shard(str(shard_path))
-        shard = sqlite3.connect(str(shard_path), check_same_thread=False)
-        scur = shard.cursor()
 
-        # 1) Pré-scan
-        all_files = []
-        for root, _, files in os.walk(mount):
-            for f in files:
-                all_files.append(os.path.join(root, f))
-        total_all = len(all_files)
-        total_av = sum(1 for p in all_files if Path(p).suffix.lower() in AV_EXTS)
+        try:
+            # 1) Pré-scan
+            all_files = []
+            for root, _, files in os.walk(mount):
+                for f in files:
+                    all_files.append(os.path.join(root, f))
+            total_all = len(all_files)
+            total_av = sum(1 for p in all_files if Path(p).suffix.lower() in AV_EXTS)
 
-        # 2) Mise à jour du drive
-        total_bytes, free_bytes = disk_usage_bytes(mount)
-        smart_blob = try_smart_overview()
-        ccur.execute("""
-        INSERT INTO drives(label, mount_path, fs_format, total_bytes, free_bytes, smart_scan, scanned_at, drive_type, notes, scan_mode)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(label) DO UPDATE SET
-            mount_path=excluded.mount_path, fs_format=excluded.fs_format, total_bytes=excluded.total_bytes,
-            free_bytes=excluded.free_bytes, smart_scan=excluded.smart_scan, scanned_at=excluded.scanned_at,
-            drive_type=excluded.drive_type, notes=excluded.notes, scan_mode=excluded.scan_mode
-        """, (self.label, str(mount), None, total_bytes, free_bytes, smart_blob,
-              datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), self.dtype, self.notes, "Auto"))
-        catalog.commit()
+            self._put({
+                "type": "start",
+                "total_all": total_all,
+                "total_av": total_av
+            })
 
-        # 3) Job
-        ccur.execute("""INSERT INTO jobs(drive_label, started_at, status, total_av, total_all, done_av, duration_sec, message)
-                        VALUES(?, datetime('now'), 'Running', ?, ?, 0, NULL, ?)""",
-                     (self.label, total_av, total_all, f"Found AV {total_av} / Total {total_all}"))
-        self.job_id = ccur.lastrowid
-        catalog.commit()
+            # 2) Mise à jour du drive & job creation
+            with sqlite3.connect(self.db_catalog) as catalog:
+                ccur = catalog.cursor()
+                total_bytes, free_bytes = disk_usage_bytes(mount)
+                smart_blob = try_smart_overview()
+                ccur.execute("""
+                INSERT INTO drives(label, mount_path, fs_format, total_bytes, free_bytes, smart_scan, scanned_at, drive_type, notes, scan_mode)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(label) DO UPDATE SET
+                    mount_path=excluded.mount_path, fs_format=excluded.fs_format, total_bytes=excluded.total_bytes,
+                    free_bytes=excluded.free_bytes, smart_scan=excluded.smart_scan, scanned_at=excluded.scanned_at,
+                    drive_type=excluded.drive_type, notes=excluded.notes, scan_mode=excluded.scan_mode
+                """, (self.label, str(mount), None, total_bytes, free_bytes, smart_blob,
+                      datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), self.dtype, self.notes, "Auto"))
+                catalog.commit()
 
-        log(f"[Job {self.job_id}] Found AV {total_av} of TOTAL {total_all} at {self.mount}")
+                ccur.execute("""INSERT INTO jobs(drive_label, started_at, status, total_av, total_all, done_av, duration_sec, message)
+                                VALUES(?, datetime('now'), 'Running', ?, ?, 0, NULL, ?)""",
+                             (self.label, total_av, total_all, f"Found AV {total_av} / Total {total_all}"))
+                self.job_id = ccur.lastrowid
+                catalog.commit()
 
-        t0 = time.perf_counter()
-        done_av = 0
+            self._put({"type": "refresh"})
+            log(f"[Job {self.job_id}] Found AV {total_av} of TOTAL {total_all} at {self.mount}")
 
-        # Nettoyage shard et écriture par batch
-        scur.execute("DELETE FROM files")
-        shard.commit()
-        batch = []
-        BATCH_SIZE = 200
+            t0 = time.perf_counter()
+            done_av = 0
 
-        def flush():
-            if not batch: return
-            scur.executemany("""INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc)
-                                VALUES(?,?,?,?,?,?,?)""", batch)
-            shard.commit()
-            batch.clear()
+            with sqlite3.connect(str(shard_path)) as shard:
+                scur = shard.cursor()
+                scur.execute("DELETE FROM files")
+                shard.commit()
+                batch = []
+                BATCH_SIZE = 200
+                processed_all = 0
 
-        for idx, fp in enumerate(all_files, start=1):
-            if self.stop_evt.is_set(): break
-            try:
-                p = Path(fp); ext = p.suffix.lower()
-                st = p.stat(); size = st.st_size
-                mtime = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+                def flush():
+                    if not batch:
+                        return
+                    scur.executemany("""INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc)
+                                        VALUES(?,?,?,?,?,?,?)""", batch)
+                    shard.commit()
+                    batch.clear()
 
-                if ext in AV_EXTS:
-                    mi = mediainfo_json(fp)
-                    hb3 = blake3_hash(fp) if self.blake_for_av else None
-                    ok = 1 if (mi is not None and "error" not in mi) else 0
-                    batch.append((fp, size, 1, hb3, json.dumps(mi, ensure_ascii=False) if mi else None, ok, mtime))
-                    done_av += 1
-                else:
-                    batch.append((fp, size, 0, None, None, 1, mtime))
+                for idx, fp in enumerate(all_files, start=1):
+                    if self.stop_evt.is_set():
+                        break
+                    try:
+                        p = Path(fp)
+                        ext = p.suffix.lower()
+                        st = p.stat()
+                        size = st.st_size
+                        mtime = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                if len(batch) >= BATCH_SIZE: flush()
-                if self.progress_cb and (idx % 500 == 0 or idx == total_all):
-                    self.progress_cb(done_av, total_av, idx, total_all)
-            except Exception as e:
-                log(f"[job {self.job_id}] error on {fp}: {e}")
-                batch.append((fp, None, 0, None, json.dumps({"error":str(e)}), 0, None))
+                        if ext in AV_EXTS:
+                            mi = mediainfo_json(fp)
+                            hb3 = blake3_hash(fp) if self.blake_for_av else None
+                            ok = 1 if (mi is not None and "error" not in mi) else 0
+                            batch.append((fp, size, 1, hb3, json.dumps(mi, ensure_ascii=False) if mi else None, ok, mtime))
+                            done_av += 1
+                        else:
+                            batch.append((fp, size, 0, None, None, 1, mtime))
 
-        flush()
-        duration = int(time.perf_counter() - t0)
-        status = "Stopped" if self.stop_evt.is_set() else "Done"
-        ccur.execute("""UPDATE jobs SET finished_at=datetime('now'), status=?, done_av=?, duration_sec=?, message=?
-                        WHERE id=?""",
-                     (status, done_av, duration, f"Completed ({done_av}/{total_av}); scanned {total_all} files total", self.job_id))
-        catalog.commit()
-        shard.close()
-        catalog.close()
+                        if len(batch) >= BATCH_SIZE:
+                            flush()
+                        if idx % 200 == 0 or idx == total_all:
+                            self._put({
+                                "type": "progress",
+                                "done_all": idx,
+                                "total_all": total_all,
+                                "done_av": done_av,
+                                "total_av": total_av
+                            })
+                        processed_all = idx
+                    except Exception as e:
+                        log(f"[job {self.job_id}] error on {fp}: {e}")
+                        batch.append((fp, None, 0, None, json.dumps({"error": str(e)}), 0, None))
+
+                flush()
+
+            duration = int(time.perf_counter() - t0)
+            status = "Stopped" if self.stop_evt.is_set() else "Done"
+            processed_summary = processed_all if processed_all else 0
+            with sqlite3.connect(self.db_catalog) as catalog:
+                ccur = catalog.cursor()
+                ccur.execute("""UPDATE jobs SET finished_at=datetime('now'), status=?, done_av=?, duration_sec=?, message=?
+                                WHERE id=?""",
+                             (status, done_av, duration,
+                              f"Completed ({done_av}/{total_av}); scanned {processed_summary} of {total_all} files", self.job_id))
+                catalog.commit()
+
+            self._put({"type": "progress", "done_all": processed_summary, "total_all": total_all,
+                       "done_av": done_av, "total_av": total_av})
+            self._put({"type": "refresh"})
+            self._put({"type": "finished", "status": status})
+        except Exception as e:
+            log(f"[job {self.job_id}] fatal error: {e}")
+            self._put({
+                "type": "error",
+                "title": "Scan error",
+                "message": str(e)
+            })
+            self._put({"type": "finished", "status": "error"})
 
 # ---------------- GUI ----------------
 class App:
@@ -301,16 +347,20 @@ class App:
 
         # worker state
         self.stop_evt: Optional[threading.Event] = None
-        self.worker:   Optional[ScannerThread]   = None
+        self.worker:   Optional[ScannerWorker]   = None
+        self.result_queue: "queue.Queue[dict]" = queue.Queue()
+        self.is_scanning = False
 
         self._build_menu()
         self._build_form()
         self._build_tables()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         for d in (SCANS_DIR, LOGS_DIR, EXPORTS_DIR, SHARDS_DIR):
             os.makedirs(d, exist_ok=True)
         init_catalog(self.db_path.get())
         self.refresh_all()
+        self.root.after(150, self._poll_queue)
 
     # ----- UI builders
     def _build_menu(self):
@@ -383,7 +433,7 @@ class App:
         self.jobs.grid(row=10, column=0, columnspan=5, sticky=(N,S,E,W), padx=6)
         Button(self.root, text="Delete Selected Job", command=self.del_job).grid(row=11, column=0, sticky=W, padx=6, pady=4)
 
-        self.status_var = StringVar(value="Ready.")
+        self.status_var = StringVar(value="Idle")
         self.progress = ttk.Progressbar(self.root, orient="horizontal", mode="determinate", length=600)
         self.progress.grid(row=12, column=0, columnspan=3, padx=6, pady=6, sticky=W)
         Label(self.root, textvariable=self.status_var).grid(row=12, column=4, sticky=E, padx=6)
@@ -497,7 +547,9 @@ class App:
         cur.execute("UPDATE drives SET label=?, mount_path=?, drive_type=?, notes=? WHERE id=?",
                     (new_label, new_mount, new_type, new_notes, drive_id))
         con.commit(); con.close()
-        self.refresh_all(); self.status_var.set(f"Updated drive {new_label}.")
+        self.refresh_all();
+        if not self.is_scanning:
+            self._set_status_idle()
 
     def open_shard_selected(self):
         sel = self.tree.selection()
@@ -538,8 +590,10 @@ class App:
     def _launch_worker(self):
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Busy", "A scan is already running."); return
+        self._drain_queue()
         self.stop_evt = threading.Event()
-        self.worker = ScannerThread(
+        self.result_queue = queue.Queue()
+        self.worker = ScannerWorker(
             label=self.label_var.get().strip(),
             mount=self.path_var.get().strip(),
             notes=self.notes_var.get().strip(),
@@ -547,21 +601,21 @@ class App:
             db_catalog=self.db_path.get(),
             blake_for_av=bool(self.blake_var.get()),
             stop_evt=self.stop_evt,
-            progress_cb=self._on_progress
+            result_queue=self.result_queue
         )
-        self.status_var.set("Scanning…"); self.progress["value"] = 0
+        self.is_scanning = True
+        self.progress["value"] = 0
+        self.progress["maximum"] = 1
+        self.status_var.set("Scanning… (0/0)")
         self.worker.start()
         self.root.after(800, self.refresh_jobs)
 
     def stop_scan(self):
         if self.stop_evt: self.stop_evt.set()
-        self.status_var.set("Stopping…")
+        if self.is_scanning:
+            self.status_var.set("Stopping…")
 
     # ----- Progress & refresh
-    def _on_progress(self, done_av: int, total_av: int, done_all: int, total_all: int):
-        self.status_var.set(f"Scanned AV {done_av}/{total_av} | ALL {done_all}/{total_all}")
-        self.progress["maximum"] = max(1, total_all); self.progress["value"] = done_all
-
     def refresh_all(self):
         self.refresh_drives(); self.refresh_jobs()
 
@@ -589,7 +643,81 @@ class App:
         if self.worker and self.worker.is_alive():
             self.root.after(1200, self.refresh_jobs)
         else:
-            self.status_var.set("Ready.")
+            if not self.is_scanning:
+                self._set_status_idle()
+
+    def _set_status_idle(self):
+        self.status_var.set("Idle")
+        self.progress["value"] = 0
+
+    def _set_status_scanning(self, done_all: int, total_all: int, done_av: int, total_av: int):
+        total_all = max(total_all, 0)
+        total_av = max(total_av, 0)
+        self.progress["maximum"] = max(1, total_all)
+        self.progress["value"] = min(done_all, total_all)
+        self.status_var.set(
+            f"Scanning… ({min(done_all, total_all)}/{total_all}) AV {min(done_av, total_av)}/{total_av}"
+        )
+
+    def _drain_queue(self):
+        try:
+            while True:
+                self.result_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self.result_queue.get_nowait()
+                self._handle_worker_message(msg)
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_queue)
+
+    def _handle_worker_message(self, msg: dict):
+        typ = msg.get("type")
+        if typ == "start":
+            self.is_scanning = True
+            self._set_status_scanning(0, msg.get("total_all", 0), 0, msg.get("total_av", 0))
+        elif typ == "progress":
+            self.is_scanning = True
+            self._set_status_scanning(
+                msg.get("done_all", 0), msg.get("total_all", 0),
+                msg.get("done_av", 0), msg.get("total_av", 0)
+            )
+        elif typ == "error":
+            messagebox.showerror(msg.get("title", "Error"), msg.get("message", ""))
+        elif typ == "refresh":
+            self.refresh_jobs()
+        elif typ == "finished":
+            self.is_scanning = False
+            if self.stop_evt:
+                self.stop_evt = None
+            if self.worker:
+                self.worker.join(timeout=0)
+                if not self.worker.is_alive():
+                    self.worker = None
+            self.refresh_jobs()
+            self._set_status_idle()
+
+    def _on_close(self):
+        if self.worker and self.worker.is_alive():
+            if self.stop_evt:
+                self.stop_evt.set()
+            self.status_var.set("Stopping…")
+            self.root.after(100, self._await_worker_shutdown)
+        else:
+            self.root.destroy()
+
+    def _await_worker_shutdown(self):
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=0.1)
+            self.root.after(100, self._await_worker_shutdown)
+            return
+        self.worker = None
+        self.stop_evt = None
+        self.root.destroy()
 
 # ---------------- main ----------------
 def main():
