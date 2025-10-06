@@ -14,6 +14,14 @@ else:
 _blake3_spec = importlib.util.find_spec("blake3")
 _blake3_hash = importlib.import_module("blake3").blake3 if _blake3_spec is not None else None
 
+
+def _has_cmd(cmd: str) -> bool:
+    """Return True if *cmd* is available on PATH."""
+    return shutil.which(cmd) is not None
+
+
+_ffmpeg_available = _has_cmd("ffmpeg")
+
 VIDEO_EXTS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.ts','.m2ts','.webm','.mpg','.mpeg'}
 
 def run(cmd:list[str]) -> tuple[int,str,str]:
@@ -32,6 +40,9 @@ def mediainfo_json(file_path: str) -> Optional[dict]:
 
 def ffmpeg_verify(file_path: str) -> bool:
     if not any(file_path.lower().endswith(e) for e in VIDEO_EXTS):
+        return True
+    if not _ffmpeg_available:
+        # ffmpeg absent: skip verification instead of marking files as invalid
         return True
     # -v error: only show errors; -xerror: stop on error
     code, out, err = run(["ffmpeg","-v","error","-xerror","-i",file_path,"-f","null","-","-nostdin"])
