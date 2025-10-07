@@ -37,6 +37,7 @@ def run(cmd:list[str]) -> tuple[int,str,str]:
         return 127, "", str(exc)
 
 def mediainfo_json(file_path: str) -> Optional[dict]:
+    global _mediainfo_available
     if not _mediainfo_available:
         return None
     code, out, err = run(["mediainfo", "--Output=JSON", file_path])
@@ -47,7 +48,6 @@ def mediainfo_json(file_path: str) -> Optional[dict]:
             return None
     if code == 127:
         # Command missing – treat as unavailable for the remainder of the scan
-        global _mediainfo_available
         _mediainfo_available = False
     return None
 
