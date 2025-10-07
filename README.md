@@ -29,3 +29,12 @@ PowerShell entry points (`launch-gui.ps1` and `scan-drive.ps1`) automatically lo
 - A red banner across the top of the window means a required media tool is missing. Install `mediainfo` and `ffmpeg` before launching a new scan. An installer will take care of these dependencies in a future release.
 - When the status ticker says “I am still working — no new items in the last few seconds — please wait”, the scan is still alive but no new files were discovered. This is expected during long directory walks.
 - The indeterminate activity indicator below the scan buttons stays visible while the worker is busy so you always know the app has not frozen.
+
+## Rescan modes
+
+The scanner now supports two rescan strategies:
+
+- **Delta rescan (recommended)** compares the current drive contents with the last catalog snapshot and only processes files that are new, modified, or restored. Files that disappeared are marked as soft-deleted with a timestamp so they can be tracked without losing history.
+- **Full rescan** forces a complete re-hash of every file regardless of previous results. Use this when you need to rebuild the shard from scratch, but be aware it can take significantly longer on large drives.
+
+Scans automatically write periodic checkpoints to each shard. If a scan stops unexpectedly, leave the “Resume interrupted scan” option enabled and the next run will continue from the most recent consistent point instead of restarting from zero.
