@@ -12,6 +12,18 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - Live log viewer embedded in the GUI so you can observe progress without opening the log file.
 - Automatic shard schema migration that ensures legacy shard databases gain the `is_av` column and other metadata fields.
 
+## Paths & working directory
+
+The scanner now resolves its working directory deterministically:
+
+1. `VIDEOCATALOG_HOME` (if set and writable).
+2. `settings.json` located under the working directory itself, `%ProgramData%\VideoCatalog`, or the project root (legacy, read-only).
+3. Default fallback: `%ProgramData%\VideoCatalog` when writable, otherwise `%LOCALAPPDATA%\VideoCatalog`.
+
+All runtime assets live beneath `<working_dir>/data` by default, including `catalog.db` and the per-drive shard databases under `<working_dir>/data/shards/`.
+
+PowerShell entry points (`launch-gui.ps1` and `scan-drive.ps1`) automatically locate the repository via `$PSScriptRoot`, honor local virtual environments, and forward arguments safely so UNC paths and spaces are supported out of the box.
+
 ## Troubleshooting
 
 - A red banner across the top of the window means a required media tool is missing. Install `mediainfo` and `ffmpeg` before launching a new scan. An installer will take care of these dependencies in a future release.

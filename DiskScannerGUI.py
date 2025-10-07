@@ -16,6 +16,7 @@ from paths import (
     get_exports_dir,
     get_logs_dir,
     get_scans_dir,
+    get_shard_db_path,
     get_shards_dir,
     load_settings,
     resolve_working_dir,
@@ -64,6 +65,16 @@ LOG_FILE = str(LOGS_DIR_PATH / "scanner.log")
 
 update_settings(WORKING_DIR_PATH, catalog_db=DB_DEFAULT)
 
+_STARTUP_INFO = (
+    f"Working directory: {WORKING_DIR_PATH} | "
+    f"catalog: {DB_DEFAULT_PATH} | shards: {SHARDS_DIR_PATH}"
+)
+print(f"[INFO] {_STARTUP_INFO}", flush=True)
+
+
+def shard_path_for(label: str) -> Path:
+    return get_shard_db_path(WORKING_DIR_PATH, label)
+
 VIDEO_EXTS = {
     ".mp4",".mkv",".avi",".mov",".wmv",".m4v",".ts",".m2ts",".webm",".mpg",".mpeg",".mp2",".vob",".flv",".3gp",".ogv",".mts",".m2t"
 }
@@ -100,6 +111,9 @@ def log(s: str):
             cb(line)
         except Exception:
             pass
+
+
+log(f"[INFO] {_STARTUP_INFO}")
 
 @lru_cache(maxsize=None)
 def has_cmd(cmd: str) -> bool:
@@ -374,8 +388,8 @@ class ScannerWorker(threading.Thread):
         self._start_monotonic = time.perf_counter()
         self._last_progress_emit = (self._start_monotonic or time.perf_counter()) - 6
 
-        shard_path = Path(SHARDS_DIR) / f"{self.label}.db"
-        os.makedirs(SHARDS_DIR, exist_ok=True)
+        shard_path = shard_path_for(self.label)
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._put({"type": "status", "message": "Enumerating files…"})
 
@@ -1305,8 +1319,8 @@ class App:
         new_notes = self.notes_var.get().strip() or item[4]
         con = sqlite3.connect(self.db_path.get()); cur = con.cursor()
         if new_label != old_label:
-            old = Path(SHARDS_DIR) / f"{old_label}.db"
-            new = Path(SHARDS_DIR) / f"{new_label}.db"
+            old = shard_path_for(old_label)
+            new = shard_path_for(new_label)
             if old.exists():
                 try: old.replace(new)
                 except Exception as e:
@@ -1321,7 +1335,7 @@ class App:
         if not sel:
             messagebox.showinfo("Select drive","Select a drive row first."); return
         label = self.tree.item(sel[0])["values"][1]
-        sp = str(Path(SHARDS_DIR) / f"{label}.db")
+        sp = str(shard_path_for(label))
         if not os.path.exists(sp):
             messagebox.showinfo("Shard", f"No shard for {label}."); return
         try:
@@ -1344,7 +1358,7 @@ class App:
         mount = self.path_var.get().strip()
         if not (label and mount):
             messagebox.showerror("Missing", "Please fill Mount Path and Disk Label."); return
-        shard_path = Path(SHARDS_DIR) / f"{label}.db"
+        shard_path = shard_path_for(label)
         for _ in range(5):
             try:
                 if shard_path.exists(): os.remove(shard_path)
