@@ -1,3 +1,5 @@
+import argparse
+import logging
 import os, sys, sqlite3, json, time, shutil, subprocess, importlib
 import importlib.util
 from pathlib import Path
@@ -7,12 +9,19 @@ import hashlib
 from paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
+    get_shard_db_path,
     resolve_working_dir,
 )
 
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
 DEFAULT_DB_PATH = str(get_catalog_db_path(WORKING_DIR_PATH))
+LOGGER = logging.getLogger("videocatalog.scan")
+
+
+def _expand_user_path(value: str) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    return Path(expanded)
 
 _tqdm_spec = importlib.util.find_spec("tqdm")
 if _tqdm_spec is None:
@@ -194,17 +203,104 @@ def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = Fal
     conn.close()
     print(f"[OK] Scan complete for {label}. DB: {db_path}")
 
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scan a drive and populate the VideoCatalog databases."
+    )
+    parser.add_argument("--label", help="Drive label to record in the catalog.")
+    parser.add_argument(
+        "--mount",
+        dest="mount_path",
+        help="Filesystem path where the drive is mounted.",
+    )
+    parser.add_argument(
+        "--catalog-db",
+        dest="catalog_db",
+        help="Optional path to the catalog database (defaults to working dir).",
+    )
+    parser.add_argument(
+        "--shard-db",
+        dest="shard_db",
+        help="Optional path to the shard database (defaults to working dir).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging output.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug helpers such as slow enumeration sleeps.",
+    )
+    parser.add_argument(
+        "--debug-slow-enumeration",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "positional",
+        nargs="*",
+        help=argparse.SUPPRESS,
+    )
+
+    namespace = parser.parse_args(argv)
+    positional = list(namespace.positional)
+
+    if namespace.label is None and positional:
+        namespace.label = positional.pop(0)
+    if namespace.mount_path is None and positional:
+        namespace.mount_path = positional.pop(0)
+    if namespace.catalog_db is None and positional:
+        namespace.catalog_db = positional.pop(0)
+
+    if namespace.label is None or namespace.mount_path is None:
+        parser.error("Both --label and --mount are required.")
+
+    namespace.positional = positional
+    return namespace
+
+
+def _ensure_directory(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        LOGGER.error("Failed to create directory %s: %s", path, exc)
+        sys.exit(4)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv or sys.argv[1:])
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    catalog_db_path = (
+        _expand_user_path(args.catalog_db)
+        if args.catalog_db
+        else Path(DEFAULT_DB_PATH)
+    )
+    shard_db_path = (
+        _expand_user_path(args.shard_db)
+        if args.shard_db
+        else get_shard_db_path(WORKING_DIR_PATH, args.label)
+    )
+
+    _ensure_directory(catalog_db_path.parent)
+    _ensure_directory(shard_db_path.parent)
+
+    startup_info = (
+        f"Working directory: {WORKING_DIR_PATH} | "
+        f"catalog: {catalog_db_path} | shard: {shard_db_path}"
+    )
+    LOGGER.info(startup_info)
+
+    debug_flag = bool(args.debug or args.debug_slow_enumeration)
+    scan_drive(args.label, args.mount_path, str(catalog_db_path), debug_slow=debug_flag)
+    return 0
+
+
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    debug_flag = False
-    if "--debug-slow-enumeration" in args:
-        args.remove("--debug-slow-enumeration")
-        debug_flag = True
-    if len(args) not in (2, 3):
-        script_name = Path(__file__).name
-        print(f"Usage: python {script_name} <LABEL> <MOUNT_PATH> [<DB_PATH>]")
-        print(f"       Default DB path: {DEFAULT_DB_PATH}")
-        sys.exit(1)
-    label, mount_path = args[:2]
-    db_path = args[2] if len(args) == 3 else DEFAULT_DB_PATH
-    scan_drive(label, mount_path, db_path, debug_slow=debug_flag)
+    sys.exit(main())

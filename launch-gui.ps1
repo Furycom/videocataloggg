@@ -2,22 +2,29 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+
 $scriptRoot = $PSScriptRoot
-$python = Join-Path $scriptRoot '.venv\Scripts\python.exe'
-if (-not (Test-Path -Path $python)) {
-    $python = 'python'
+$pythonExe = Join-Path -Path $scriptRoot -ChildPath '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $pythonExe)) {
+    $pythonExe = 'python'
 }
 
-$guiScript = Join-Path $scriptRoot 'DiskScannerGUI.py'
+$guiScript = Join-Path -Path $scriptRoot -ChildPath 'DiskScannerGUI.py'
+if (-not (Test-Path -LiteralPath $guiScript)) {
+    Write-Error "Unable to locate DiskScannerGUI.py at $guiScript."
+    exit 1
+}
 
 try {
-    & $python $guiScript
+    & $pythonExe $guiScript
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
-        Write-Error "Disk Scanner GUI exited with code $exitCode."
+        Write-Error "DiskScannerGUI exited with code $exitCode."
         exit 1
     }
 } catch {
     Write-Error $_
     exit 1
 }
+
+exit 0

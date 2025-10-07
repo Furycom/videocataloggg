@@ -1,48 +1,67 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Label,
-    [Parameter(Mandatory = $true)][string]$MountPath,
-    [string]$CatalogPath,
-    [switch]$DebugSlowEnumeration
+    [Parameter(Mandatory = $true)][string] $Label,
+    [Parameter(Mandatory = $true)][string] $MountPath,
+    [string] $CatalogDb,
+    [string] $ShardDb,
+    [switch] $VerboseMode,
+    [switch] $DebugMode
 )
 
 $ErrorActionPreference = 'Stop'
+
 $scriptRoot = $PSScriptRoot
-$python = Join-Path $scriptRoot '.venv\Scripts\python.exe'
-if (-not (Test-Path -Path $python)) {
-    $python = 'python'
+$pythonExe = Join-Path -Path $scriptRoot -ChildPath '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $pythonExe)) {
+    $pythonExe = 'python'
 }
 
-$scanScript = Join-Path $scriptRoot 'scan_drive.py'
-if (-not (Test-Path -Path $scanScript)) {
-    Write-Error "scan_drive.py not found at $scanScript."
+$scanScript = Join-Path -Path $scriptRoot -ChildPath 'scan_drive.py'
+if (-not (Test-Path -LiteralPath $scanScript)) {
+    Write-Error "Unable to locate scan_drive.py at $scanScript."
     exit 1
 }
 
+$args = @($scanScript, '--label', $Label, '--mount', $MountPath)
+if ($CatalogDb) {
+    $args += @('--catalog-db', $CatalogDb)
+}
+if ($ShardDb) {
+    $args += @('--shard-db', $ShardDb)
+}
+if ($VerboseMode.IsPresent) {
+    $args += '--verbose'
+}
+if ($DebugMode.IsPresent) {
+    $args += '--debug'
+}
+
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $pythonExe
+foreach ($arg in $args) {
+    [void]$psi.ArgumentList.Add($arg)
+}
+$psi.WorkingDirectory = $scriptRoot
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.UseShellExecute = $false
+
 try {
-    if (-not $CatalogPath) {
-        $CatalogPath = & $python -c "from paths import resolve_working_dir, ensure_working_dir_structure, get_catalog_db_path; wd = resolve_working_dir(); ensure_working_dir_structure(wd); print(get_catalog_db_path(wd))"
-        $determineExit = $LASTEXITCODE
-        if ($determineExit -ne 0 -or [string]::IsNullOrWhiteSpace($CatalogPath)) {
-            throw 'Failed to determine default catalog path.'
-        }
-        $CatalogPath = $CatalogPath.Trim()
-    }
+    $process = [System.Diagnostics.Process]::Start($psi)
 } catch {
     Write-Error $_
     exit 1
 }
 
-$arguments = @($scanScript, $Label, $MountPath, $CatalogPath)
-if ($DebugSlowEnumeration.IsPresent) {
-    $arguments += '--debug-slow-enumeration'
+$process.WaitForExit()
+
+$stdOut = $process.StandardOutput.ReadToEnd()
+if ($stdOut) {
+    Write-Output $stdOut
+}
+$stdErr = $process.StandardError.ReadToEnd()
+if ($stdErr) {
+    Write-Error $stdErr
 }
 
-& $python @arguments
-$exitCode = $LASTEXITCODE
-if ($exitCode -ne 0) {
-    Write-Error "scan_drive.py exited with code $exitCode."
-    exit $exitCode
-}
-
-exit 0
+exit $process.ExitCode

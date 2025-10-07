@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -89,12 +90,12 @@ def resolve_working_dir() -> Path:
             if prepared is not None:
                 return prepared
 
-    legacy_settings_paths = [
-        _PROJECT_ROOT / "settings.json",
-    ]
     program_data = _program_data_dir()
+
+    legacy_settings_paths = []
     if program_data is not None:
         legacy_settings_paths.append(program_data / "VideoCatalog" / "settings.json")
+    legacy_settings_paths.append(_PROJECT_ROOT / "settings.json")
 
     for legacy_path in legacy_settings_paths:
         data = _read_settings(legacy_path)
@@ -152,6 +153,19 @@ def get_catalog_db_path(working_dir: Path) -> Path:
 
 def get_shards_dir(working_dir: Path) -> Path:
     return get_data_dir(working_dir) / "shards"
+
+
+_SAFE_LABEL_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def safe_label(label: str) -> str:
+    """Return a filesystem-safe label used for shard filenames."""
+    cleaned = _SAFE_LABEL_PATTERN.sub("_", label.strip())
+    return cleaned or "drive"
+
+
+def get_shard_db_path(working_dir: Path, label: str) -> Path:
+    return get_shards_dir(working_dir) / f"{safe_label(label)}.db"
 
 
 def get_logs_dir(working_dir: Path) -> Path:
