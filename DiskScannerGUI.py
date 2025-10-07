@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from tkinter import (
-    Tk, Label, Entry, Button, StringVar, IntVar, END, N, S, E, W,
+    Tk, StringVar, IntVar, END, N, S, E, W,
     filedialog, messagebox, ttk, Menu, Spinbox
 )
 from tkinter.scrolledtext import ScrolledText
@@ -466,6 +466,23 @@ class App:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("Disk Scanner - Catalog GUI")
+        self.style = ttk.Style()
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+        self.colors = self._setup_theme()
+        self.status_styles = {
+            "info": "StatusInfo.TLabel",
+            "success": "StatusSuccess.TLabel",
+            "warning": "StatusWarning.TLabel",
+            "error": "StatusDanger.TLabel",
+            "accent": "StatusAccent.TLabel",
+        }
+        self.root.configure(bg=self.colors["background"])
+        self.root.option_add("*Font", "Segoe UI 10")
+        self.root.geometry("1020x820")
+        self.root.minsize(900, 720)
         self.db_path = StringVar(value=DB_DEFAULT)
 
         # inputs
@@ -501,6 +518,70 @@ class App:
         self.refresh_all()
 
     # ----- UI builders
+    def _setup_theme(self) -> dict[str, str]:
+        colors = {
+            "background": "#0f172a",
+            "content": "#111f33",
+            "card": "#15273f",
+            "border": "#1f324d",
+            "text": "#e2e8f0",
+            "muted_text": "#94a3b8",
+            "accent": "#38bdf8",
+            "accent_dark": "#0ea5e9",
+            "success": "#4ade80",
+            "warning": "#facc15",
+            "danger": "#f97316",
+            "info": "#3b82f6"
+        }
+
+        self.style.configure("TFrame", background=colors["content"])
+        self.style.configure("Content.TFrame", background=colors["content"])
+        self.style.configure("Header.TFrame", background=colors["background"])
+        self.style.configure("Card.TFrame", background=colors["card"], borderwidth=0)
+        self.style.configure("Card.TLabelframe", background=colors["card"], foreground=colors["text"], borderwidth=0)
+        self.style.configure("Card.TLabelframe.Label", background=colors["card"], foreground=colors["muted_text"], font=("Segoe UI", 10, "bold"))
+        self.style.configure("HeaderTitle.TLabel", background=colors["background"], foreground=colors["text"], font=("Segoe UI", 18, "bold"))
+        self.style.configure("HeaderSubtitle.TLabel", background=colors["background"], foreground=colors["muted_text"], font=("Segoe UI", 11))
+        self.style.configure("TLabel", background=colors["card"], foreground=colors["text"])
+        self.style.configure("Subtle.TLabel", background=colors["card"], foreground=colors["muted_text"], font=("Segoe UI", 9))
+        self.style.configure("Value.TLabel", background=colors["card"], foreground=colors["accent"], font=("Segoe UI", 10, "bold"))
+        self.style.configure("ProgressBig.TLabel", background=colors["card"], foreground=colors["text"], font=("Segoe UI", 24, "bold"))
+        self.style.configure("TreeHeading.TLabel", background=colors["card"], foreground=colors["text"], font=("Segoe UI", 10, "bold"))
+
+        button_padding = (14, 8)
+        self.style.configure("TButton", padding=button_padding, background=colors["card"], foreground=colors["text"], borderwidth=0)
+        self.style.map("TButton", background=[("pressed", colors["accent_dark"]), ("active", colors["accent"])] , foreground=[("disabled", colors["muted_text"])])
+        self.style.configure("Accent.TButton", padding=button_padding, background=colors["accent"], foreground=colors["background"], borderwidth=0)
+        self.style.map("Accent.TButton", background=[("pressed", colors["accent_dark"]), ("active", colors["accent"])] , foreground=[("disabled", colors["muted_text"])])
+        self.style.configure("Danger.TButton", padding=button_padding, background=colors["danger"], foreground=colors["background"], borderwidth=0)
+        self.style.map("Danger.TButton", background=[("pressed", "#ea580c"), ("active", colors["danger"])], foreground=[("disabled", colors["muted_text"])])
+
+        # Treeview styling
+        self.style.configure("Card.Treeview", background=colors["card"], fieldbackground=colors["card"], foreground=colors["text"], bordercolor=colors["border"], borderwidth=0, rowheight=24)
+        self.style.map("Card.Treeview", background=[("selected", colors["accent"])] , foreground=[("selected", colors["background"])])
+        self.style.configure("Card.Treeview.Heading", background=colors["border"], foreground=colors["text"], relief="flat")
+
+        # Progressbar styles
+        trough = colors["content"]
+        self.style.configure("Idle.Horizontal.TProgressbar", troughcolor=trough, background=colors["border"], bordercolor=colors["border"], lightcolor=colors["border"], darkcolor=colors["border"])
+        self.style.configure("Info.Horizontal.TProgressbar", troughcolor=trough, background=colors["info"], bordercolor=colors["info"], lightcolor=colors["info"], darkcolor=colors["info"])
+        self.style.configure("Accent.Horizontal.TProgressbar", troughcolor=trough, background=colors["accent"], bordercolor=colors["accent"], lightcolor=colors["accent"], darkcolor=colors["accent"])
+        self.style.configure("Success.Horizontal.TProgressbar", troughcolor=trough, background=colors["success"], bordercolor=colors["success"], lightcolor=colors["success"], darkcolor=colors["success"])
+        self.style.configure("Warning.Horizontal.TProgressbar", troughcolor=trough, background=colors["warning"], bordercolor=colors["warning"], lightcolor=colors["warning"], darkcolor=colors["warning"])
+
+        # Status badge styles
+        badge_font = ("Segoe UI", 10, "bold")
+        for style_name, bg, fg in (
+            ("StatusInfo.TLabel", colors["info"], colors["background"]),
+            ("StatusSuccess.TLabel", colors["success"], colors["background"]),
+            ("StatusWarning.TLabel", colors["warning"], colors["background"]),
+            ("StatusDanger.TLabel", colors["danger"], colors["background"]),
+            ("StatusAccent.TLabel", colors["accent"], colors["background"]),
+        ):
+            self.style.configure(style_name, background=bg, foreground=fg, font=badge_font, padding=(12, 4))
+
+        return colors
+
     def _build_menu(self):
         menubar = Menu(self.root); self.root.config(menu=menubar)
         mdb = Menu(menubar, tearoff=0)
@@ -517,73 +598,203 @@ class App:
         menubar.add_cascade(label="Tools", menu=mtools)
 
     def _build_form(self):
-        r=0
-        Label(self.root, text="Current DB:").grid(row=r, column=0, sticky=E, padx=6, pady=4)
-        Label(self.root, textvariable=self.db_path).grid(row=r, column=1, columnspan=3, sticky=W, padx=6)
-        Button(self.root, text="Browse…", command=self.db_open).grid(row=r, column=4, sticky=W, padx=6)
-        r+=1
+        self.content = ttk.Frame(self.root, padding=(20, 18), style="Content.TFrame")
+        self.content.grid(row=0, column=0, sticky=(N, S, E, W))
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.content.columnconfigure(0, weight=1)
 
-        Label(self.root, text="Mount or Network path (e.g., E:\\ or \\\\server\\share):").grid(row=r, column=0, sticky=E, padx=6, pady=4)
-        Entry(self.root, textvariable=self.path_var, width=70).grid(row=r, column=1, columnspan=3, sticky=W, padx=6)
-        Button(self.root, text="Browse…", command=self.choose_path).grid(row=r, column=4, sticky=W, padx=6)
-        r+=1
+        header = ttk.Frame(self.content, style="Header.TFrame", padding=(0, 0, 0, 16))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Disk Scanner Catalog", style="HeaderTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Manage your drives and follow scans at a glance.", style="HeaderSubtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        Label(self.root, text="Disk Label (your own name):").grid(row=r, column=0, sticky=E, padx=6, pady=4)
-        Entry(self.root, textvariable=self.label_var, width=30).grid(row=r, column=1, sticky=W, padx=6)
+        db_frame = ttk.LabelFrame(self.content, text="Database", padding=(16, 12), style="Card.TLabelframe")
+        db_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        for c in range(4):
+            db_frame.columnconfigure(c, weight=0)
+        db_frame.columnconfigure(1, weight=1)
+        ttk.Label(db_frame, text="Current DB:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(db_frame, textvariable=self.db_path, style="Value.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Button(db_frame, text="Browse…", command=self.db_open, style="Accent.TButton").grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Button(db_frame, text="New DB…", command=self.db_new).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
+        scan_frame = ttk.LabelFrame(self.content, text="Scan parameters", padding=(16, 16), style="Card.TLabelframe")
+        scan_frame.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+        for c in range(4):
+            scan_frame.columnconfigure(c, weight=1 if c in (1, 2) else 0)
+
+        ttk.Label(scan_frame, text="Mount or network path:").grid(row=0, column=0, sticky="w", pady=4)
+        path_entry = ttk.Entry(scan_frame, textvariable=self.path_var, width=48)
+        path_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(12, 12))
+        ttk.Button(scan_frame, text="Browse…", command=self.choose_path).grid(row=0, column=3, sticky="ew")
+
+        ttk.Label(scan_frame, text="Disk label:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(scan_frame, textvariable=self.label_var, width=28).grid(row=1, column=1, sticky="ew", padx=(12, 12))
+        ttk.Label(scan_frame, text="Drive type:").grid(row=1, column=2, sticky="w", pady=4)
         self.presets = self._load_types()
-        self.presets_combo = ttk.Combobox(self.root, values=self.presets, textvariable=self.type_var, width=30)
-        self.presets_combo.grid(row=r, column=2, sticky=W, padx=6)
-        Button(self.root, text="Presets ▾", command=self._reload_presets).grid(row=r, column=3, sticky=W, padx=6)
-        Button(self.root, text="Save Type", command=self._save_current_type).grid(row=r, column=4, sticky=W, padx=6)
-        r+=1
+        self.presets_combo = ttk.Combobox(scan_frame, values=self.presets, textvariable=self.type_var, width=24)
+        self.presets_combo.grid(row=1, column=3, sticky="ew")
 
-        Label(self.root, text="Drive Type (free text):").grid(row=r, column=0, sticky=E, padx=6, pady=4)
-        Entry(self.root, textvariable=self.type_var, width=30).grid(row=r, column=1, sticky=W, padx=6)
-        r+=1
+        presets_row = ttk.Frame(scan_frame, style="Card.TFrame")
+        presets_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        presets_row.columnconfigure(0, weight=1)
+        presets_row.columnconfigure(1, weight=1)
+        ttk.Button(presets_row, text="Reload presets", command=self._reload_presets).grid(row=0, column=0, sticky="ew")
+        ttk.Button(presets_row, text="Save current type", command=self._save_current_type).grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
-        Label(self.root, text="Notes (short description):").grid(row=r, column=0, sticky=E, padx=6, pady=4)
-        Entry(self.root, textvariable=self.notes_var, width=70).grid(row=r, column=1, columnspan=3, sticky=W, padx=6)
-        r+=1
+        ttk.Label(scan_frame, text="Notes:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(scan_frame, textvariable=self.notes_var).grid(row=3, column=1, columnspan=3, sticky="ew", padx=(12, 0))
 
-        Label(self.root, text="Worker threads:").grid(row=r, column=0, sticky=E, padx=6, pady=4)
-        Spinbox(self.root, from_=1, to=max(32, (os.cpu_count() or 8)), textvariable=self.threads_var, width=5).grid(row=r, column=1, sticky=W, padx=6)
-        r+=1
+        ttk.Label(scan_frame, text="Worker threads:").grid(row=4, column=0, sticky="w", pady=4)
+        threads_spin = Spinbox(scan_frame, from_=1, to=max(32, (os.cpu_count() or 8)), textvariable=self.threads_var, width=6, justify="center")
+        threads_spin.configure(bg=self.colors["content"], fg=self.colors["text"], foreground=self.colors["text"],
+                               insertbackground=self.colors["text"], highlightthickness=0, relief="flat")
+        threads_spin.grid(row=4, column=1, sticky="w", padx=(12, 12))
 
-        ttk.Checkbutton(self.root, text="BLAKE3 for A/V (optional, slower)", variable=self.blake_var).grid(row=r, column=0, sticky=W, padx=10)
-        Button(self.root, text="Scan (Auto)", command=self.start_scan).grid(row=r, column=1, sticky=W, padx=6)
-        Button(self.root, text="Rescan (Delete shard + Scan)", command=self.rescan).grid(row=r, column=2, sticky=W, padx=6)
-        Button(self.root, text="STOP", command=self.stop_scan).grid(row=r, column=3, sticky=W, padx=6)
-        Button(self.root, text="Export Current Catalog DB", command=self.export_db).grid(row=r, column=4, sticky=W, padx=6)
+        ttk.Checkbutton(scan_frame, text="BLAKE3 hashing for A/V (slower)", variable=self.blake_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 12))
+
+        actions = ttk.Frame(scan_frame, style="Card.TFrame")
+        actions.grid(row=6, column=0, columnspan=4, sticky="ew")
+        for c in range(4):
+            actions.columnconfigure(c, weight=1)
+        ttk.Button(actions, text="Scan", command=self.start_scan, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
+        ttk.Button(actions, text="Rescan (delete shard)", command=self.rescan).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(actions, text="Stop", command=self.stop_scan, style="Danger.TButton").grid(row=0, column=2, sticky="ew", padx=(8, 0))
+        ttk.Button(actions, text="Export catalog", command=self.export_db).grid(row=0, column=3, sticky="ew", padx=(8, 0))
 
     def _build_tables(self):
-        Label(self.root, text="Drives in catalog:").grid(row=6, column=0, sticky=W, padx=6)
+        self.content.rowconfigure(3, weight=1)
+        self.content.rowconfigure(4, weight=1)
+        self.content.rowconfigure(6, weight=1)
+
         cols = ("id","label","mount","type","notes","serial","model","totalGB")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=10)
-        for c in cols: self.tree.heading(c, text=c)
-        self.tree.grid(row=7, column=0, columnspan=5, sticky=(N,S,E,W), padx=6)
-        self.root.grid_rowconfigure(7, weight=1); self.root.grid_columnconfigure(2, weight=1)
+        drives_frame = ttk.LabelFrame(self.content, text="Drives in catalog", padding=(16, 12), style="Card.TLabelframe")
+        drives_frame.grid(row=3, column=0, sticky=(N, S, E, W), pady=(0, 12))
+        drives_frame.columnconfigure(0, weight=1)
+        drives_frame.rowconfigure(0, weight=1)
 
-        Button(self.root, text="Delete Selected Drive (catalog only)", command=self.del_drive).grid(row=8, column=0, sticky=W, padx=6, pady=4)
-        Button(self.root, text="Update Selected Drive Info", command=self.update_drive).grid(row=8, column=1, sticky=W, padx=6, pady=4)
-        Button(self.root, text="Open Shard of Selected Drive", command=self.open_shard_selected).grid(row=8, column=4, sticky=E, padx=6, pady=4)
+        drives_container = ttk.Frame(drives_frame, style="Card.TFrame")
+        drives_container.grid(row=0, column=0, sticky=(N, S, E, W))
+        drives_container.columnconfigure(0, weight=1)
+        drives_container.rowconfigure(0, weight=1)
 
-        Label(self.root, text="Jobs:").grid(row=9, column=0, sticky=W, padx=6)
+        self.tree = ttk.Treeview(drives_container, columns=cols, show="headings", height=9, style="Card.Treeview")
+        for c in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, anchor=W, stretch=True)
+        tree_scroll = ttk.Scrollbar(drives_container, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        tree_scroll.grid(row=0, column=1, sticky=(N, S))
+
+        drives_actions = ttk.Frame(drives_frame, style="Card.TFrame")
+        drives_actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for i in range(3):
+            drives_actions.columnconfigure(i, weight=1)
+        ttk.Button(drives_actions, text="Delete selected drive", command=self.del_drive, style="Danger.TButton").grid(row=0, column=0, sticky="ew")
+        ttk.Button(drives_actions, text="Update selected drive", command=self.update_drive).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(drives_actions, text="Open shard", command=self.open_shard_selected).grid(row=0, column=2, sticky="ew", padx=(8, 0))
+
         jcols=("id","drive_label","status","done_av","total_av","total_all","started_at","finished_at","duration","message")
-        self.jobs = ttk.Treeview(self.root, columns=jcols, show="headings", height=6)
-        for c in jcols: self.jobs.heading(c, text=c)
-        self.jobs.grid(row=10, column=0, columnspan=5, sticky=(N,S,E,W), padx=6)
-        Button(self.root, text="Delete Selected Job", command=self.del_job).grid(row=11, column=0, sticky=W, padx=6, pady=4)
+        jobs_frame = ttk.LabelFrame(self.content, text="Scan jobs", padding=(16, 12), style="Card.TLabelframe")
+        jobs_frame.grid(row=4, column=0, sticky=(N, S, E, W), pady=(0, 12))
+        jobs_frame.columnconfigure(0, weight=1)
+        jobs_frame.rowconfigure(0, weight=1)
 
-        self.status_var = StringVar(value="Ready.")
-        self.progress = ttk.Progressbar(self.root, orient="horizontal", mode="determinate", length=600)
-        self.progress.grid(row=12, column=0, columnspan=3, padx=6, pady=6, sticky=W)
-        Label(self.root, textvariable=self.status_var).grid(row=12, column=4, sticky=E, padx=6)
+        jobs_container = ttk.Frame(jobs_frame, style="Card.TFrame")
+        jobs_container.grid(row=0, column=0, sticky=(N, S, E, W))
+        jobs_container.columnconfigure(0, weight=1)
+        jobs_container.rowconfigure(0, weight=1)
 
-        Label(self.root, text="Live log (latest 1000 lines):").grid(row=13, column=0, columnspan=5, sticky=W, padx=6)
-        self.log_widget = ScrolledText(self.root, height=10, width=110, state="disabled")
-        self.log_widget.grid(row=14, column=0, columnspan=5, sticky=(N,S,E,W), padx=6, pady=(0,6))
-        self.root.grid_rowconfigure(14, weight=1)
+        self.jobs = ttk.Treeview(jobs_container, columns=jcols, show="headings", height=7, style="Card.Treeview")
+        for c in jcols:
+            self.jobs.heading(c, text=c)
+            anchor = W if c not in ("id","done_av","total_av","total_all") else E
+            self.jobs.column(c, anchor=anchor, stretch=True)
+        jobs_scroll = ttk.Scrollbar(jobs_container, orient="vertical", command=self.jobs.yview)
+        self.jobs.configure(yscrollcommand=jobs_scroll.set)
+        self.jobs.grid(row=0, column=0, sticky=(N, S, E, W))
+        jobs_scroll.grid(row=0, column=1, sticky=(N, S))
+
+        job_actions = ttk.Frame(jobs_frame, style="Card.TFrame")
+        job_actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for i in range(3):
+            job_actions.columnconfigure(i, weight=1)
+        ttk.Button(job_actions, text="Resume selected job", command=self.resume_job, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
+        ttk.Button(job_actions, text="Delete selected job", command=self.del_job, style="Danger.TButton").grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(job_actions, text="Refresh jobs", command=self.refresh_jobs).grid(row=0, column=2, sticky="ew", padx=(8, 0))
+
+        progress_frame = ttk.LabelFrame(self.content, text="Progress", padding=(16, 16), style="Card.TLabelframe")
+        progress_frame.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        progress_frame.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(progress_frame, style="Card.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
+
+        self.progress_percent_var = StringVar(value="0%")
+        ttk.Label(header, textvariable=self.progress_percent_var, style="ProgressBig.TLabel").grid(row=0, column=0, sticky="w")
+
+        self.status_var = StringVar()
+        self.status_label = ttk.Label(header, textvariable=self.status_var, style="StatusInfo.TLabel")
+        self.status_label.grid(row=0, column=1, sticky="e")
+
+        bars = ttk.Frame(progress_frame, style="Card.TFrame")
+        bars.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        bars.columnconfigure(1, weight=1)
+
+        self.total_percent_var = StringVar(value="0%")
+        ttk.Label(bars, text="All files", style="Subtle.TLabel").grid(row=0, column=0, sticky="w")
+        self.total_progress = ttk.Progressbar(bars, orient="horizontal", mode="determinate", style="Idle.Horizontal.TProgressbar")
+        self.total_progress.grid(row=0, column=1, sticky="ew", padx=(12, 12))
+        ttk.Label(bars, textvariable=self.total_percent_var, style="Subtle.TLabel").grid(row=0, column=2, sticky="e")
+
+        self.av_percent_var = StringVar(value="—")
+        ttk.Label(bars, text="Audio/Video", style="Subtle.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.av_progress = ttk.Progressbar(bars, orient="horizontal", mode="determinate", style="Idle.Horizontal.TProgressbar")
+        self.av_progress.grid(row=1, column=1, sticky="ew", padx=(12, 12), pady=(8, 0))
+        ttk.Label(bars, textvariable=self.av_percent_var, style="Subtle.TLabel").grid(row=1, column=2, sticky="e", pady=(8, 0))
+
+        self.progress_detail_var = StringVar(value="No scan running.")
+        ttk.Label(progress_frame, textvariable=self.progress_detail_var, style="Subtle.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 0))
+
+        log_frame = ttk.LabelFrame(self.content, text="Live log", padding=(16, 12), style="Card.TLabelframe")
+        log_frame.grid(row=6, column=0, sticky=(N, S, E, W))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+        self.log_widget = ScrolledText(log_frame, height=9, width=100, state="disabled", relief="flat", borderwidth=0,
+                                       background=self.colors["background"], foreground=self.colors["text"],
+                                       insertbackground=self.colors["text"], font=("Consolas", 10))
+        self.log_widget.grid(row=0, column=0, sticky=(N, S, E, W))
+        self._set_status("Ready.")
+        self._update_progress_styles(0, 0)
+
+    def _set_status(self, message: str, level: str = "info"):
+        if not hasattr(self, "status_var"):
+            self.status_var = StringVar()
+        self.status_var.set(message)
+        style = self.status_styles.get(level, "StatusInfo.TLabel")
+        if hasattr(self, "status_label"):
+            self.status_label.configure(style=style)
+
+    def _progress_style_for(self, percent: float) -> str:
+        if percent >= 100:
+            return "Success.Horizontal.TProgressbar"
+        if percent >= 75:
+            return "Accent.Horizontal.TProgressbar"
+        if percent >= 40:
+            return "Info.Horizontal.TProgressbar"
+        if percent >= 15:
+            return "Warning.Horizontal.TProgressbar"
+        return "Idle.Horizontal.TProgressbar"
+
+    def _update_progress_styles(self, overall_pct: float, av_pct: float):
+        self.total_progress.configure(style=self._progress_style_for(overall_pct))
+        self.av_progress.configure(style=self._progress_style_for(av_pct if av_pct else 0))
 
     def _log_enqueue(self, line: str):
         if line is None:
@@ -709,6 +920,37 @@ class App:
         con.commit(); con.close()
         self.refresh_all()
 
+    def resume_job(self):
+        sel = self.jobs.selection()
+        if not sel:
+            messagebox.showinfo("Resume", "Select a job row to resume.")
+            return
+        values = self.jobs.item(sel[0]).get("values", [])
+        if len(values) < 3:
+            messagebox.showwarning("Resume", "Unable to read the selected job.")
+            return
+        drive_label = values[1]
+        job_status = str(values[2]) if len(values) > 2 else ""
+        if job_status and job_status.lower() not in {"stopped", "done"}:
+            if not messagebox.askyesno("Resume job", f"Job is marked as '{job_status}'. Resume anyway?"):
+                return
+        con = sqlite3.connect(self.db_path.get()); cur = con.cursor()
+        cur.execute("SELECT mount_path, COALESCE(drive_type,''), COALESCE(notes,'') FROM drives WHERE label=?", (drive_label,))
+        row = cur.fetchone()
+        con.close()
+        if not row:
+            messagebox.showwarning("Resume job", f"Drive '{drive_label}' not found in catalog.")
+            return
+        mount_path, dtype, notes = row
+        self.label_var.set(drive_label)
+        self.path_var.set(mount_path)
+        self.type_var.set(dtype)
+        self.notes_var.set(notes)
+        if not messagebox.askyesno("Resume job", f"Restart scanning drive '{drive_label}'?\nMount: {mount_path}"):
+            return
+        self._set_status(f"Resuming {drive_label}…", "accent")
+        self._launch_worker()
+
     def update_drive(self):
         sel = self.tree.selection()
         if not sel:
@@ -731,7 +973,7 @@ class App:
         cur.execute("UPDATE drives SET label=?, mount_path=?, drive_type=?, notes=? WHERE id=?",
                     (new_label, new_mount, new_type, new_notes, drive_id))
         con.commit(); con.close()
-        self.refresh_all(); self.status_var.set(f"Updated drive {new_label}.")
+        self.refresh_all(); self._set_status(f"Updated drive {new_label}.", "success")
 
     def open_shard_selected(self):
         sel = self.tree.selection()
@@ -790,16 +1032,23 @@ class App:
             stop_evt=self.stop_evt,
             event_queue=self.worker_queue
         )
-        self.status_var.set("Scanning…")
-        self.progress["value"] = 0
-        self.progress["maximum"] = 1
+        self._set_status("Scanning…", "accent")
+        self.progress_percent_var.set("0%")
+        self.total_percent_var.set("0%")
+        self.av_percent_var.set("0%")
+        self.progress_detail_var.set("Preparing scan…")
+        self.total_progress["value"] = 0
+        self.total_progress["maximum"] = 1
+        self.av_progress["value"] = 0
+        self.av_progress["maximum"] = 1
+        self._update_progress_styles(0, 0)
         self.worker.start()
         self.root.after(800, self.refresh_jobs)
 
     def stop_scan(self):
         if self.stop_evt:
             self.stop_evt.set()
-        self.status_var.set("Stopping…")
+        self._set_status("Stopping…", "warning")
 
     # ----- Progress & refresh
     def _clear_worker_queue(self):
@@ -823,15 +1072,42 @@ class App:
     def _handle_worker_event(self, event: dict):
         etype = event.get("type")
         if etype == "progress":
-            self.progress["maximum"] = max(1, event.get("total_all", 1))
-            self.progress["value"] = event.get("done_all", 0)
-            total_av = event.get("total_av", 0)
-            done_av = event.get("done_av", 0)
-            done_all = event.get("done_all", 0)
-            total_all = event.get("total_all", 0)
-            self.status_var.set(f"Scanned AV {done_av}/{total_av} | ALL {done_all}/{total_all}")
+            total_all = event.get("total_all", 0) or 0
+            done_all = event.get("done_all", 0) or 0
+            total_av = event.get("total_av", 0) or 0
+            done_av = event.get("done_av", 0) or 0
+
+            self.total_progress["maximum"] = max(1, total_all)
+            self.total_progress["value"] = done_all
+            self.av_progress["maximum"] = max(1, total_av or 1)
+            self.av_progress["value"] = done_av
+
+            overall_pct = (done_all / total_all * 100) if total_all else 0.0
+            av_pct = (done_av / total_av * 100) if total_av else 0.0
+
+            self.progress_percent_var.set(f"{overall_pct:.0f}%")
+            self.total_percent_var.set(f"{overall_pct:.0f}%")
+            self.av_percent_var.set(f"{av_pct:.0f}%" if total_av else "—")
+
+            if total_all:
+                detail = f"{done_all:,}/{total_all:,} files · {done_av:,}/{total_av:,} AV"
+                status_text = f"Scanning • {done_all:,}/{total_all:,} files"
+            else:
+                detail = "Gathering files…"
+                status_text = "Scanning…"
+            self.progress_detail_var.set(detail)
+            self._set_status(status_text, "accent")
+            self._update_progress_styles(overall_pct, av_pct if total_av else 0.0)
         elif etype == "status":
-            self.status_var.set(event.get("message", ""))
+            msg = event.get("message", "")
+            lower = msg.lower()
+            if "complete" in lower or "ready" in lower:
+                level = "success"
+            elif "stop" in lower or "error" in lower:
+                level = "warning"
+            else:
+                level = "info"
+            self._set_status(msg, level)
         elif etype == "refresh_jobs":
             self.refresh_jobs()
         elif etype == "error":
@@ -842,13 +1118,20 @@ class App:
             self._await_worker_completion()
             status = event.get("status", "Ready")
             if status == "Done":
-                self.status_var.set("Ready.")
+                self._set_status("Ready.", "success")
             elif status == "Stopped":
-                self.status_var.set("Scan stopped.")
+                self._set_status("Scan stopped.", "warning")
             else:
-                self.status_var.set(status)
-            self.progress["value"] = 0
-            self.progress["maximum"] = 1
+                self._set_status(status)
+            self.progress_detail_var.set("No scan running.")
+            self.progress_percent_var.set("0%")
+            self.total_percent_var.set("0%")
+            self.av_percent_var.set("—")
+            self.total_progress["value"] = 0
+            self.total_progress["maximum"] = 1
+            self.av_progress["value"] = 0
+            self.av_progress["maximum"] = 1
+            self._update_progress_styles(0, 0)
 
     def _try_finalize_worker(self):
         if self.worker and not self.worker.is_alive():
@@ -884,7 +1167,7 @@ class App:
             self.root.after(1200, self.refresh_jobs)
         elif not (self.worker and self.worker.is_alive()):
             if self.worker is None:
-                self.status_var.set("Ready.")
+                self._set_status("Ready.")
 
     def on_close(self):
         if self._closing:
@@ -894,7 +1177,7 @@ class App:
         if self.worker and self.worker.is_alive():
             if self.stop_evt:
                 self.stop_evt.set()
-            self.status_var.set("Stopping…")
+            self._set_status("Stopping…", "warning")
             self._await_worker_completion(self.root.destroy)
         else:
             self.root.destroy()
@@ -914,10 +1197,6 @@ def main():
     for d in (SCANS_DIR, LOGS_DIR, EXPORTS_DIR, SHARDS_DIR): os.makedirs(d, exist_ok=True)
     init_catalog(DB_DEFAULT)
     root = Tk()
-    try:
-        style = ttk.Style()
-        if "vista" in style.theme_names(): style.theme_use("vista")
-    except Exception: pass
     App(root)
     root.mainloop()
 
