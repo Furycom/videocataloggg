@@ -117,11 +117,28 @@ def try_smart_overview() -> str:
             acc["details"].append(json.loads(out))
     return json.dumps(acc, ensure_ascii=False)
 
-def scan_drive(label: str, mount_path: str, db_path: str):
+def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = False):
+    global _ffmpeg_available, _mediainfo_available
     mount = Path(mount_path)
     if not mount.exists():
         print(f"[ERROR] Mount path not found: {mount_path}")
         sys.exit(2)
+
+    _mediainfo_available = _has_cmd("mediainfo")
+    _ffmpeg_available = _has_cmd("ffmpeg")
+    missing_tools = []
+    if not _mediainfo_available:
+        missing_tools.append("mediainfo")
+    if not _ffmpeg_available:
+        missing_tools.append("ffmpeg")
+    if missing_tools:
+        for tool in missing_tools:
+            print(json.dumps({"type": "tool_missing", "tool": tool}), flush=True)
+        print(
+            f"[ERROR] Missing required tool(s): {', '.join(missing_tools)}",
+            file=sys.stderr,
+        )
+        sys.exit(3)
 
     total, used, free = shutil.disk_usage(mount)
     conn = init_db(db_path)
@@ -145,6 +162,8 @@ def scan_drive(label: str, mount_path: str, db_path: str):
     for root, dirs, files in os.walk(mount):
         for f in files:
             file_paths.append(os.path.join(root, f))
+            if debug_slow:
+                time.sleep(0.01)
 
     for fp in tqdm(file_paths, desc=f"Scanning {label}"):
         try:
@@ -166,8 +185,13 @@ def scan_drive(label: str, mount_path: str, db_path: str):
     print(f"[OK] Scan complete for {label}. DB: {db_path}")
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    args = sys.argv[1:]
+    debug_flag = False
+    if "--debug-slow-enumeration" in args:
+        args.remove("--debug-slow-enumeration")
+        debug_flag = True
+    if len(args) != 3:
         print("Usage: python scan_drive.py <LABEL> <MOUNT_PATH> <DB_PATH>")
         sys.exit(1)
-    label, mount_path, db_path = sys.argv[1], sys.argv[2], sys.argv[3]
-    scan_drive(label, mount_path, db_path)
+    label, mount_path, db_path = args
+    scan_drive(label, mount_path, db_path, debug_slow=debug_flag)
