@@ -3,7 +3,7 @@ import logging
 import os, sys, sqlite3, json, time, shutil, subprocess, importlib
 import importlib.util
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 import hashlib
 
 from paths import (
@@ -12,11 +12,31 @@ from paths import (
     get_shard_db_path,
     resolve_working_dir,
 )
+from tools import bootstrap_local_bin, probe_tool
 
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
+bootstrap_local_bin(WORKING_DIR_PATH)
 DEFAULT_DB_PATH = str(get_catalog_db_path(WORKING_DIR_PATH))
 LOGGER = logging.getLogger("videocatalog.scan")
+
+ALL_TOOLS = ("mediainfo", "ffmpeg", "smartctl")
+REQUIRED_TOOLS = ("mediainfo", "ffmpeg")
+TOOL_STATUS: Dict[str, dict] = {}
+TOOL_PATHS: Dict[str, Optional[str]] = {}
+
+
+def _refresh_tool_status() -> Dict[str, dict]:
+    global TOOL_STATUS, TOOL_PATHS
+    statuses: Dict[str, dict] = {}
+    for tool in ALL_TOOLS:
+        statuses[tool] = probe_tool(tool, WORKING_DIR_PATH)
+    TOOL_STATUS = statuses
+    TOOL_PATHS = {
+        tool: (info.get("path") if info.get("present") else None)
+        for tool, info in statuses.items()
+    }
+    return statuses
 
 
 def _expand_user_path(value: str) -> Path:
@@ -33,15 +53,6 @@ else:
 _blake3_spec = importlib.util.find_spec("blake3")
 _blake3_hash = importlib.import_module("blake3").blake3 if _blake3_spec is not None else None
 
-
-def _has_cmd(cmd: str) -> bool:
-    """Return True if *cmd* is available on PATH."""
-    return shutil.which(cmd) is not None
-
-
-_ffmpeg_available = _has_cmd("ffmpeg")
-_mediainfo_available = _has_cmd("mediainfo")
-
 VIDEO_EXTS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.ts','.m2ts','.webm','.mpg','.mpeg'}
 
 def run(cmd:list[str]) -> tuple[int,str,str]:
@@ -55,29 +66,24 @@ def run(cmd:list[str]) -> tuple[int,str,str]:
         # are not installed.
         return 127, "", str(exc)
 
-def mediainfo_json(file_path: str) -> Optional[dict]:
-    global _mediainfo_available
-    if not _mediainfo_available:
+def mediainfo_json(file_path: str, executable: Optional[str]) -> Optional[dict]:
+    if not executable:
         return None
-    code, out, err = run(["mediainfo", "--Output=JSON", file_path])
+    code, out, err = run([executable, "--Output=JSON", file_path])
     if code == 0 and out.strip():
         try:
             return json.loads(out)
         except Exception:
             return None
-    if code == 127:
-        # Command missing – treat as unavailable for the remainder of the scan
-        _mediainfo_available = False
     return None
 
-def ffmpeg_verify(file_path: str) -> bool:
+def ffmpeg_verify(file_path: str, executable: Optional[str]) -> bool:
     if not any(file_path.lower().endswith(e) for e in VIDEO_EXTS):
         return True
-    if not _ffmpeg_available:
-        # ffmpeg absent: skip verification instead of marking files as invalid
+    if not executable:
         return True
     # -v error: only show errors; -xerror: stop on error
-    code, out, err = run(["ffmpeg","-v","error","-xerror","-i",file_path,"-f","null","-","-nostdin"])
+    code, out, err = run([executable, "-v", "error", "-xerror", "-i", file_path, "-f", "null", "-", "-nostdin"])
     return code == 0
 
 def hash_blake3(file_path: str, chunk: int = 1024*1024) -> str:
@@ -125,52 +131,46 @@ def init_db(db_path: str):
     conn.commit()
     return conn
 
-def try_smart_overview() -> str:
+def try_smart_overview(executable: Optional[str]) -> Optional[str]:
     # Best-effort: capture smartctl --scan-open and a subset of PhysicalDrive outputs
+    if not executable:
+        return None
     acc = {"scan": None, "details": []}
-    code, out, err = run(["smartctl","--scan-open"])
-    if code == 0: acc["scan"] = out
-    for n in range(0,10):
-        code, out, err = run(["smartctl","-i","-H","-A","-j", fr"\\.\PhysicalDrive{n}"])
+    code, out, err = run([executable, "--scan-open"])
+    if code == 0:
+        acc["scan"] = out
+    for n in range(0, 10):
+        code, out, err = run([executable, "-i", "-H", "-A", "-j", fr"\\.\PhysicalDrive{n}"])
         if code == 0 and out.strip():
             acc["details"].append(json.loads(out))
     return json.dumps(acc, ensure_ascii=False)
 
 def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = False):
-    global _ffmpeg_available, _mediainfo_available
     mount = Path(mount_path)
     if not mount.exists():
         print(f"[ERROR] Mount path not found: {mount_path}")
         sys.exit(2)
 
-    _mediainfo_available = _has_cmd("mediainfo")
-    _ffmpeg_available = _has_cmd("ffmpeg")
-    missing_tools = []
-    if not _mediainfo_available:
-        missing_tools.append("mediainfo")
-    if not _ffmpeg_available:
-        missing_tools.append("ffmpeg")
-    if missing_tools:
-        for tool in missing_tools:
+    statuses = _refresh_tool_status()
+    missing_required = [tool for tool in REQUIRED_TOOLS if not statuses.get(tool, {}).get("present")]
+    if missing_required:
+        for tool in missing_required:
             print(json.dumps({"type": "tool_missing", "tool": tool}), flush=True)
-        print(
-            f"[ERROR] Missing required tool(s): {', '.join(missing_tools)}",
-            file=sys.stderr,
-        )
+            print(
+                f"Required tool missing: {tool}. Please install or configure a portable path.",
+                file=sys.stderr,
+            )
         sys.exit(3)
+
+    if not statuses.get("smartctl", {}).get("present"):
+        print("[WARN] smartctl not found. SMART data will be skipped.", file=sys.stderr)
 
     total, used, free = shutil.disk_usage(mount)
     conn = init_db(db_path)
     c = conn.cursor()
 
     # SMART best-effort (won't fail the scan if smartctl missing)
-    smart_blob = None
-    try:
-        code, _, _ = run(["smartctl","--version"])
-        if code == 0:
-            smart_blob = try_smart_overview()
-    except Exception:
-        smart_blob = None
+    smart_blob = try_smart_overview(TOOL_PATHS.get("smartctl"))
 
     c.execute("""INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
                  VALUES(?,?,?,?,?,datetime('now'))""",
@@ -188,8 +188,8 @@ def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = Fal
         try:
             size = os.path.getsize(fp)
             hb3 = hash_blake3(fp)
-            mi = mediainfo_json(fp)
-            ok = ffmpeg_verify(fp)
+            mi = mediainfo_json(fp, TOOL_PATHS.get("mediainfo"))
+            ok = ffmpeg_verify(fp, TOOL_PATHS.get("ffmpeg"))
             mtime = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(fp)))
             c.execute("""INSERT INTO files(drive_label, path, size_bytes, hash_blake3, media_json, integrity_ok, mtime_utc)
                          VALUES(?,?,?,?,?,?,?)""",

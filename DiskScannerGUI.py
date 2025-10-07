@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Literal, Optional
 
 from paths import (
     ensure_working_dir_structure,
@@ -22,8 +22,17 @@ from paths import (
     resolve_working_dir,
     update_settings,
 )
+from tools import (
+    bootstrap_local_bin,
+    get_winget_candidates,
+    install_tool_via_winget,
+    probe_tool,
+    set_manual_tool_path,
+    setup_portable_tool,
+    winget_available,
+)
 from tkinter import (
-    Tk, StringVar, IntVar, END, N, S, E, W,
+    Tk, Toplevel, StringVar, IntVar, END, N, S, E, W,
     filedialog, messagebox, ttk, Menu, Spinbox
 )
 from tkinter.scrolledtext import ScrolledText
@@ -31,6 +40,7 @@ from tkinter.scrolledtext import ScrolledText
 # ---------------- Config & constantes ----------------
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
+bootstrap_local_bin(WORKING_DIR_PATH)
 
 def _expand_user_path(value: str) -> Path:
     expanded = os.path.expandvars(os.path.expanduser(value))
@@ -83,6 +93,15 @@ AUDIO_EXTS = {
 }
 AV_EXTS = VIDEO_EXTS | AUDIO_EXTS
 
+ToolName = Literal["mediainfo", "ffmpeg", "smartctl"]
+ALL_TOOLS: tuple[ToolName, ...] = ("mediainfo", "ffmpeg", "smartctl")
+REQUIRED_TOOLS: tuple[ToolName, ...] = ("mediainfo", "ffmpeg")
+TOOL_DISPLAY: Dict[ToolName, str] = {
+    "mediainfo": "MediaInfo",
+    "ffmpeg": "FFmpeg",
+    "smartctl": "smartctl",
+}
+
 # ---------------- Utilitaires ----------------
 _LOG_LISTENERS: list = []
 _LOG_LISTENERS_LOCK = threading.Lock()
@@ -117,22 +136,18 @@ log(f"[INFO] {_STARTUP_INFO}")
 
 @lru_cache(maxsize=None)
 def has_cmd(cmd: str) -> bool:
-    try:
-        subprocess.check_output([cmd, "--version"], stderr=subprocess.STDOUT)
-        return True
-    except Exception:
-        return False
+    return shutil.which(cmd) is not None
 
 def disk_usage_bytes(path: Path):
     total, used, free = shutil.disk_usage(path)
     return int(total), int(free)
 
-def mediainfo_json(file_path: str) -> Optional[dict]:
-    if not has_cmd("mediainfo"):
+def mediainfo_json(file_path: str, executable: Optional[str]) -> Optional[dict]:
+    if not executable:
         return None
     try:
         out = subprocess.check_output(
-            ["mediainfo","--Output=JSON", file_path],
+            [executable, "--Output=JSON", file_path],
             stderr=subprocess.STDOUT, text=True, timeout=180
         )
         return json.loads(out)
@@ -160,16 +175,17 @@ def blake3_hash(file_path: str, chunk: int = 1024*1024) -> Optional[str]:
         log(f"[hash fail] {file_path} -> {e}")
         return None
 
-def try_smart_overview() -> Optional[str]:
-    if not has_cmd("smartctl"): return None
+def try_smart_overview(executable: Optional[str]) -> Optional[str]:
+    if not executable:
+        return None
     acc = {"scan": None, "details": []}
     try:
-        out = subprocess.check_output(["smartctl","--scan-open"], text=True, stderr=subprocess.STDOUT)
+        out = subprocess.check_output([executable, "--scan-open"], text=True, stderr=subprocess.STDOUT)
         acc["scan"] = out
         for n in range(0,20):
             try:
                 out = subprocess.check_output(
-                    ["smartctl","-i","-H","-A","-j", fr"\\.\PhysicalDrive{n}"],
+                    [executable, "-i", "-H", "-A", "-j", fr"\\.\PhysicalDrive{n}"],
                     text=True, stderr=subprocess.STDOUT
                 )
                 acc["details"].append(json.loads(out))
@@ -283,9 +299,19 @@ def init_shard(shard_path: str):
 
 # ---------------- Scanner worker ----------------
 class ScannerWorker(threading.Thread):
-    def __init__(self, label: str, mount: str, notes: str, dtype: str,
-                 db_catalog: str, blake_for_av: bool, max_workers: int,
-                 stop_evt: threading.Event, event_queue: "queue.Queue[dict]"):
+    def __init__(
+        self,
+        label: str,
+        mount: str,
+        notes: str,
+        dtype: str,
+        db_catalog: str,
+        blake_for_av: bool,
+        max_workers: int,
+        stop_evt: threading.Event,
+        event_queue: "queue.Queue[dict]",
+        tool_state: Optional[Dict[str, dict]] = None,
+    ):
         super().__init__(daemon=False)
         self.label = label
         self.mount = mount
@@ -303,6 +329,12 @@ class ScannerWorker(threading.Thread):
         self._total_av: int = 0
         self._current_phase: str = "enumerating"
         self._tool_missing_reported = False
+        self.tool_state: Dict[str, dict] = tool_state or {}
+        self.tool_paths: Dict[str, Optional[str]] = {}
+        for tool_name, info in self.tool_state.items():
+            path = info.get("path") if isinstance(info, dict) else None
+            present = bool(info.get("present")) if isinstance(info, dict) else False
+            self.tool_paths[tool_name] = str(path) if (present and path) else None
 
     def _put(self, payload: dict):
         try:
@@ -380,11 +412,6 @@ class ScannerWorker(threading.Thread):
             self._put({"type": "done", "status": "Error"})
             return
 
-        for tool in ("mediainfo", "ffmpeg"):
-            if not has_cmd(tool):
-                self._report_missing_tool(tool)
-                return
-
         self._start_monotonic = time.perf_counter()
         self._last_progress_emit = (self._start_monotonic or time.perf_counter()) - 6
 
@@ -418,7 +445,7 @@ class ScannerWorker(threading.Thread):
             return
 
         started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        smart_blob = try_smart_overview()
+        smart_blob = try_smart_overview(self.tool_paths.get("smartctl"))
         total_bytes, free_bytes = disk_usage_bytes(mount)
 
         with sqlite3.connect(self.db_catalog) as catalog:
@@ -536,8 +563,9 @@ class ScannerWorker(threading.Thread):
                         if prev and prev.get("size_bytes") == size and prev.get("mtime_utc") == mtime:
                             av_inc = 1 if prev.get("is_av") == 1 and prev.get("integrity_ok") in (0, 1) else 0
                             return ("skip", av_inc)
+                        mediainfo_path = self.tool_paths.get("mediainfo")
                         if ext in AV_EXTS:
-                            mi = mediainfo_json(fp)
+                            mi = mediainfo_json(fp, mediainfo_path)
                             hb3 = blake3_hash(fp) if self.blake_for_av else None
                             if mi is None:
                                 ok = None
@@ -625,6 +653,9 @@ class App:
         self.heartbeat_active = False
         self.activity_indicator_running = False
         self._banner_visible = False
+        self.tool_status: Dict[str, dict] = {}
+        self._diagnostics_windows: List["DiagnosticsDialog"] = []
+        self._tool_banner_active = False
         self.status_styles = {
             "info": "StatusInfo.TLabel",
             "success": "StatusSuccess.TLabel",
@@ -659,6 +690,8 @@ class App:
         self._build_form()
         self._build_tables()
 
+        self.refresh_tool_statuses(initial=True)
+
         register_log_listener(self._log_enqueue)
         self._load_existing_logs()
 
@@ -671,6 +704,172 @@ class App:
         self.refresh_all()
         self._update_status_line(force=True)
         self._schedule_status_ticker()
+
+    def _probe_all_tools(self) -> Dict[str, dict]:
+        statuses: Dict[str, dict] = {}
+        for tool in ALL_TOOLS:
+            try:
+                statuses[tool] = probe_tool(tool, WORKING_DIR_PATH)
+            except Exception as exc:
+                statuses[tool] = {
+                    "name": tool,
+                    "present": False,
+                    "version": None,
+                    "path": None,
+                    "errors": [str(exc)],
+                }
+        return statuses
+
+    def _log_tool_statuses(self, statuses: Dict[str, dict]):
+        parts = []
+        for tool in ALL_TOOLS:
+            info = statuses.get(tool) or {}
+            present = "present" if info.get("present") else "missing"
+            version = info.get("version") or "n/a"
+            path = info.get("path") or "n/a"
+            parts.append(f"{TOOL_DISPLAY[tool]}: {present}, version={version}, path={path}")
+        line = "Tool status — " + "; ".join(parts)
+        print(f"[INFO] {line}", flush=True)
+        log(f"[INFO] {line}")
+
+    def _notify_diagnostics(self, statuses: Dict[str, dict]):
+        alive: List["DiagnosticsDialog"] = []
+        for window in list(self._diagnostics_windows):
+            if window.winfo_exists():
+                window.update_rows(statuses)
+                alive.append(window)
+        self._diagnostics_windows = alive
+
+    def _update_tool_banner(self):
+        missing_required = [
+            TOOL_DISPLAY[name]
+            for name in REQUIRED_TOOLS
+            if not self.tool_status.get(name, {}).get("present")
+        ]
+        if missing_required:
+            message = (
+                ", ".join(missing_required)
+                + " missing. Open Tools ▸ Diagnostics to install or locate tools."
+            )
+            if not self._banner_visible or self._tool_banner_active:
+                self.show_banner(message, "WARNING")
+                self._tool_banner_active = True
+        else:
+            if self._tool_banner_active and self._banner_visible and not self.scan_in_progress:
+                self.clear_banner()
+            self._tool_banner_active = False
+
+    def _update_tool_statuses(self, statuses: Dict[str, dict], *, log_line: bool = False):
+        self.tool_status = statuses
+        if log_line:
+            self._log_tool_statuses(statuses)
+        self._update_tool_banner()
+        self._notify_diagnostics(statuses)
+
+    def refresh_tool_statuses(self, initial: bool = False):
+        statuses = self._probe_all_tools()
+        self._update_tool_statuses(statuses, log_line=initial)
+
+    def recheck_tool(self, tool: ToolName) -> dict:
+        statuses = self._probe_all_tools()
+        self._update_tool_statuses(statuses)
+        return statuses.get(tool, {})
+
+    def open_diagnostics_dialog(self):
+        for window in list(self._diagnostics_windows):
+            if window.winfo_exists():
+                window.lift()
+                window.focus_set()
+                return
+        window = DiagnosticsDialog(self)
+        self._diagnostics_windows.append(window)
+
+    def open_install_dialog(self, tool: ToolName):
+        return ToolInstallDialog(self, tool)
+
+    def locate_tool_manually(self, tool: ToolName):
+        display = TOOL_DISPLAY[tool]
+        current_path = self.tool_status.get(tool, {}).get("path") if self.tool_status.get(tool) else None
+        base_dir = Path(current_path).parent if current_path else Path(BASE_DIR)
+        file_path = filedialog.askopenfilename(
+            title=f"Locate {display} executable",
+            initialdir=str(base_dir),
+            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+        success, message = set_manual_tool_path(tool, file_path, WORKING_DIR_PATH)
+        if success:
+            log(f"Using manual {display} at {message}")
+            messagebox.showinfo("Tool path saved", f"Saved {display} path.\n{message}")
+        else:
+            messagebox.showerror("Locate tool", message)
+        self.refresh_tool_statuses()
+
+    def _prompt_tool_decision(self, tool: ToolName) -> Optional[str]:
+        display = TOOL_DISPLAY[tool]
+        top = Toplevel(self.root)
+        top.title("Required tool missing")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+        frame = ttk.Frame(top, padding=(18, 18))
+        frame.grid(row=0, column=0, sticky="nsew")
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(0, weight=1)
+        ttk.Label(
+            frame,
+            text=f"{display} is not available. Install now or continue with limited features?",
+            wraplength=360,
+            style="Subtle.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        result = {"value": None}
+
+        def _set(value: Optional[str]):
+            result["value"] = value
+            top.destroy()
+
+        btn_install = ttk.Button(frame, text="Install", style="Accent.TButton", command=lambda: _set("install"))
+        btn_install.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        ttk.Button(
+            frame,
+            text=f"Continue without {display}",
+            command=lambda: _set("continue"),
+        ).grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(16, 0))
+        ttk.Button(frame, text="Cancel", command=lambda: _set(None)).grid(row=1, column=2, sticky="ew", pady=(16, 0))
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(2, weight=1)
+
+        self.root.wait_window(top)
+        return result["value"]
+
+    def _ensure_tools_before_scan(self) -> Optional[Dict[str, dict]]:
+        statuses = self._probe_all_tools()
+        self._update_tool_statuses(statuses)
+        for tool in REQUIRED_TOOLS:
+            info = statuses.get(tool)
+            if info and not info.get("present"):
+                while True:
+                    choice = self._prompt_tool_decision(tool)
+                    if choice == "install":
+                        dialog = self.open_install_dialog(tool)
+                        if dialog is not None:
+                            self.root.wait_window(dialog)
+                        statuses = self._probe_all_tools()
+                        self._update_tool_statuses(statuses)
+                        if statuses.get(tool, {}).get("present"):
+                            break
+                        messagebox.showwarning(
+                            "Install failed",
+                            f"{TOOL_DISPLAY[tool]} is still missing. Retry installation or continue without it.",
+                        )
+                        continue
+                    if choice == "continue":
+                        break
+                    return None
+        return statuses
 
     # ----- UI builders
     def _setup_theme(self) -> dict[str, str]:
@@ -787,6 +986,8 @@ class App:
 
         mtools = Menu(menubar, tearoff=0)
         mtools.add_command(label="Export Current Catalog DB", command=self.export_db)
+        mtools.add_separator()
+        mtools.add_command(label="Diagnostics…", command=self.open_diagnostics_dialog)
         menubar.add_cascade(label="Tools", menu=mtools)
 
     def _build_form(self):
@@ -1015,6 +1216,7 @@ class App:
             self.status_label.configure(style=style)
 
     def show_banner(self, message: str, level: str = "INFO"):
+        self._tool_banner_active = False
         level_key = (level or "INFO").upper()
         styles = self.banner_styles.get(level_key, self.banner_styles["INFO"])
         if self.banner_after_id:
@@ -1037,6 +1239,7 @@ class App:
             self.banner_frame.grid_remove()
             self._banner_visible = False
         self.banner_message.set("")
+        self._tool_banner_active = False
 
     def _start_activity_indicator(self):
         if getattr(self, "activity_indicator", None) is None:
@@ -1304,7 +1507,10 @@ class App:
         if not messagebox.askyesno("Resume job", f"Restart scanning drive '{drive_label}'?\nMount: {mount_path}"):
             return
         self._set_status(f"Resuming {drive_label}…", "accent")
-        self._launch_worker()
+        tool_state = self._ensure_tools_before_scan()
+        if tool_state is None:
+            return
+        self._launch_worker(tool_state)
 
     def update_drive(self):
         sel = self.tree.selection()
@@ -1351,22 +1557,28 @@ class App:
         mount = self.path_var.get().strip()
         if not (label and mount):
             messagebox.showerror("Missing", "Please fill Mount Path and Disk Label."); return
-        self._launch_worker()
+        tool_state = self._ensure_tools_before_scan()
+        if tool_state is None:
+            return
+        self._launch_worker(tool_state)
 
     def rescan(self):
         label = self.label_var.get().strip()
         mount = self.path_var.get().strip()
         if not (label and mount):
             messagebox.showerror("Missing", "Please fill Mount Path and Disk Label."); return
+        tool_state = self._ensure_tools_before_scan()
+        if tool_state is None:
+            return
         shard_path = shard_path_for(label)
         for _ in range(5):
             try:
                 if shard_path.exists(): os.remove(shard_path)
                 break
             except PermissionError: time.sleep(0.3)
-        self._launch_worker()
+        self._launch_worker(tool_state)
 
-    def _launch_worker(self):
+    def _launch_worker(self, tool_state: Dict[str, dict]):
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Busy", "A scan is already running."); return
         self.stop_evt = threading.Event()
@@ -1385,7 +1597,8 @@ class App:
             blake_for_av=bool(self.blake_var.get()),
             max_workers=threads,
             stop_evt=self.stop_evt,
-            event_queue=self.worker_queue
+            event_queue=self.worker_queue,
+            tool_state=tool_state,
         )
         self.clear_banner()
         self.show_banner("Scan started", "INFO")
@@ -1641,6 +1854,302 @@ class App:
             self._try_finalize_worker()
             if on_complete:
                 on_complete()
+
+
+class DiagnosticsDialog(Toplevel):
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Tool Diagnostics")
+        self.transient(app.root)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.rows: Dict[ToolName, dict] = {}
+
+        container = ttk.Frame(self, padding=(20, 18), style="Content.TFrame")
+        container.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        headings = ("Tool", "Status", "Version", "Path", "Actions")
+        for idx, text in enumerate(headings):
+            ttk.Label(container, text=text, style="TreeHeading.TLabel").grid(
+                row=0, column=idx, sticky="w", padx=(0, 8)
+            )
+
+        for index, tool in enumerate(ALL_TOOLS):
+            display = TOOL_DISPLAY[tool]
+            row_base = index * 2 + 1
+            ttk.Label(container, text=display, style="Subtle.TLabel").grid(
+                row=row_base, column=0, sticky="w"
+            )
+            status_label = ttk.Label(container, text="—", style="StatusWarning.TLabel")
+            status_label.grid(row=row_base, column=1, sticky="w", padx=(0, 8))
+            version_var = StringVar(value="—")
+            ttk.Label(container, textvariable=version_var, style="Subtle.TLabel").grid(
+                row=row_base, column=2, sticky="w"
+            )
+            path_var = StringVar(value="—")
+            ttk.Label(container, textvariable=path_var, style="Subtle.TLabel").grid(
+                row=row_base, column=3, sticky="w"
+            )
+
+            actions = ttk.Frame(container, style="Card.TFrame")
+            actions.grid(row=row_base, column=4, sticky="e", padx=(0, 4))
+            ttk.Button(actions, text="Install…", command=lambda t=tool: self._install(t)).grid(
+                row=0, column=0, padx=(0, 4)
+            )
+            ttk.Button(actions, text="Locate…", command=lambda t=tool: self._locate(t)).grid(
+                row=0, column=1, padx=(0, 4)
+            )
+            ttk.Button(actions, text="Recheck", command=lambda t=tool: self._recheck(t)).grid(
+                row=0, column=2
+            )
+
+            error_var = StringVar(value="")
+            error_label = ttk.Label(
+                container,
+                textvariable=error_var,
+                style="Subtle.TLabel",
+                wraplength=520,
+            )
+            error_label.grid(row=row_base + 1, column=0, columnspan=5, sticky="w", pady=(2, 8))
+
+            self.rows[tool] = {
+                "status_label": status_label,
+                "version_var": version_var,
+                "path_var": path_var,
+                "error_var": error_var,
+            }
+
+        button_row = ttk.Frame(container, style="Card.TFrame")
+        button_row.grid(
+            row=len(ALL_TOOLS) * 2 + 1,
+            column=0,
+            columnspan=5,
+            sticky="e",
+            pady=(12, 0),
+        )
+        ttk.Button(button_row, text="Close", command=self._on_close).grid(row=0, column=0, sticky="e")
+
+        self.update_rows(self.app.tool_status)
+
+    def update_rows(self, statuses: Dict[str, dict]):
+        for tool, widgets in self.rows.items():
+            info = statuses.get(tool) or {}
+            present = bool(info.get("present"))
+            status_text = "Present" if present else "Missing"
+            style = "StatusSuccess.TLabel" if present else "StatusDanger.TLabel"
+            widgets["status_label"].configure(text=status_text, style=style)
+            widgets["version_var"].set(info.get("version") or "—")
+            widgets["path_var"].set(info.get("path") or "—")
+            errors = info.get("errors") or []
+            widgets["error_var"].set("; ".join(errors) if errors else "")
+
+    def _install(self, tool: ToolName):
+        dialog = self.app.open_install_dialog(tool)
+        if dialog is not None:
+            self.wait_window(dialog)
+        self.update_rows(self.app.tool_status)
+
+    def _locate(self, tool: ToolName):
+        self.app.locate_tool_manually(tool)
+
+    def _recheck(self, tool: ToolName):
+        self.app.recheck_tool(tool)
+        self.update_rows(self.app.tool_status)
+
+    def _on_close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        if self in self.app._diagnostics_windows:
+            self.app._diagnostics_windows.remove(self)
+        self.destroy()
+
+
+class ToolInstallDialog(Toplevel):
+    def __init__(self, app: App, tool: ToolName):
+        super().__init__(app.root)
+        self.app = app
+        self.tool = tool
+        self.title(f"Install {TOOL_DISPLAY[tool]}")
+        self.transient(app.root)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.install_thread: Optional[threading.Thread] = None
+        self.cancel_event: Optional[threading.Event] = None
+
+        container = ttk.Frame(self, padding=(20, 18), style="Content.TFrame")
+        container.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        winget_text = ", ".join(get_winget_candidates(tool))
+        instructions = (
+            f"Install {TOOL_DISPLAY[tool]} via winget or provide a portable folder. "
+            f"winget IDs: {winget_text}."
+        )
+        ttk.Label(container, text=instructions, style="Subtle.TLabel", wraplength=520).grid(
+            row=0, column=0, sticky="w"
+        )
+
+        self.status_var = StringVar(value="Ready.")
+        ttk.Label(container, textvariable=self.status_var, style="Subtle.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(8, 4)
+        )
+
+        self.progress = ttk.Progressbar(
+            container,
+            orient="horizontal",
+            mode="indeterminate",
+            length=320,
+            style="Info.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=2, column=0, sticky="ew", pady=(4, 8))
+        self.progress.grid_remove()
+
+        self.log_widget = ScrolledText(
+            container,
+            height=10,
+            width=70,
+            state="disabled",
+            relief="flat",
+            borderwidth=0,
+            background=self.app.colors["background"],
+            foreground=self.app.colors["text"],
+        )
+        self.log_widget.grid(row=3, column=0, sticky="nsew", pady=(0, 12))
+        container.rowconfigure(3, weight=1)
+
+        buttons = ttk.Frame(container, style="Card.TFrame")
+        buttons.grid(row=4, column=0, sticky="e")
+
+        self.install_button = ttk.Button(
+            buttons,
+            text="Install with winget",
+            command=self.start_winget_install,
+        )
+        self.install_button.grid(row=0, column=0, padx=(0, 8))
+
+        self.portable_button = ttk.Button(
+            buttons,
+            text="Portable setup…",
+            command=self.choose_portable_folder,
+        )
+        self.portable_button.grid(row=0, column=1, padx=(0, 8))
+
+        self.cancel_button = ttk.Button(
+            buttons,
+            text="Cancel install",
+            command=self.cancel_install,
+            style="Danger.TButton",
+        )
+        self.cancel_button.grid(row=0, column=2, padx=(0, 8))
+        self.cancel_button.grid_remove()
+
+        ttk.Button(buttons, text="Close", command=self._on_close).grid(row=0, column=3)
+
+    def _append_log(self, line: str):
+        self.log_widget.configure(state="normal")
+        self.log_widget.insert(END, line + "\n")
+        self.log_widget.see(END)
+        self.log_widget.configure(state="disabled")
+
+    def _set_install_running(self, running: bool):
+        if running:
+            self.progress.grid()
+            self.progress.start(100)
+            self.install_button.configure(state="disabled")
+            self.portable_button.configure(state="disabled")
+            self.cancel_button.grid()
+            self.status_var.set("Installing via winget…")
+        else:
+            try:
+                self.progress.stop()
+            except Exception:
+                pass
+            self.progress.grid_remove()
+            self.install_button.configure(state="normal")
+            self.portable_button.configure(state="normal")
+            self.cancel_button.grid_remove()
+            if self.install_thread and self.install_thread.is_alive():
+                self.status_var.set("Cancelling…")
+            else:
+                self.status_var.set("Ready.")
+
+    def start_winget_install(self):
+        if self.install_thread and self.install_thread.is_alive():
+            return
+        if not winget_available():
+            messagebox.showerror("winget unavailable", "winget is not available. Try the portable setup option.")
+            return
+        self.cancel_event = threading.Event()
+
+        def worker():
+            success, message, cancelled = install_tool_via_winget(
+                self.tool,
+                cancel_event=self.cancel_event,
+                output_callback=lambda line: self.after(0, lambda: self._append_log(line)),
+            )
+            self.after(0, lambda: self._winget_finished(success, message, cancelled))
+
+        self._append_log("Starting winget installation…")
+        self._set_install_running(True)
+        self.install_thread = threading.Thread(target=worker, daemon=True)
+        self.install_thread.start()
+
+    def _winget_finished(self, success: bool, message: str, cancelled: bool):
+        self._set_install_running(False)
+        self.install_thread = None
+        self.cancel_event = None
+        if cancelled:
+            self.status_var.set("Installation cancelled.")
+            self._append_log("Installation cancelled by user.")
+            return
+        if success:
+            display = TOOL_DISPLAY[self.tool]
+            log(f"Installed {self.tool} via winget.")
+            self._append_log(message)
+            self.status_var.set("Installation completed.")
+            messagebox.showinfo("Install", f"Installed {display} via winget.")
+            self.app.refresh_tool_statuses()
+        else:
+            self.status_var.set("Installation failed.")
+            self._append_log(message)
+            messagebox.showerror("Install", message)
+
+    def cancel_install(self):
+        if self.cancel_event and not self.cancel_event.is_set():
+            self.cancel_event.set()
+            self._append_log("Cancelling winget installation…")
+
+    def choose_portable_folder(self):
+        folder = filedialog.askdirectory(title=f"Select portable folder for {TOOL_DISPLAY[self.tool]}")
+        if not folder:
+            return
+        success, message, _ = setup_portable_tool(self.tool, folder, WORKING_DIR_PATH)
+        if success:
+            self._append_log(message)
+            log(message)
+            messagebox.showinfo("Portable setup", message)
+            self.app.refresh_tool_statuses()
+        else:
+            self._append_log(message)
+            messagebox.showerror("Portable setup", message)
+
+    def _on_close(self):
+        if self.install_thread and self.install_thread.is_alive():
+            messagebox.showwarning("Installation running", "Cancel the installation before closing this window.")
+            return
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
 
 # ---------------- main ----------------
 def main():
