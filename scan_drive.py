@@ -75,7 +75,9 @@ def hash_blake3(file_path: str, chunk: int = 1024*1024) -> str:
     return h.hexdigest()
 
 def init_db(db_path: str):
-    conn = sqlite3.connect(db_path)
+    db_path_obj = Path(db_path)
+    db_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path_obj))
     c = conn.cursor()
     c.executescript("""
     PRAGMA journal_mode=WAL;
