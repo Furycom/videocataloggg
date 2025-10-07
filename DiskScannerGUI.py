@@ -8,6 +8,19 @@ from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+from paths import (
+    ensure_working_dir_structure,
+    get_catalog_db_path,
+    get_drive_types_path,
+    get_exports_dir,
+    get_logs_dir,
+    get_scans_dir,
+    get_shards_dir,
+    load_settings,
+    resolve_working_dir,
+    update_settings,
+)
 from tkinter import (
     Tk, StringVar, IntVar, END, N, S, E, W,
     filedialog, messagebox, ttk, Menu, Spinbox
@@ -15,14 +28,41 @@ from tkinter import (
 from tkinter.scrolledtext import ScrolledText
 
 # ---------------- Config & constantes ----------------
-BASE_DIR   = r"C:\Users\Administrator\VideoCatalog"
-DB_DEFAULT = str(Path(BASE_DIR) / "catalog.db")
-SCANS_DIR  = str(Path(BASE_DIR) / "scans")
-LOGS_DIR   = str(Path(BASE_DIR) / "logs")
-EXPORTS_DIR= str(Path(BASE_DIR) / "exports")
-SHARDS_DIR = str(Path(BASE_DIR) / "shards")
-TYPES_JSON = str(Path(BASE_DIR) / "drive_types.json")
-LOG_FILE   = str(Path(LOGS_DIR) / "scanner.log")
+WORKING_DIR_PATH = resolve_working_dir()
+ensure_working_dir_structure(WORKING_DIR_PATH)
+
+def _expand_user_path(value: str) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = WORKING_DIR_PATH / path
+    return path
+
+_SETTINGS = load_settings(WORKING_DIR_PATH)
+_settings_catalog = _SETTINGS.get("catalog_db") if isinstance(_SETTINGS, dict) else None
+
+if isinstance(_settings_catalog, str) and _settings_catalog.strip():
+    DB_DEFAULT_PATH = _expand_user_path(_settings_catalog.strip())
+else:
+    DB_DEFAULT_PATH = get_catalog_db_path(WORKING_DIR_PATH)
+
+BASE_DIR_PATH = WORKING_DIR_PATH
+SCANS_DIR_PATH = get_scans_dir(WORKING_DIR_PATH)
+LOGS_DIR_PATH = get_logs_dir(WORKING_DIR_PATH)
+EXPORTS_DIR_PATH = get_exports_dir(WORKING_DIR_PATH)
+SHARDS_DIR_PATH = get_shards_dir(WORKING_DIR_PATH)
+TYPES_JSON_PATH = get_drive_types_path(WORKING_DIR_PATH)
+
+DB_DEFAULT = str(DB_DEFAULT_PATH)
+BASE_DIR = str(BASE_DIR_PATH)
+SCANS_DIR = str(SCANS_DIR_PATH)
+LOGS_DIR = str(LOGS_DIR_PATH)
+EXPORTS_DIR = str(EXPORTS_DIR_PATH)
+SHARDS_DIR = str(SHARDS_DIR_PATH)
+TYPES_JSON = str(TYPES_JSON_PATH)
+LOG_FILE = str(LOGS_DIR_PATH / "scanner.log")
+
+update_settings(WORKING_DIR_PATH, catalog_db=DB_DEFAULT)
 
 VIDEO_EXTS = {
     ".mp4",".mkv",".avi",".mov",".wmv",".m4v",".ts",".m2ts",".webm",".mpg",".mpeg",".mp2",".vob",".flv",".3gp",".ogv",".mts",".m2t"
@@ -1153,15 +1193,23 @@ class App:
             messagebox.showinfo("Saved", f"Saved preset: {t}")
 
     # ----- DB actions
+    def _persist_catalog_path(self, path: str):
+        try:
+            update_settings(WORKING_DIR_PATH, catalog_db=str(Path(path)))
+        except Exception as exc:
+            log(f"[settings save error] {exc}")
+
     def db_new(self):
-        fn = filedialog.asksaveasfilename(defaultextension=".db", initialdir=BASE_DIR, title="Create new catalog DB")
+        initial_dir_path = Path(self.db_path.get()).parent if self.db_path.get() else Path(BASE_DIR)
+        fn = filedialog.asksaveasfilename(defaultextension=".db", initialdir=str(initial_dir_path), title="Create new catalog DB")
         if not fn: return
-        self.db_path.set(fn); init_catalog(fn); self.refresh_all()
+        self.db_path.set(fn); init_catalog(fn); self.refresh_all(); self._persist_catalog_path(fn)
 
     def db_open(self):
-        fn = filedialog.askopenfilename(initialdir=BASE_DIR, title="Open catalog DB", filetypes=[("SQLite DB","*.db"),("All","*.*")])
+        initial_dir_path = Path(self.db_path.get()).parent if self.db_path.get() else Path(BASE_DIR)
+        fn = filedialog.askopenfilename(initialdir=str(initial_dir_path), title="Open catalog DB", filetypes=[("SQLite DB","*.db"),("All","*.*")])
         if not fn: return
-        self.db_path.set(fn); init_catalog(fn); self.refresh_all()
+        self.db_path.set(fn); init_catalog(fn); self.refresh_all(); self._persist_catalog_path(fn)
 
     def db_reset(self):
         if not messagebox.askyesno("Reset", "This will wipe the current catalog tables (keeps shards). Continue?"):
@@ -1582,8 +1630,7 @@ class App:
 
 # ---------------- main ----------------
 def main():
-    os.makedirs(BASE_DIR, exist_ok=True)
-    for d in (SCANS_DIR, LOGS_DIR, EXPORTS_DIR, SHARDS_DIR): os.makedirs(d, exist_ok=True)
+    ensure_working_dir_structure(WORKING_DIR_PATH)
     init_catalog(DB_DEFAULT)
     root = Tk()
     App(root)
