@@ -24,8 +24,14 @@ All runtime assets live beneath `<working_dir>/data` by default, including `cata
 
 PowerShell entry points (`launch-gui.ps1` and `scan-drive.ps1`) automatically locate the repository via `$PSScriptRoot`, honor local virtual environments, and forward arguments safely so UNC paths and spaces are supported out of the box.
 
+## Tools & Diagnostics
+
+- Open **Tools ▸ Diagnostics…** in the GUI to review the availability, version, and resolved path for MediaInfo, FFmpeg, and smartctl.
+- The **Install…** action tries winget packages first. When winget is unavailable or fails, use the portable setup option to copy binaries into `<working_dir>/bin/<tool>`; the app adds that folder to the current session `PATH` automatically and remembers the location for next launch.
+- The **Locate…** button lets you select an existing executable manually. The absolute path is stored in `settings.json` so follow-up launches reuse the same binary without additional prompts.
+
 ## Troubleshooting
 
-- A red banner across the top of the window means a required media tool is missing. Install `mediainfo` and `ffmpeg` before launching a new scan. An installer will take care of these dependencies in a future release.
+- A yellow banner warns when MediaInfo or FFmpeg is missing. Use **Tools ▸ Diagnostics…** to install via winget, configure a portable copy, or point the app to an existing executable before launching a scan.
 - When the status ticker says “I am still working — no new items in the last few seconds — please wait”, the scan is still alive but no new files were discovered. This is expected during long directory walks.
 - The indeterminate activity indicator below the scan buttons stays visible while the worker is busy so you always know the app has not frozen.
