@@ -4,6 +4,16 @@ from pathlib import Path
 from typing import Optional
 import hashlib
 
+from paths import (
+    ensure_working_dir_structure,
+    get_catalog_db_path,
+    resolve_working_dir,
+)
+
+WORKING_DIR_PATH = resolve_working_dir()
+ensure_working_dir_structure(WORKING_DIR_PATH)
+DEFAULT_DB_PATH = str(get_catalog_db_path(WORKING_DIR_PATH))
+
 _tqdm_spec = importlib.util.find_spec("tqdm")
 if _tqdm_spec is None:
     def tqdm(iterable, **kwargs):
@@ -190,8 +200,11 @@ if __name__ == "__main__":
     if "--debug-slow-enumeration" in args:
         args.remove("--debug-slow-enumeration")
         debug_flag = True
-    if len(args) != 3:
-        print("Usage: python scan_drive.py <LABEL> <MOUNT_PATH> <DB_PATH>")
+    if len(args) not in (2, 3):
+        script_name = Path(__file__).name
+        print(f"Usage: python {script_name} <LABEL> <MOUNT_PATH> [<DB_PATH>]")
+        print(f"       Default DB path: {DEFAULT_DB_PATH}")
         sys.exit(1)
-    label, mount_path, db_path = args
+    label, mount_path = args[:2]
+    db_path = args[2] if len(args) == 3 else DEFAULT_DB_PATH
     scan_drive(label, mount_path, db_path, debug_slow=debug_flag)
