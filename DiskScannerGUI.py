@@ -243,12 +243,63 @@ class ScannerWorker(threading.Thread):
         self.stop_evt = stop_evt
         self.queue = event_queue
         self.job_id: Optional[int] = None
+        self._start_monotonic: Optional[float] = None
+        self._last_progress_emit: float = 0.0
+        self._total_all: int = 0
+        self._total_av: int = 0
+        self._current_phase: str = "enumerating"
+        self._tool_missing_reported = False
 
     def _put(self, payload: dict):
         try:
             self.queue.put_nowait(payload)
         except queue.Full:
             pass
+
+    def _emit_progress(
+        self,
+        phase: str,
+        files_seen: int,
+        av_seen: int,
+        total_all: Optional[int] = None,
+        force: bool = False,
+    ):
+        if self._tool_missing_reported:
+            return
+        now = time.perf_counter()
+        if self._start_monotonic is None:
+            self._start_monotonic = now
+        if not force and (now - self._last_progress_emit) < 5:
+            return
+        elapsed = int(now - (self._start_monotonic or now))
+        files_total_payload = total_all
+        if files_total_payload is None and self._total_all:
+            files_total_payload = self._total_all
+        total_av_payload = self._total_av or None
+        payload = {
+            "type": "progress",
+            "phase": phase,
+            "elapsed_s": elapsed,
+            "files_total": files_total_payload,
+            "files_seen": files_seen,
+            "av_seen": av_seen,
+            "done_all": files_seen,
+            "done_av": av_seen,
+        }
+        if files_total_payload is not None:
+            payload["total_all"] = files_total_payload
+        if total_av_payload is not None:
+            payload["total_av"] = total_av_payload
+        self._put(payload)
+        self._last_progress_emit = now
+
+    def _report_missing_tool(self, tool: str):
+        if self._tool_missing_reported:
+            return
+        self._tool_missing_reported = True
+        message = f"Error — {tool} not found. Please install {tool} and try again."
+        self._put({"type": "tool_missing", "tool": tool})
+        self._put({"type": "done", "status": "Error", "message": message})
 
     def run(self):
         try:
@@ -275,6 +326,14 @@ class ScannerWorker(threading.Thread):
             self._put({"type": "done", "status": "Error"})
             return
 
+        for tool in ("mediainfo", "ffmpeg"):
+            if not has_cmd(tool):
+                self._report_missing_tool(tool)
+                return
+
+        self._start_monotonic = time.perf_counter()
+        self._last_progress_emit = (self._start_monotonic or time.perf_counter()) - 6
+
         shard_path = Path(SHARDS_DIR) / f"{self.label}.db"
         os.makedirs(SHARDS_DIR, exist_ok=True)
 
@@ -287,11 +346,22 @@ class ScannerWorker(threading.Thread):
 
         all_files: list[str] = []
         total_av = 0
+        self._current_phase = "enumerating"
         for fp in iter_files(mount):
+            if self.stop_evt.is_set():
+                break
             all_files.append(fp)
             if Path(fp).suffix.lower() in AV_EXTS:
                 total_av += 1
-        total_all = len(all_files)
+            self._emit_progress(self._current_phase, len(all_files), total_av)
+        self._total_all = len(all_files)
+        self._total_av = total_av
+        self._emit_progress(self._current_phase, self._total_all, total_av, total_all=self._total_all, force=True)
+        total_all = self._total_all
+        if self.stop_evt.is_set():
+            self._put({"type": "status", "message": "Scan stopped."})
+            self._put({"type": "done", "status": "Stopped"})
+            return
 
         started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         smart_blob = try_smart_overview()
@@ -328,6 +398,8 @@ class ScannerWorker(threading.Thread):
             BATCH_SIZE = 200
             max_workers = max(1, min(self.max_workers, 32))
             log(f"[Job {self.job_id}] scanning with {max_workers} worker thread(s)")
+            self._current_phase = "hashing" if self.blake_for_av else "mediainfo"
+            self._emit_progress(self._current_phase, processed_all, done_av, total_all=total_all, force=True)
 
             with sqlite3.connect(str(shard_path)) as shard:
                 _ensure_shard_schema(shard)
@@ -389,14 +461,13 @@ class ScannerWorker(threading.Thread):
                         processed_all += 1
                         if av_inc:
                             done_av += av_inc
-                    if processed_all % 200 == 0 or processed_all == total_all:
-                        self._put({
-                            "type": "progress",
-                            "done_av": done_av,
-                            "total_av": total_av,
-                            "done_all": processed_all,
-                            "total_all": total_all
-                        })
+                    self._emit_progress(
+                        self._current_phase,
+                        processed_all,
+                        done_av,
+                        total_all=total_all,
+                        force=(processed_all % 200 == 0 or processed_all == total_all),
+                    )
 
                 def process_file(fp: str):
                     if self.stop_evt.is_set():
@@ -449,6 +520,9 @@ class ScannerWorker(threading.Thread):
 
                 flush()
 
+            self._current_phase = "finalizing"
+            self._emit_progress(self._current_phase, processed_all, done_av, total_all=total_all, force=True)
+
             duration = int(time.perf_counter() - t0)
             status = "Stopped" if self.stop_evt.is_set() else "Done"
             ccur.execute("""UPDATE jobs SET finished_at=datetime('now'), status=?, done_av=?, duration_sec=?, message=?
@@ -459,7 +533,14 @@ class ScannerWorker(threading.Thread):
             self._put({"type": "refresh_jobs"})
             final_msg = "Scan stopped." if self.stop_evt.is_set() else "Scan complete."
             self._put({"type": "status", "message": final_msg})
-            self._put({"type": "done", "status": status})
+            self._put({
+                "type": "done",
+                "status": status,
+                "total_all": total_all,
+                "done_av": done_av,
+                "total_av": self._total_av,
+                "duration": duration,
+            })
 
 # ---------------- GUI ----------------
 class App:
@@ -472,6 +553,24 @@ class App:
         except Exception:
             pass
         self.colors = self._setup_theme()
+        self.banner_styles = {
+            "INFO": {"frame": "BannerINFO.TFrame", "label": "BannerINFO.TLabel"},
+            "SUCCESS": {"frame": "BannerSUCCESS.TFrame", "label": "BannerSUCCESS.TLabel"},
+            "WARNING": {"frame": "BannerWARNING.TFrame", "label": "BannerWARNING.TLabel"},
+            "ERROR": {"frame": "BannerERROR.TFrame", "label": "BannerERROR.TLabel"},
+        }
+        self.status_line_active_style = "StatusLineActive.TLabel"
+        self.status_line_idle_style = "StatusLineIdle.TLabel"
+        self.status_line_idle_text = "Ready."
+        self.banner_after_id: Optional[str] = None
+        self.status_line_update_id: Optional[str] = None
+        self.scan_in_progress = False
+        self.scan_start_ts: Optional[float] = None
+        self.last_progress_ts: Optional[float] = None
+        self.progress_snapshot: Optional[dict] = None
+        self.heartbeat_active = False
+        self.activity_indicator_running = False
+        self._banner_visible = False
         self.status_styles = {
             "info": "StatusInfo.TLabel",
             "success": "StatusSuccess.TLabel",
@@ -516,6 +615,8 @@ class App:
             os.makedirs(d, exist_ok=True)
         init_catalog(self.db_path.get())
         self.refresh_all()
+        self._update_status_line(force=True)
+        self._schedule_status_ticker()
 
     # ----- UI builders
     def _setup_theme(self) -> dict[str, str]:
@@ -580,6 +681,43 @@ class App:
         ):
             self.style.configure(style_name, background=bg, foreground=fg, font=badge_font, padding=(12, 4))
 
+        # Status banner styles
+        for level, color in (
+            ("INFO", colors["info"]),
+            ("SUCCESS", colors["success"]),
+            ("WARNING", colors["warning"]),
+            ("ERROR", colors["danger"]),
+        ):
+            self.style.configure(f"Banner{level}.TFrame", background=color)
+            self.style.configure(
+                f"Banner{level}.TLabel",
+                background=color,
+                foreground=colors["background"],
+                font=("Segoe UI", 11, "bold"),
+                padding=(8, 6),
+            )
+
+        # Status line styles
+        base_font = ("Segoe UI", 10)
+        self.style.configure(
+            "StatusLineActive.TLabel",
+            background=colors["card"],
+            foreground=colors["text"],
+            font=base_font,
+        )
+        self.style.configure(
+            "StatusLineIdle.TLabel",
+            background=colors["card"],
+            foreground=colors["muted_text"],
+            font=base_font,
+        )
+        self.style.configure(
+            "Heartbeat.TLabel",
+            background=colors["card"],
+            foreground=colors["warning"],
+            font=("Segoe UI", 10, "bold"),
+        )
+
         return colors
 
     def _build_menu(self):
@@ -598,10 +736,29 @@ class App:
         menubar.add_cascade(label="Tools", menu=mtools)
 
     def _build_form(self):
-        self.content = ttk.Frame(self.root, padding=(20, 18), style="Content.TFrame")
-        self.content.grid(row=0, column=0, sticky=(N, S, E, W))
-        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_rowconfigure(0, weight=0)
+        self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
+
+        self.banner_container = ttk.Frame(self.root, style="Header.TFrame")
+        self.banner_container.grid(row=0, column=0, sticky="ew")
+        self.banner_container.columnconfigure(0, weight=1)
+
+        self.banner_message = StringVar(value="")
+        self.banner_frame = ttk.Frame(self.banner_container, style="BannerINFO.TFrame")
+        self.banner_frame.grid(row=0, column=0, sticky="ew")
+        self.banner_frame.columnconfigure(0, weight=1)
+        self.banner_label = ttk.Label(
+            self.banner_frame,
+            textvariable=self.banner_message,
+            anchor="center",
+            style="BannerINFO.TLabel",
+        )
+        self.banner_label.grid(row=0, column=0, sticky="ew", padx=4, pady=2)
+        self.banner_frame.grid_remove()
+
+        self.content = ttk.Frame(self.root, padding=(20, 18), style="Content.TFrame")
+        self.content.grid(row=1, column=0, sticky=(N, S, E, W))
         self.content.columnconfigure(0, weight=1)
 
         header = ttk.Frame(self.content, style="Header.TFrame", padding=(0, 0, 0, 16))
@@ -663,6 +820,28 @@ class App:
         ttk.Button(actions, text="Rescan (delete shard)", command=self.rescan).grid(row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Button(actions, text="Stop", command=self.stop_scan, style="Danger.TButton").grid(row=0, column=2, sticky="ew", padx=(8, 0))
         ttk.Button(actions, text="Export catalog", command=self.export_db).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+        status_activity = ttk.Frame(scan_frame, style="Card.TFrame")
+        status_activity.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        status_activity.columnconfigure(1, weight=1)
+
+        self.activity_indicator = ttk.Progressbar(
+            status_activity,
+            orient="horizontal",
+            mode="indeterminate",
+            style="Info.Horizontal.TProgressbar",
+            length=180,
+        )
+        self.activity_indicator.grid(row=0, column=0, sticky="w")
+        self.activity_indicator.grid_remove()
+
+        self.status_line_var = StringVar(value="Ready.")
+        self.status_line_label = ttk.Label(
+            status_activity,
+            textvariable=self.status_line_var,
+            style=self.status_line_idle_style,
+        )
+        self.status_line_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
     def _build_tables(self):
         self.content.rowconfigure(3, weight=1)
@@ -780,6 +959,120 @@ class App:
         style = self.status_styles.get(level, "StatusInfo.TLabel")
         if hasattr(self, "status_label"):
             self.status_label.configure(style=style)
+
+    def show_banner(self, message: str, level: str = "INFO"):
+        level_key = (level or "INFO").upper()
+        styles = self.banner_styles.get(level_key, self.banner_styles["INFO"])
+        if self.banner_after_id:
+            self.root.after_cancel(self.banner_after_id)
+            self.banner_after_id = None
+        self.banner_message.set(message)
+        self.banner_frame.configure(style=styles["frame"])
+        self.banner_label.configure(style=styles["label"])
+        if not self._banner_visible:
+            self.banner_frame.grid()
+            self._banner_visible = True
+        if level_key == "SUCCESS":
+            self.banner_after_id = self.root.after(8000, self.clear_banner)
+
+    def clear_banner(self):
+        if self.banner_after_id:
+            self.root.after_cancel(self.banner_after_id)
+            self.banner_after_id = None
+        if self._banner_visible:
+            self.banner_frame.grid_remove()
+            self._banner_visible = False
+        self.banner_message.set("")
+
+    def _start_activity_indicator(self):
+        if getattr(self, "activity_indicator", None) is None:
+            return
+        if not self.activity_indicator_running:
+            self.activity_indicator.grid()
+            self.activity_indicator.start(interval=100)
+            self.activity_indicator_running = True
+
+    def _stop_activity_indicator(self):
+        if getattr(self, "activity_indicator", None) is None:
+            return
+        if self.activity_indicator_running:
+            try:
+                self.activity_indicator.stop()
+            except Exception:
+                pass
+            self.activity_indicator.grid_remove()
+            self.activity_indicator_running = False
+
+    def _schedule_status_ticker(self):
+        if self.status_line_update_id is None and not self._closing:
+            self.status_line_update_id = self.root.after(5000, self._status_ticker_tick)
+
+    def _status_ticker_tick(self):
+        self.status_line_update_id = None
+        if self._closing:
+            return
+        self._update_status_line()
+        self._schedule_status_ticker()
+
+    def _format_elapsed(self, seconds: Optional[int]) -> str:
+        total = max(0, int(seconds or 0))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _update_status_line(self, force: bool = False):
+        if not hasattr(self, "status_line_var"):
+            return
+        now = time.time()
+        if self.scan_in_progress:
+            if self.last_progress_ts is None:
+                self.last_progress_ts = now
+            heartbeat_due = (
+                self.last_progress_ts is not None
+                and now - self.last_progress_ts >= 15
+            )
+            if heartbeat_due:
+                if not self.heartbeat_active:
+                    self.heartbeat_active = True
+                    self.status_line_label.configure(style="Heartbeat.TLabel")
+                self.status_line_var.set(
+                    "I am still working — no new items in the last few seconds — please wait"
+                )
+                return
+            if self.heartbeat_active:
+                self.heartbeat_active = False
+                self.status_line_label.configure(style=self.status_line_active_style)
+            snapshot = self.progress_snapshot or {}
+            if not snapshot:
+                self.status_line_label.configure(style=self.status_line_active_style)
+                self.status_line_var.set("Preparing…")
+                return
+            phase = str(snapshot.get("phase") or "working")
+            phase_text = phase.replace("_", " ").replace("-", " ")
+            elapsed = snapshot.get("elapsed_s")
+            if elapsed is None and self.scan_start_ts:
+                elapsed = int(now - self.scan_start_ts)
+            files_seen = snapshot.get("files_seen")
+            if files_seen is None:
+                files_seen = snapshot.get("done_all", 0) or 0
+            av_seen = snapshot.get("av_seen")
+            if av_seen is None:
+                av_seen = snapshot.get("done_av")
+            message = (
+                f"Working — phase: {phase_text} — elapsed: {self._format_elapsed(elapsed)}"
+                f" — files seen: {files_seen:,}"
+            )
+            if av_seen is not None:
+                message += f" — AV files: {av_seen:,}"
+            self.status_line_label.configure(style=self.status_line_active_style)
+            self.status_line_var.set(message)
+        else:
+            if self.heartbeat_active:
+                self.heartbeat_active = False
+            self.status_line_label.configure(style=self.status_line_idle_style)
+            self.status_line_var.set(self.status_line_idle_text)
 
     def _progress_style_for(self, percent: float) -> str:
         if percent >= 100:
@@ -1032,6 +1325,8 @@ class App:
             stop_evt=self.stop_evt,
             event_queue=self.worker_queue
         )
+        self.clear_banner()
+        self.show_banner("Scan started", "INFO")
         self._set_status("Scanning…", "accent")
         self.progress_percent_var.set("0%")
         self.total_percent_var.set("0%")
@@ -1042,6 +1337,21 @@ class App:
         self.av_progress["value"] = 0
         self.av_progress["maximum"] = 1
         self._update_progress_styles(0, 0)
+        self.scan_in_progress = True
+        self.scan_start_ts = time.time()
+        self.last_progress_ts = self.scan_start_ts
+        self.progress_snapshot = {
+            "phase": "enumerating",
+            "files_total": None,
+            "files_seen": 0,
+            "av_seen": 0,
+            "elapsed_s": 0,
+            "total_av": None,
+        }
+        self.heartbeat_active = False
+        self.status_line_idle_text = "Ready."
+        self._start_activity_indicator()
+        self._update_status_line(force=True)
         self.worker.start()
         self.root.after(800, self.refresh_jobs)
 
@@ -1072,32 +1382,68 @@ class App:
     def _handle_worker_event(self, event: dict):
         etype = event.get("type")
         if etype == "progress":
-            total_all = event.get("total_all", 0) or 0
-            done_all = event.get("done_all", 0) or 0
-            total_av = event.get("total_av", 0) or 0
-            done_av = event.get("done_av", 0) or 0
+            files_total = event.get("files_total")
+            if files_total is None:
+                alt_total = event.get("total_all")
+                if alt_total is not None:
+                    files_total = alt_total
+            files_seen = event.get("files_seen")
+            if files_seen is None:
+                files_seen = event.get("done_all", 0) or 0
+            av_seen = event.get("av_seen")
+            if av_seen is None:
+                av_seen = event.get("done_av")
+            total_av = event.get("total_av")
+            if total_av is None and self.progress_snapshot:
+                total_av = self.progress_snapshot.get("total_av")
+            phase = event.get("phase") or (self.progress_snapshot or {}).get("phase") or "working"
+            elapsed = event.get("elapsed_s")
 
-            self.total_progress["maximum"] = max(1, total_all)
-            self.total_progress["value"] = done_all
-            self.av_progress["maximum"] = max(1, total_av or 1)
-            self.av_progress["value"] = done_av
+            self.total_progress["maximum"] = max(1, files_total or 1)
+            self.total_progress["value"] = files_seen
+            av_total_for_bar = total_av if total_av not in (None, 0) else (total_av or 1)
+            self.av_progress["maximum"] = max(1, av_total_for_bar)
+            self.av_progress["value"] = av_seen or 0
 
-            overall_pct = (done_all / total_all * 100) if total_all else 0.0
-            av_pct = (done_av / total_av * 100) if total_av else 0.0
+            overall_pct = (files_seen / files_total * 100) if files_total else 0.0
+            av_pct = (av_seen / total_av * 100) if (total_av not in (None, 0)) else 0.0
 
             self.progress_percent_var.set(f"{overall_pct:.0f}%")
             self.total_percent_var.set(f"{overall_pct:.0f}%")
-            self.av_percent_var.set(f"{av_pct:.0f}%" if total_av else "—")
+            self.av_percent_var.set(
+                f"{av_pct:.0f}%" if total_av not in (None, 0) else "—"
+            )
 
-            if total_all:
-                detail = f"{done_all:,}/{total_all:,} files · {done_av:,}/{total_av:,} AV"
-                status_text = f"Scanning • {done_all:,}/{total_all:,} files"
+            if files_total:
+                if total_av not in (None, 0):
+                    detail = f"{files_seen:,}/{files_total:,} files · {av_seen or 0:,}/{total_av:,} AV"
+                else:
+                    detail = f"{files_seen:,}/{files_total:,} files"
+                status_text = f"Scanning • {files_seen:,}/{files_total:,} files"
             else:
                 detail = "Gathering files…"
                 status_text = "Scanning…"
             self.progress_detail_var.set(detail)
             self._set_status(status_text, "accent")
-            self._update_progress_styles(overall_pct, av_pct if total_av else 0.0)
+            self._update_progress_styles(overall_pct, av_pct if total_av not in (None, 0) else 0.0)
+
+            self.progress_snapshot = {
+                "phase": phase,
+                "files_total": files_total,
+                "files_seen": files_seen,
+                "av_seen": av_seen if av_seen is not None else 0,
+                "elapsed_s": elapsed,
+                "total_av": total_av,
+                "done_av": av_seen if av_seen is not None else 0,
+                "done_all": files_seen,
+            }
+            if event.get("total_all") is not None:
+                self.progress_snapshot["total_all"] = event.get("total_all")
+            self.last_progress_ts = time.time()
+            if self.heartbeat_active:
+                self.heartbeat_active = False
+                self.status_line_label.configure(style=self.status_line_active_style)
+            self._update_status_line(force=True)
         elif etype == "status":
             msg = event.get("message", "")
             lower = msg.lower()
@@ -1108,6 +1454,18 @@ class App:
             else:
                 level = "info"
             self._set_status(msg, level)
+        elif etype == "tool_missing":
+            tool = str(event.get("tool", "")).strip() or "tool"
+            self.scan_in_progress = False
+            self._stop_activity_indicator()
+            message = f"Error — {tool} not found. Please install {tool} and try again."
+            self.show_banner(message, "ERROR")
+            self._set_status("Scan error.", "error")
+            self.progress_detail_var.set("Scan stopped due to missing tool.")
+            self.status_line_idle_text = message
+            self.progress_snapshot = None
+            self.last_progress_ts = None
+            self._update_status_line(force=True)
         elif etype == "refresh_jobs":
             self.refresh_jobs()
         elif etype == "error":
@@ -1117,12 +1475,41 @@ class App:
         elif etype == "done":
             self._await_worker_completion()
             status = event.get("status", "Ready")
+            self.scan_in_progress = False
+            self._stop_activity_indicator()
+            self.heartbeat_active = False
+            self.last_progress_ts = None
+            self.scan_start_ts = None
+            summary_snapshot = self.progress_snapshot or {}
+            total_all = event.get("total_all")
+            if total_all is None:
+                total_all = summary_snapshot.get("files_total")
+            total_av = event.get("done_av")
+            if total_av is None:
+                total_av = summary_snapshot.get("av_seen")
+            duration = event.get("duration")
+            if duration is None and summary_snapshot.get("elapsed_s") is not None:
+                duration = summary_snapshot.get("elapsed_s")
             if status == "Done":
                 self._set_status("Ready.", "success")
+                summary_text = (
+                    "Done — total files: "
+                    f"{(total_all or 0):,} — AV files: {(total_av or 0):,} — duration: {self._format_elapsed(duration)}"
+                )
+                self.status_line_idle_text = summary_text
+                self.show_banner("Scan completed successfully", "SUCCESS")
             elif status == "Stopped":
                 self._set_status("Scan stopped.", "warning")
+                self.status_line_idle_text = "Scan canceled."
+                self.show_banner("Scan canceled", "WARNING")
             else:
-                self._set_status(status)
+                default_msg = event.get("message") or status or "Scan error."
+                if status.lower() == "error":
+                    self.show_banner(default_msg, "ERROR")
+                elif not self._banner_visible:
+                    self.show_banner(default_msg, "WARNING")
+                self._set_status(default_msg)
+                self.status_line_idle_text = default_msg
             self.progress_detail_var.set("No scan running.")
             self.progress_percent_var.set("0%")
             self.total_percent_var.set("0%")
@@ -1132,6 +1519,8 @@ class App:
             self.av_progress["value"] = 0
             self.av_progress["maximum"] = 1
             self._update_progress_styles(0, 0)
+            self.progress_snapshot = None
+            self._update_status_line(force=True)
 
     def _try_finalize_worker(self):
         if self.worker and not self.worker.is_alive():
