@@ -13,10 +13,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 from paths import (
     ensure_working_dir_structure,
@@ -32,6 +33,18 @@ from perf import (
     RateController,
     enumerate_sleep_range,
     resolve_performance_config,
+)
+from robust import (
+    CancellationToken,
+    PathTooLongError,
+    clamp_batch_seconds,
+    from_fs_path,
+    is_hidden,
+    is_transient,
+    key_for_path,
+    merge_settings,
+    should_ignore,
+    to_fs_path,
 )
 
 WORKING_DIR_PATH = resolve_working_dir()
@@ -80,10 +93,13 @@ AV_EXTS = VIDEO_EXTS | AUDIO_EXTS
 
 @dataclass(slots=True)
 class FileInfo:
-    path: str
+    path: str  # original display/DB path
+    fs_path: str  # path used for filesystem operations (may include long-path prefix)
     size_bytes: int
     mtime_utc: str
     is_av: bool
+    existing_id: Optional[int] = None
+    was_deleted: bool = False
 
 
 @dataclass(slots=True)
@@ -212,56 +228,9 @@ def _is_av(path: str) -> bool:
     return Path(path).suffix.lower() in AV_EXTS
 
 
-def _enumerate_files(
-    base_path: Path,
-    *,
-    debug_slow: bool = False,
-    progress_callback: Optional[Callable[[str, int, int], None]] = None,
-    gentle_sleep: Optional[Tuple[float, float]] = None,
-) -> List[FileInfo]:
-    stack: List[Path] = [base_path]
-    results: List[FileInfo] = []
-    last_emit = time.monotonic()
-
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(Path(entry.path))
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    try:
-                        stat = entry.stat(follow_symlinks=False)
-                    except (FileNotFoundError, PermissionError, OSError):
-                        continue
-                    info = FileInfo(
-                        path=entry.path,
-                        size_bytes=int(stat.st_size),
-                        mtime_utc=_iso_from_timestamp(stat.st_mtime),
-                        is_av=_is_av(entry.path),
-                    )
-                    results.append(info)
-                    if gentle_sleep:
-                        time.sleep(random.uniform(*gentle_sleep))
-                    if debug_slow:
-                        time.sleep(0.01)
-                    if progress_callback and (time.monotonic() - last_emit) >= 5:
-                        progress_callback("enumerating", len(results), 0)
-                        last_emit = time.monotonic()
-        except PermissionError:
-            LOGGER.warning("Permission denied while enumerating %s", current)
-        except FileNotFoundError:
-            continue
-    if progress_callback:
-        progress_callback("enumerating", len(results), 0)
-    results.sort(key=lambda item: item.path)
-    return results
-
-
-def _load_existing(conn: sqlite3.Connection, drive_label: str) -> Dict[str, dict]:
+def _load_existing(
+    conn: sqlite3.Connection, drive_label: str, *, casefold: bool
+) -> Dict[str, dict]:
     cur = conn.cursor()
     cur.execute(
         "SELECT id, path, size_bytes, mtime_utc, deleted FROM files WHERE drive_label=?",
@@ -270,8 +239,10 @@ def _load_existing(conn: sqlite3.Connection, drive_label: str) -> Dict[str, dict
     existing: Dict[str, dict] = {}
     for row in cur.fetchall():
         file_id, path, size_bytes, mtime_utc, deleted = row
-        existing[path] = {
+        key = key_for_path(path, casefold=casefold)
+        existing[key] = {
             "id": file_id,
+            "path": path,
             "size_bytes": size_bytes,
             "mtime_utc": mtime_utc,
             "deleted": int(deleted or 0),
@@ -437,6 +408,7 @@ def scan_drive(
     debug_slow: bool = False,
     settings: Optional[Dict[str, object]] = None,
     perf_overrides: Optional[Dict[str, object]] = None,
+    robust_overrides: Optional[Dict[str, object]] = None,
 ) -> dict:
     mount = Path(mount_path)
     if not mount.exists():
@@ -523,6 +495,33 @@ def scan_drive(
     )
     conn.commit()
 
+    is_windows = os.name == "nt"
+    robust_raw: Dict[str, object] = {}
+    if isinstance(effective_settings, dict):
+        maybe_robust = effective_settings.get("robust")
+        if isinstance(maybe_robust, dict):
+            robust_raw = maybe_robust
+    robust_overrides = robust_overrides or {}
+    robust_cfg = merge_settings(robust_raw, robust_overrides)
+    robust_cfg.batch_seconds = clamp_batch_seconds(robust_cfg.batch_seconds, perf_config.profile)
+    LOGGER.info("Robust settings: %s", robust_cfg.as_log_line())
+
+    ignore_patterns: List[str] = []
+    ignore_patterns.extend(list(robust_cfg.ignore))
+    ignore_patterns.extend(list(robust_cfg.skip_globs))
+    if ignore_patterns:
+        seen_patterns: set[str] = set()
+        ordered_patterns: List[str] = []
+        for pattern in ignore_patterns:
+            pattern = pattern.strip()
+            if not pattern or pattern in seen_patterns:
+                continue
+            ordered_patterns.append(pattern)
+            seen_patterns.add(pattern)
+        ignore_patterns = ordered_patterns
+    else:
+        ignore_patterns = []
+
     state_store = ScanStateStore(conn, label, interval_seconds=int(checkpoint_seconds))
     if not resume:
         state_store.clear()
@@ -530,221 +529,505 @@ def scan_drive(
     else:
         resume_state = state_store.load()
 
-    def _progress_event(phase: str, count: int, _unused: int) -> None:
-        LOGGER.debug("%s — files enumerated: %s", phase, count)
+    resume_path = resume_state.get("last_path_processed") if resume_state else None
+    resume_key = key_for_path(resume_path, casefold=is_windows) if resume_path else None
+    resume_consumed = not bool(resume_key)
+
+    cancel_token = CancellationToken()
+
+    metrics = {
+        "dirs_scanned": 0,
+        "files_seen": 0,
+        "av_total": 0,
+        "skipped_perm": 0,
+        "skipped_toolong": 0,
+        "skipped_ignored": 0,
+        "retries": 0,
+    }
+
+    processed_files = 0
+    processed_av = 0
+    unchanged_count = 0
+    total_enqueued = 0
+    pending_tasks = 0
+    last_processed_path = resume_path
+
+    progress_last_emit = 0.0
+
+    def _emit_progress(phase: str, *, force: bool = False) -> None:
+        nonlocal progress_last_emit, last_processed_path
+        now = time.monotonic()
+        if not force and (now - progress_last_emit) < 5:
+            return
+        elapsed = int(now - start_time)
+        payload = {
+            "type": "progress",
+            "phase": phase,
+            "elapsed_s": elapsed,
+            "dirs_scanned": metrics["dirs_scanned"],
+            "files_total": metrics["files_seen"],
+            "files_seen": processed_files,
+            "av_seen": processed_av,
+            "skipped_perm": metrics["skipped_perm"],
+            "skipped_toolong": metrics["skipped_toolong"],
+            "skipped_ignored": metrics["skipped_ignored"],
+        }
+        if metrics["av_total"]:
+            payload["total_av"] = metrics["av_total"]
+        try:
+            print(json.dumps(payload), flush=True)
+        except Exception:
+            pass
+        LOGGER.debug(
+            "%s — dirs=%s files=%s processed=%s skipped=(perm=%s,long=%s,ignored=%s)",
+            phase,
+            metrics["dirs_scanned"],
+            metrics["files_seen"],
+            processed_files,
+            metrics["skipped_perm"],
+            metrics["skipped_toolong"],
+            metrics["skipped_ignored"],
+        )
         if resume:
-            state_store.checkpoint(phase, None)
+            state_store.checkpoint(phase, last_processed_path if last_processed_path else None, force=force)
+        progress_last_emit = now
+
+    def _stat_path(path: str, *, follow_symlinks: bool) -> Optional[os.stat_result]:
+        attempts = 0
+        delay = 0.5
+        while attempts < 3 and not cancel_token.is_set():
+            attempts += 1
+            try:
+                start = time.monotonic()
+                result = os.stat(path, follow_symlinks=follow_symlinks)
+                elapsed = time.monotonic() - start
+                if elapsed > robust_cfg.op_timeout_s:
+                    raise TimeoutError(f"stat timeout after {elapsed:.1f}s")
+                return result
+            except PermissionError:
+                metrics["skipped_perm"] += 1
+                LOGGER.warning("Permission denied while stating %s", from_fs_path(path))
+                return None
+            except OSError as exc:
+                if is_transient(exc) and attempts < 3:
+                    metrics["retries"] += 1
+                    time.sleep(min(2.0, delay))
+                    delay *= 2
+                    continue
+                LOGGER.warning("stat failed for %s: %s", from_fs_path(path), exc)
+                return None
+        return None
+
+    def _open_scandir(fs_path: str, display_path: str) -> Optional[os.ScandirIterator]:
+        attempts = 0
+        delay = 0.5
+        while attempts < 3 and not cancel_token.is_set():
+            attempts += 1
+            try:
+                start = time.monotonic()
+                iterator = os.scandir(fs_path)
+                elapsed = time.monotonic() - start
+                if elapsed > robust_cfg.op_timeout_s:
+                    iterator.close()
+                    raise TimeoutError(f"scandir timeout after {elapsed:.1f}s")
+                return iterator
+            except PermissionError:
+                metrics["skipped_perm"] += 1
+                LOGGER.warning("Permission denied while enumerating %s", display_path)
+                return None
+            except OSError as exc:
+                if is_transient(exc) and attempts < 3:
+                    metrics["retries"] += 1
+                    time.sleep(min(2.0, delay))
+                    delay *= 2
+                    continue
+                LOGGER.warning("Failed to enumerate %s: %s", display_path, exc)
+                return None
+        LOGGER.warning("Giving up on %s after repeated failures", display_path)
+        return None
 
     enumeration_sleep = enumerate_sleep_range(perf_config.profile, perf_config.gentle_io)
-    file_infos = _enumerate_files(
-        mount,
-        debug_slow=debug_slow,
-        progress_callback=_progress_event,
-        gentle_sleep=enumeration_sleep,
+
+    base_sleep_range = None
+    if perf_config.profile == "NETWORK":
+        base_sleep_range = (0.002, 0.005)
+    elif perf_config.gentle_io and perf_config.profile == "USB":
+        base_sleep_range = (0.0015, 0.003)
+
+    rate_controller = RateController(
+        enabled=bool(perf_config.gentle_io or perf_config.profile == "NETWORK"),
+        worker_threads=perf_config.worker_threads,
+        base_sleep_range=base_sleep_range,
+        latency_threshold=0.05 if perf_config.profile == "NETWORK" else 0.04,
     )
-    existing_rows = _load_existing(conn, label)
+    ffmpeg_semaphore = threading.Semaphore(max(1, perf_config.ffmpeg_parallel))
+    task_queue: "queue.Queue[object]" = queue.Queue(maxsize=max(1, int(robust_cfg.queue_max)))
+    result_queue: "queue.Queue[WorkerResult]" = queue.Queue()
+    sentinel = object()
+    mediainfo_path = TOOL_PATHS.get("mediainfo")
+    ffmpeg_path = TOOL_PATHS.get("ffmpeg")
+    retry_delays = (0.1, 0.3, 0.9)
 
-    enumerated_paths = {info.path for info in file_infos}
-    stale_paths = [path for path in existing_rows.keys() if path not in enumerated_paths]
-    deleted_count, deleted_examples = _mark_deleted(conn, label, deleted_paths=stale_paths)
-    if deleted_count:
-        LOGGER.info(
-            "Marked %s files as deleted (examples: %s)",
-            deleted_count,
-            ", ".join(deleted_examples) if deleted_examples else "—",
-        )
+    existing_rows = _load_existing(conn, label, casefold=is_windows)
+    if resume_key and resume_key not in existing_rows:
+        resume_consumed = True
 
-    pending: List[FileInfo] = []
-    unchanged: List[FileInfo] = []
-    for info in file_infos:
-        prev = existing_rows.get(info.path)
-        if full_rescan:
-            pending.append(info)
-        elif prev is None or prev.get("deleted"):
-            pending.append(info)
-        else:
-            prev_size = prev.get("size_bytes")
-            prev_mtime = prev.get("mtime_utc")
-            if prev_size != info.size_bytes or prev_mtime != info.mtime_utc:
-                pending.append(info)
-            else:
-                unchanged.append(info)
+    restore_batch: List[str] = []
+    pending_updates: List[Tuple[int, Optional[str], Optional[str], Optional[int], str, int]] = []
+    pending_inserts: List[Tuple[str, str, int, Optional[str], Optional[str], Optional[int], str]] = []
+    last_flush = time.monotonic()
+    pragma_batches = 0
 
-    _restore_active(conn, label, [info.path for info in unchanged])
-
-    resume_index = -1
-    if resume and resume_state:
-        last_path = resume_state.get("last_path_processed")
-        if last_path:
-            for idx, info in enumerate(pending):
-                if info.path == last_path:
-                    resume_index = idx
-                    break
-
-    work_list = pending if resume_index < 0 else pending[resume_index + 1 :]
-    processed_files = 0 if resume_index < 0 else resume_index + 1
-    processed_av = sum(1 for info in pending[: processed_files] if info.is_av)
-
-    LOGGER.info(
-        "Enumerated %s files (%s AV). Pending work: %s (unchanged: %s).",
-        len(file_infos),
-        sum(1 for info in file_infos if info.is_av),
-        len(work_list),
-        len(unchanged),
-    )
-
-    if resume and work_list:
-        last_path = pending[processed_files - 1].path if processed_files > 0 else None
-        state_store.checkpoint("hashing", last_path, force=True)
-
-    results_expected = len(work_list)
-    last_processed_path = pending[processed_files - 1].path if processed_files > 0 else None
-
-    if work_list:
-        base_sleep_range = None
-        if perf_config.profile == "NETWORK":
-            base_sleep_range = (0.002, 0.005)
-        elif perf_config.gentle_io and perf_config.profile == "USB":
-            base_sleep_range = (0.0015, 0.003)
-
-        rate_controller = RateController(
-            enabled=bool(perf_config.gentle_io or perf_config.profile == "NETWORK"),
-            worker_threads=perf_config.worker_threads,
-            base_sleep_range=base_sleep_range,
-            latency_threshold=0.05 if perf_config.profile == "NETWORK" else 0.04,
-        )
-        ffmpeg_semaphore = threading.Semaphore(max(1, perf_config.ffmpeg_parallel))
-        task_queue: "queue.Queue[object]" = queue.Queue()
-        result_queue: "queue.Queue[WorkerResult]" = queue.Queue()
-        sentinel = object()
-        mediainfo_path = TOOL_PATHS.get("mediainfo")
-        ffmpeg_path = TOOL_PATHS.get("ffmpeg")
-        retry_delays = (0.1, 0.3, 0.9)
-
-        def _process_file(info: FileInfo) -> WorkerResult:
-            integrity_ok: Optional[int] = None if info.is_av else 1
-            media_blob: Optional[str] = None
-            hash_value: Optional[str] = None
-            error_message: Optional[str] = None
-            attempts = 0
-
-            while True:
-                try:
-                    delay = rate_controller.before_task(task_queue.qsize())
-                    if delay > 0:
-                        time.sleep(delay)
-
-                    def _on_chunk(bytes_read: int, elapsed: float) -> None:
-                        if bytes_read > 0:
-                            rate_controller.note_io(elapsed)
-
-                    hash_value = hash_blake3(
-                        info.path,
-                        chunk=perf_config.hash_chunk_bytes,
-                        on_chunk=_on_chunk,
-                    )
-                    metadata = (
-                        mediainfo_json(info.path, mediainfo_path) if info.is_av else None
-                    )
-                    if metadata is not None:
-                        media_blob = json.dumps(metadata, ensure_ascii=False)
-                        integrity_ok = 0 if metadata.get("error") else 1
-                    else:
-                        media_blob = None
-                        integrity_ok = None if info.is_av else 1
-                    if info.is_av:
-                        with ffmpeg_semaphore:
-                            ok = ffmpeg_verify(info.path, ffmpeg_path)
-                        if ok is False:
-                            integrity_ok = 0
-                    rate_controller.note_success()
-                    error_message = None
-                    break
-                except (OSError, IOError) as exc:
-                    rate_controller.note_error()
-                    attempts += 1
-                    if attempts < len(retry_delays):
-                        time.sleep(retry_delays[attempts - 1])
-                        continue
-                    LOGGER.warning("I/O error while processing %s: %s", info.path, exc)
-                    media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                    integrity_ok = 0
-                    hash_value = None
-                    error_message = str(exc)
-                    break
-                except Exception as exc:
-                    rate_controller.note_error()
-                    LOGGER.exception("Failed to process %s", info.path)
-                    media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                    integrity_ok = 0
-                    hash_value = None
-                    error_message = str(exc)
-                    break
-
-            return WorkerResult(
-                info=info,
-                hash_value=hash_value,
-                media_blob=media_blob,
-                integrity_ok=integrity_ok,
-                error_message=error_message,
+    def _flush_db(force: bool = False) -> None:
+        nonlocal pending_updates, pending_inserts, restore_batch, last_flush, pragma_batches
+        if not force:
+            if (
+                (len(pending_updates) + len(pending_inserts)) < robust_cfg.batch_files
+                and (time.monotonic() - last_flush) < robust_cfg.batch_seconds
+            ):
+                return
+        cur = conn.cursor()
+        executed = False
+        if pending_updates:
+            cur.executemany(
+                """
+                UPDATE files
+                SET size_bytes=?, hash_blake3=?, media_json=?, integrity_ok=?, mtime_utc=?, deleted=0, deleted_ts=NULL
+                WHERE id=?
+                """,
+                pending_updates,
             )
-
-        def _worker() -> None:
-            while True:
-                item = task_queue.get()
+            pending_updates = []
+            executed = True
+        if pending_inserts:
+            cur.executemany(
+                """
+                INSERT INTO files(
+                    drive_label, path, size_bytes, hash_blake3, media_json, integrity_ok, mtime_utc, deleted, deleted_ts
+                )
+                VALUES(?,?,?,?,?,?,?,0,NULL)
+                """,
+                pending_inserts,
+            )
+            pending_inserts = []
+            executed = True
+        if restore_batch:
+            cur.executemany(
+                "UPDATE files SET deleted=0, deleted_ts=NULL WHERE drive_label=? AND path=?",
+                [(label, path) for path in restore_batch],
+            )
+            restore_batch = []
+            executed = True
+        if executed:
+            conn.commit()
+            pragma_batches += 1
+            if pragma_batches % 25 == 0:
                 try:
-                    if item is sentinel:
-                        break
-                    assert isinstance(item, FileInfo)
-                    result_queue.put(_process_file(item))
-                finally:
-                    task_queue.task_done()
+                    conn.execute("PRAGMA optimize")
+                except sqlite3.Error:
+                    pass
+        if executed or force:
+            last_flush = time.monotonic()
 
-        workers: List[threading.Thread] = []
-        for _ in range(perf_config.worker_threads):
-            thread = threading.Thread(target=_worker, name="scan-worker")
-            thread.daemon = True
-            thread.start()
-            workers.append(thread)
-
-        for info in work_list:
-            task_queue.put(info)
-        for _ in workers:
-            task_queue.put(sentinel)
-
-        completed = 0
-        while completed < results_expected:
+    def _drain_results(block: bool = False) -> None:
+        nonlocal pending_tasks, processed_files, processed_av, last_processed_path
+        timeout = 0.5 if block else 0.0
+        while pending_tasks:
             try:
-                result = result_queue.get(timeout=1.0)
+                result = result_queue.get(timeout=timeout)
             except queue.Empty:
-                if resume:
-                    state_store.checkpoint("hashing", last_processed_path)
-                continue
-            _upsert_file(
-                conn,
-                label,
-                result.info,
-                hash_value=result.hash_value,
-                media_blob=result.media_blob,
-                integrity_ok=result.integrity_ok,
-            )
+                break
+            pending_tasks -= 1
+            info = result.info
             processed_files += 1
-            if result.info.is_av:
+            if info.is_av:
                 processed_av += 1
-            completed += 1
-            last_processed_path = result.info.path
-            if resume:
-                state_store.checkpoint("hashing", result.info.path)
+            last_processed_path = info.path
             if result.error_message:
-                LOGGER.debug("Recorded warning for %s: %s", result.info.path, result.error_message)
+                LOGGER.debug("Recorded warning for %s: %s", info.path, result.error_message)
+            if info.existing_id:
+                pending_updates.append(
+                    (
+                        int(info.size_bytes),
+                        result.hash_value,
+                        result.media_blob,
+                        result.integrity_ok,
+                        info.mtime_utc,
+                        int(info.existing_id),
+                    )
+                )
+            else:
+                pending_inserts.append(
+                    (
+                        label,
+                        info.path,
+                        int(info.size_bytes),
+                        result.hash_value,
+                        result.media_blob,
+                        result.integrity_ok,
+                        info.mtime_utc,
+                    )
+                )
+            _flush_db(force=False)
+            _emit_progress("hashing")
 
-        task_queue.join()
-        for thread in workers:
-            thread.join()
+    def _process_file(info: FileInfo) -> WorkerResult:
+        integrity_ok: Optional[int] = None if info.is_av else 1
+        media_blob: Optional[str] = None
+        hash_value: Optional[str] = None
+        error_message: Optional[str] = None
+        attempts = 0
+
+        while not cancel_token.is_set():
+            try:
+                delay = rate_controller.before_task(task_queue.qsize())
+                if delay > 0:
+                    time.sleep(delay)
+
+                def _on_chunk(bytes_read: int, elapsed: float) -> None:
+                    if bytes_read > 0:
+                        rate_controller.note_io(elapsed)
+
+                hash_value = hash_blake3(
+                    info.fs_path,
+                    chunk=perf_config.hash_chunk_bytes,
+                    on_chunk=_on_chunk,
+                )
+                metadata = mediainfo_json(info.fs_path, mediainfo_path) if info.is_av else None
+                if metadata is not None:
+                    media_blob = json.dumps(metadata, ensure_ascii=False)
+                    integrity_ok = 0 if metadata.get("error") else 1
+                else:
+                    media_blob = None
+                    integrity_ok = None if info.is_av else 1
+                if info.is_av and not cancel_token.is_set():
+                    with ffmpeg_semaphore:
+                        ok = ffmpeg_verify(info.fs_path, ffmpeg_path)
+                    if ok is False:
+                        integrity_ok = 0
+                rate_controller.note_success()
+                error_message = None
+                break
+            except (OSError, IOError) as exc:
+                rate_controller.note_error()
+                attempts += 1
+                if attempts < len(retry_delays):
+                    time.sleep(retry_delays[attempts - 1])
+                    continue
+                LOGGER.warning("I/O error while processing %s: %s", info.path, exc)
+                media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                integrity_ok = 0
+                hash_value = None
+                error_message = str(exc)
+                break
+            except Exception as exc:
+                rate_controller.note_error()
+                LOGGER.exception("Failed to process %s", info.path)
+                media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                integrity_ok = 0
+                hash_value = None
+                error_message = str(exc)
+                break
+        else:
+            error_message = "cancelled"
+
+        return WorkerResult(
+            info=info,
+            hash_value=hash_value,
+            media_blob=media_blob,
+            integrity_ok=integrity_ok,
+            error_message=error_message,
+        )
+
+    def _worker() -> None:
+        while True:
+            try:
+                item = task_queue.get(timeout=0.5)
+            except queue.Empty:
+                if cancel_token.is_set():
+                    continue
+                continue
+            try:
+                if item is sentinel:
+                    break
+                assert isinstance(item, FileInfo)
+                if cancel_token.is_set():
+                    continue
+                result_queue.put(_process_file(item))
+            finally:
+                task_queue.task_done()
+
+    workers: List[threading.Thread] = []
+    for _ in range(perf_config.worker_threads):
+        thread = threading.Thread(target=_worker, name="scan-worker")
+        thread.daemon = True
+        thread.start()
+        workers.append(thread)
+
+    try:
+        root_display = str(mount)
+        try:
+            root_fs = to_fs_path(root_display, mode=robust_cfg.long_paths)
+        except PathTooLongError:
+            metrics["skipped_toolong"] += 1
+            LOGGER.error("Mount path too long: %s", root_display)
+            cancel_token.set()
+            root_fs = root_display
+
+        stack: Deque[Tuple[str, str]] = deque()
+        stack.append((root_display, root_fs))
+        visited_dirs: set[Tuple[int, int]] = set()
+        if robust_cfg.follow_symlinks:
+            root_stat = _stat_path(root_fs, follow_symlinks=True)
+            if root_stat:
+                visited_dirs.add((root_stat.st_dev, root_stat.st_ino))
+
+        while stack and not cancel_token.is_set():
+            display_dir, fs_dir = stack.pop()
+            iterator = _open_scandir(fs_dir, display_dir)
+            if iterator is None:
+                continue
+            metrics["dirs_scanned"] += 1
+            with iterator as it:
+                for entry in it:
+                    if cancel_token.is_set():
+                        break
+                    entry_fs = entry.path
+                    display_entry = from_fs_path(entry_fs)
+                    if robust_cfg.skip_hidden and is_hidden(entry, fs_path=entry_fs, display_path=display_entry):
+                        metrics["skipped_ignored"] += 1
+                        continue
+                    if ignore_patterns and should_ignore(display_entry, patterns=ignore_patterns):
+                        metrics["skipped_ignored"] += 1
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=robust_cfg.follow_symlinks):
+                            try:
+                                next_fs = to_fs_path(display_entry, mode=robust_cfg.long_paths)
+                            except PathTooLongError:
+                                metrics["skipped_toolong"] += 1
+                                LOGGER.warning("Skipping long directory %s", display_entry)
+                                continue
+                            if robust_cfg.follow_symlinks:
+                                dir_stat = _stat_path(next_fs, follow_symlinks=True)
+                                if not dir_stat:
+                                    continue
+                                inode_key = (dir_stat.st_dev, dir_stat.st_ino)
+                                if inode_key in visited_dirs:
+                                    LOGGER.warning("Detected symlink loop at %s", display_entry)
+                                    continue
+                                visited_dirs.add(inode_key)
+                            stack.append((display_entry, next_fs))
+                            continue
+                    except OSError:
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    stat_result = _stat_path(entry_fs, follow_symlinks=False)
+                    if stat_result is None:
+                        continue
+                    try:
+                        fs_file = to_fs_path(display_entry, mode=robust_cfg.long_paths)
+                    except PathTooLongError:
+                        metrics["skipped_toolong"] += 1
+                        LOGGER.warning("Skipping long path %s", display_entry)
+                        continue
+                    info = FileInfo(
+                        path=display_entry,
+                        fs_path=fs_file,
+                        size_bytes=int(stat_result.st_size),
+                        mtime_utc=_iso_from_timestamp(stat_result.st_mtime),
+                        is_av=_is_av(display_entry),
+                    )
+                    metrics["files_seen"] += 1
+                    if info.is_av:
+                        metrics["av_total"] += 1
+                    existing_key = key_for_path(info.path, casefold=is_windows)
+                    existing_row = existing_rows.pop(existing_key, None)
+                    if existing_row is not None:
+                        info.existing_id = existing_row["id"]
+                        info.was_deleted = bool(existing_row["deleted"])
+                        if (
+                            not full_rescan
+                            and not info.was_deleted
+                            and int(existing_row["size_bytes"]) == info.size_bytes
+                            and existing_row["mtime_utc"] == info.mtime_utc
+                        ):
+                            restore_batch.append(existing_row["path"])
+                            unchanged_count += 1
+                            if len(restore_batch) >= 2000:
+                                _flush_db(force=True)
+                            continue
+                    if resume and not resume_consumed:
+                        processed_files += 1
+                        if info.is_av:
+                            processed_av += 1
+                        last_processed_path = info.path
+                        if resume_key == existing_key:
+                            resume_consumed = True
+                        continue
+                    while not cancel_token.is_set():
+                        try:
+                            task_queue.put(info, timeout=0.5)
+                            pending_tasks += 1
+                            total_enqueued += 1
+                            break
+                        except queue.Full:
+                            _drain_results(block=True)
+                            _flush_db(force=False)
+                    if cancel_token.is_set():
+                        break
+                    if enumeration_sleep:
+                        time.sleep(random.uniform(*enumeration_sleep))
+                    if debug_slow:
+                        time.sleep(0.01)
+                    _drain_results(block=False)
+                    _emit_progress("enumerating")
+    except KeyboardInterrupt:
+        cancel_token.set()
+        LOGGER.warning("Scan cancelled by user.")
+    except Exception as exc:
+        cancel_token.set()
+        LOGGER.exception("Enumeration failure: %s", exc)
+
+    _emit_progress("enumerating", force=True)
+
+    for _ in workers:
+        while True:
+            try:
+                task_queue.put(sentinel, timeout=0.5)
+                break
+            except queue.Full:
+                _drain_results(block=True)
+                _flush_db(force=False)
+
+    while pending_tasks:
+        _drain_results(block=True)
+    _flush_db(force=True)
+
+    task_queue.join()
+    for thread in workers:
+        thread.join()
+
+    _emit_progress("hashing", force=True)
+
+    deleted_count = 0
+    deleted_examples: List[str] = []
+    if not cancel_token.is_set():
+        stale_paths = [row["path"] for row in existing_rows.values()]
+        deleted_count, deleted_examples = _mark_deleted(conn, label, deleted_paths=stale_paths)
+        if deleted_count:
+            LOGGER.info(
+                "Marked %s files as deleted (examples: %s)",
+                deleted_count,
+                ", ".join(deleted_examples) if deleted_examples else "—",
+            )
 
     if resume:
-        if work_list:
-            state_store.checkpoint("hashing", last_processed_path, force=True)
+        state_store.checkpoint("hashing", last_processed_path, force=True)
         state_store.checkpoint("finalizing", None, force=True)
         state_store.clear()
 
@@ -756,16 +1039,27 @@ def scan_drive(
         processed_av,
         duration,
     )
+    LOGGER.info(
+        "Skipped: perm=%s, long=%s, ignored=%s (retries=%s)",
+        metrics["skipped_perm"],
+        metrics["skipped_toolong"],
+        metrics["skipped_ignored"],
+        metrics["retries"],
+    )
     conn.close()
     return {
-        "total_files": len(file_infos),
-        "av_files": sum(1 for info in file_infos if info.is_av),
-        "pending": len(work_list),
-        "unchanged": len(unchanged),
+        "total_files": metrics["files_seen"],
+        "av_files": metrics["av_total"],
+        "pending": total_enqueued,
+        "unchanged": unchanged_count,
         "deleted": deleted_count,
         "duration_seconds": duration,
         "performance": perf_config.as_dict(),
+        "skipped_perm": metrics["skipped_perm"],
+        "skipped_toolong": metrics["skipped_toolong"],
+        "skipped_ignored": metrics["skipped_ignored"],
     }
+
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -802,6 +1096,47 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--debug-slow-enumeration",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--batch-files",
+        type=int,
+        help="Batch database commits after this many files (default: 1000).",
+    )
+    parser.add_argument(
+        "--batch-seconds",
+        type=float,
+        help="Maximum seconds between batched commits (default: 2).",
+    )
+    parser.add_argument(
+        "--queue-max",
+        type=int,
+        help="Maximum work items queued ahead of hashing (default: 10000).",
+    )
+    parser.add_argument(
+        "--skip-hidden",
+        action="store_true",
+        help="Skip hidden/system files and directories during enumeration.",
+    )
+    parser.add_argument(
+        "--skip-glob",
+        action="append",
+        metavar="PATTERN",
+        help="Glob pattern to ignore (repeatable).",
+    )
+    parser.add_argument(
+        "--follow-symlinks",
+        action="store_true",
+        help="Follow symlinks and junctions; cycles are detected and skipped.",
+    )
+    parser.add_argument(
+        "--long-paths",
+        choices=["auto", "force", "off"],
+        help="Control Windows extended-length path handling (default: auto).",
+    )
+    parser.add_argument(
+        "--op-timeout",
+        type=int,
+        help="Filesystem operation timeout in seconds before retry (default: 30).",
     )
     parser.add_argument(
         "--full-rescan",
@@ -981,6 +1316,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     if getattr(args, "perf_gentle_io", None) is not None:
         perf_cli_overrides["gentle_io"] = args.perf_gentle_io
 
+    robust_cli_overrides: Dict[str, object] = {}
+    if getattr(args, "batch_files", None) is not None:
+        robust_cli_overrides["batch_files"] = args.batch_files
+    if getattr(args, "batch_seconds", None) is not None:
+        robust_cli_overrides["batch_seconds"] = args.batch_seconds
+    if getattr(args, "queue_max", None) is not None:
+        robust_cli_overrides["queue_max"] = args.queue_max
+    if getattr(args, "skip_hidden", False):
+        robust_cli_overrides["skip_hidden"] = True
+    if getattr(args, "skip_glob", None):
+        robust_cli_overrides["skip_globs"] = args.skip_glob
+    if getattr(args, "follow_symlinks", False):
+        robust_cli_overrides["follow_symlinks"] = True
+    if getattr(args, "long_paths", None) is not None:
+        robust_cli_overrides["long_paths"] = args.long_paths
+    if getattr(args, "op_timeout", None) is not None:
+        robust_cli_overrides["op_timeout_s"] = args.op_timeout
+
     settings_data = load_settings(WORKING_DIR_PATH)
 
     result = scan_drive(
@@ -993,6 +1346,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         debug_slow=debug_flag,
         settings=settings_data,
         perf_overrides=perf_cli_overrides,
+        robust_overrides=robust_cli_overrides,
     )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0

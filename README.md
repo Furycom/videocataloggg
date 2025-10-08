@@ -56,6 +56,44 @@ CLI flags override both detection and persisted settings when needed:
 
 The GUI shows the active profile above the progress bars so you can confirm how the scan is tuned in real time.
 
+## Robust enumeration & filters
+
+Scanning massive directory trees or slow network shares now uses a fully iterative walker with bounded backpressure so memory stays stable even with millions of entries. The CLI batches database commits (default: 1,000 files or 2 seconds) and pauses enumeration automatically when the hashing queue hits its limit. Operations are retried with exponential backoff on transient SMB/CIFS errors and per-operation timeouts (default: 30 seconds) prevent the scanner from hanging indefinitely when a share stalls.
+
+`settings.json` can persist these knobs under a new `"robust"` section:
+
+```json
+{
+  "robust": {
+    "batch_files": 1000,
+    "batch_seconds": 2,
+    "queue_max": 10000,
+    "skip_hidden": false,
+    "ignore": ["Thumbs.db", "*.tmp"],
+    "skip_globs": [],
+    "follow_symlinks": false,
+    "long_paths": "auto",
+    "op_timeout_s": 30
+  }
+}
+```
+
+CLI overrides mirror these settings:
+
+- `--batch-files N` / `--batch-seconds N` – tweak commit batching.
+- `--queue-max N` – bound the hashing backlog.
+- `--skip-hidden` – ignore hidden/system files.
+- `--skip-glob PATTERN` (repeatable) – skip glob patterns; e.g. `--skip-glob "*.bak" --skip-glob "Cache/*"`.
+- `--follow-symlinks` – opt-in to traversing symlinks/junctions (cycles are detected and logged once).
+- `--long-paths auto|force|off` – control `\\?\` extended-length prefixes on Windows.
+- `--op-timeout N` – per-operation timeout before retries.
+
+UNC and network shares remain first-class citizens: `scan_drive.py --label NAS --mount \\\\media-server\\videos --queue-max 2000 --batch-seconds 1` gently paces enumeration to keep remote paths responsive. Long Windows paths are handled transparently when `long_paths` is `auto` or `force`; if a share still refuses the prefix the path is skipped, counted, and reported without aborting the scan.
+
+Symlinks are skipped by default to avoid junction loops. When following links is enabled, the scanner tracks `(st_dev, st_ino)` pairs so cycles are broken with a warning and the run continues.
+
+Both the CLI and GUI surface new skip counters (`perm`, `long`, `ignored`) alongside the existing heartbeat so you can see permission denials, long-path fallbacks, and glob filters at a glance.
+
 ## Paths & working directory
 
 The scanner now resolves its working directory deterministically:
