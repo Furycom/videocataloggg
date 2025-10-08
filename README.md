@@ -118,6 +118,20 @@ PowerShell entry points (`launch-gui.ps1` and `scan-drive.ps1`) automatically lo
 - Run `scan_drive.py --export-csv` or `--export-jsonl` after a scan to stream results directly to disk. Combine with `--include-deleted`, `--av-only`, and `--since 2024-01-01T00:00:00Z` to filter rows before they are written. Provide a path (e.g. `--export-csv C:/tmp/files.csv`) to override the default location.
 - The GUI adds an **Exports** menu and menubutton with quick actions for CSV/JSONL along with checkboxes for “Include deleted” and “AV only”. Completed exports raise a toast and the post-scan banner offers an *Open exports folder* shortcut when new files were produced.
 
+## Database Maintenance
+
+- Open **Tools ▸ Maintenance…** in the GUI to review the catalog database and every shard. The dialog lists file sizes, highlights when a scan is active, and exposes one-click actions:
+  - **Quick Optimize** — creates a lightweight backup then runs `REINDEX`, `ANALYZE`, and `PRAGMA optimize`.
+  - **Check Integrity** — runs `PRAGMA quick_check`/`integrity_check` and reports any issues.
+  - **Full Maintenance** — backup → reindex/analyze/optimize → size reclaim via `VACUUM` when thresholds are met (or immediately when forced).
+  - **VACUUM (force)** — backup then forced `VACUUM`, useful after large deletions.
+  - **Backup Now** — stores a compact copy under `<working_dir>/backups/sqlite/`.
+- Maintenance runs in a background thread with a cancellable progress window so the GUI stays responsive. Status updates land in the live log and the status bar heartbeat remains active.
+- The dialog disables actions when the scanner is working on the same database and shows a tooltip explaining why.
+- The CLI mirrors these capabilities via `scan_drive.py --maint-action ACTION [--maint-target catalog|shard:<label>|all-shards] [--maint-force]`. It prints a summary per database and exits non-zero when an integrity check fails.
+- Every destructive action (reindex or VACUUM) writes a `.bak` into `<working_dir>/backups/sqlite/` before touching the database. Manual VACUUM from the Database menu now follows the same safety steps.
+- After a successful scan the app automatically runs a light `PRAGMA optimize` on the affected shard and, when `settings.json` sets `"maintenance": { "auto_vacuum_after_scan": true }`, also triggers a checkpointed VACUUM with a fresh backup.
+
 ## Troubleshooting
 
 - A yellow banner warns when MediaInfo or FFmpeg is missing. Use **Tools ▸ Diagnostics…** to install via winget, configure a portable copy, or point the app to an existing executable before launching a scan.

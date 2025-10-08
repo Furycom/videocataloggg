@@ -23,8 +23,10 @@ from paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
     get_shard_db_path,
+    get_shards_dir,
     load_settings,
     resolve_working_dir,
+    safe_label,
 )
 from exports import ExportFilters, export_catalog, parse_since
 from tools import bootstrap_local_bin, probe_tool
@@ -45,6 +47,17 @@ from robust import (
     merge_settings,
     should_ignore,
     to_fs_path,
+)
+
+from db_maint import (
+    MaintenanceOptions,
+    check_integrity,
+    light_backup,
+    quick_optimize,
+    reindex_and_analyze,
+    resolve_options,
+    update_maintenance_metadata,
+    vacuum_if_needed,
 )
 
 WORKING_DIR_PATH = resolve_working_dir()
@@ -1083,6 +1096,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Optional path to the shard database (defaults to working dir).",
     )
     parser.add_argument(
+        "--maint-target",
+        dest="maint_target",
+        help="Maintenance target: catalog, shard:<label>, or all-shards.",
+    )
+    parser.add_argument(
+        "--maint-action",
+        choices=["quick", "integrity", "full", "vacuum", "backup"],
+        help="Run database maintenance instead of scanning.",
+    )
+    parser.add_argument(
+        "--maint-force",
+        action="store_true",
+        help="Force VACUUM during maintenance, overriding free-space thresholds.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging output.",
@@ -1232,6 +1260,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     if namespace.catalog_db is None and positional:
         namespace.catalog_db = positional.pop(0)
 
+    if namespace.maint_action:
+        namespace.positional = positional
+        return namespace
+
     if namespace.label is None or namespace.mount_path is None:
         parser.error("Both --label and --mount are required.")
 
@@ -1254,11 +1286,221 @@ def _format_duration(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02}"
 
 
+def _format_bytes(value: int) -> str:
+    if value <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    remaining = float(value)
+    for unit in units:
+        if remaining < 1024.0 or unit == units[-1]:
+            return f"{remaining:.1f} {unit}" if unit != "B" else f"{int(remaining)} {unit}"
+        remaining /= 1024.0
+    return f"{remaining:.1f} PB"
+
+
 def _format_filter_summary(filters: ExportFilters) -> str:
     since = filters.since_utc or "—"
     include = "true" if filters.include_deleted else "false"
     av_only = "true" if filters.av_only else "false"
     return f"include_deleted={include}, av_only={av_only}, since={since}"
+
+
+def _resolve_maintenance_targets(
+    target_spec: Optional[str], catalog_db_path: Path
+) -> List[Dict[str, object]]:
+    spec = (target_spec or "catalog").strip()
+    lower = spec.lower()
+    targets: List[Dict[str, object]] = []
+    if lower in {"catalog", "catalog.db"}:
+        targets.append({"kind": "catalog", "label": "catalog", "path": catalog_db_path})
+        return targets
+    if lower in {"all-shards", "all"}:
+        shards_dir = get_shards_dir(WORKING_DIR_PATH)
+        if shards_dir.exists():
+            for shard_path in sorted(shards_dir.glob("*.db")):
+                targets.append(
+                    {
+                        "kind": "shard",
+                        "label": shard_path.stem,
+                        "path": shard_path,
+                    }
+                )
+        return targets
+    if lower.startswith("shard:"):
+        label = spec.split(":", 1)[1]
+    else:
+        label = spec
+    candidate_path = Path(spec)
+    if candidate_path.exists() and candidate_path.is_file():
+        targets.append({"kind": "shard", "label": candidate_path.stem, "path": candidate_path})
+        return targets
+    shard_path = get_shard_db_path(WORKING_DIR_PATH, label)
+    targets.append({"kind": "shard", "label": label, "path": shard_path})
+    return targets
+
+
+def _execute_maintenance_action(
+    action: str,
+    target: Dict[str, object],
+    options: MaintenanceOptions,
+    *,
+    force: bool,
+) -> Dict[str, object]:
+    path = Path(target["path"])
+    label = str(target["label"])
+    kind = str(target.get("kind") or "shard")
+    display = "Catalog" if kind == "catalog" else f"Shard {label}"
+    safe = safe_label(label)
+    result: Dict[str, object] = {"line": ""}
+    if action == "integrity":
+        integrity = check_integrity(path, busy_timeout_ms=options.busy_timeout_ms)
+        ok = bool(integrity.get("ok"))
+        issues = integrity.get("issues") or []
+        summary = "OK" if ok else "FAILED"
+        line = f"{display}: Integrity {summary}"
+        if issues and not ok:
+            sample = "; ".join(str(item) for item in list(issues)[:3])
+            line += f" — sample: {sample}"
+        result.update({"line": line, "integrity_ok": ok})
+        update_maintenance_metadata(
+            last_run=datetime.utcnow(),
+            last_integrity_ok=ok,
+            working_dir=WORKING_DIR_PATH,
+        )
+        return result
+
+    if action == "backup":
+        backup = light_backup(path, f"manual_{safe}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=options.busy_timeout_ms)
+        result["line"] = f"{display}: Backup stored at {backup}"
+        update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+        return result
+
+    if action == "quick":
+        backup = light_backup(path, f"quick_{safe}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=options.busy_timeout_ms)
+        metrics = reindex_and_analyze(path, busy_timeout_ms=options.busy_timeout_ms)
+        duration = metrics.get("duration_s")
+        indexes = metrics.get("indexes_after")
+        duration_text = f"{float(duration):.2f}s" if isinstance(duration, (int, float)) else "—"
+        result["line"] = (
+            f"{display}: Quick optimize complete (indexes={indexes}, duration={duration_text}, backup={backup})"
+        )
+        update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+        return result
+
+    if action == "full":
+        backup = light_backup(path, f"full_{safe}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=options.busy_timeout_ms)
+        metrics = reindex_and_analyze(path, busy_timeout_ms=options.busy_timeout_ms)
+        vacuum_result = vacuum_if_needed(
+            path,
+            thresholds={"vacuum_free_bytes_min": options.vacuum_free_bytes_min},
+            busy_timeout_ms=options.busy_timeout_ms,
+            force=force,
+        )
+        reclaimed = int(vacuum_result.get("reclaimed_bytes") or 0)
+        result.update(
+            {
+                "line": (
+                    f"{display}: Full maintenance complete (indexes={metrics.get('indexes_after')}, "
+                    f"reclaimed={_format_bytes(reclaimed)}, backup={backup})"
+                ),
+                "reclaimed_bytes": reclaimed,
+            }
+        )
+        update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+        return result
+
+    if action == "vacuum":
+        backup = light_backup(path, f"vacuum_{safe}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=options.busy_timeout_ms)
+        vacuum_result = vacuum_if_needed(
+            path,
+            thresholds={"vacuum_free_bytes_min": options.vacuum_free_bytes_min},
+            busy_timeout_ms=options.busy_timeout_ms,
+            force=force,
+        )
+        if vacuum_result.get("skipped"):
+            line = f"{display}: VACUUM skipped (threshold not met). Backup at {backup}"
+            reclaimed = 0
+        else:
+            reclaimed = int(vacuum_result.get("reclaimed_bytes") or 0)
+            line = f"{display}: VACUUM reclaimed {_format_bytes(reclaimed)} (backup={backup})"
+        result.update({"line": line, "reclaimed_bytes": reclaimed})
+        update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+        return result
+
+    raise ValueError(f"Unsupported maintenance action: {action}")
+
+
+def _run_cli_maintenance(args: argparse.Namespace, catalog_db_path: Path) -> int:
+    targets = _resolve_maintenance_targets(args.maint_target, catalog_db_path)
+    if not targets:
+        LOGGER.error("No maintenance targets resolved.")
+        print("[ERROR] No maintenance targets resolved.", file=sys.stderr)
+        return 1
+    options = resolve_options(load_settings(WORKING_DIR_PATH))
+    action = args.maint_action
+    force = bool(getattr(args, "maint_force", False))
+    total_reclaimed = 0
+    exit_code = 0
+    for target in targets:
+        path = Path(target["path"])
+        if not path.exists():
+            LOGGER.warning("Maintenance target missing: %s", path)
+            print(f"[WARN] Target not found: {path}", file=sys.stderr)
+            exit_code = max(exit_code, 1)
+            continue
+        try:
+            summary = _execute_maintenance_action(action, target, options, force=force)
+        except Exception as exc:
+            LOGGER.error("Maintenance failed for %s: %s", target["label"], exc)
+            print(f"[ERROR] Maintenance failed for {target['label']}: {exc}", file=sys.stderr)
+            return 5
+        print(summary.get("line", ""))
+        reclaimed = int(summary.get("reclaimed_bytes") or 0)
+        total_reclaimed += reclaimed
+        if summary.get("integrity_ok") is False:
+            exit_code = max(exit_code, 6)
+    if action in {"vacuum", "full"} and total_reclaimed > 0:
+        print(f"Total reclaimed: {_format_bytes(total_reclaimed)}")
+    return exit_code
+
+
+def _auto_optimize_after_scan(shard_path: Path, label: str, options: MaintenanceOptions) -> None:
+    if not shard_path.exists():
+        return
+    try:
+        LOGGER.info("Auto optimize shard %s", label)
+        quick_optimize(shard_path, busy_timeout_ms=options.busy_timeout_ms)
+        if options.auto_vacuum_after_scan:
+            backup = light_backup(
+                shard_path,
+                f"auto_{safe_label(label)}",
+                working_dir=WORKING_DIR_PATH,
+                busy_timeout_ms=options.busy_timeout_ms,
+            )
+            LOGGER.info("Auto vacuum backup stored at %s", backup)
+            vacuum_result = vacuum_if_needed(
+                shard_path,
+                thresholds={"vacuum_free_bytes_min": options.vacuum_free_bytes_min},
+                busy_timeout_ms=options.busy_timeout_ms,
+                force=False,
+                active_check=lambda: False,
+            )
+            if vacuum_result.get("skipped"):
+                LOGGER.info(
+                    "Auto vacuum skipped for %s (reason=%s)",
+                    label,
+                    vacuum_result.get("reason") or "threshold",
+                )
+            else:
+                reclaimed = int(vacuum_result.get("reclaimed_bytes") or 0)
+                LOGGER.info(
+                    "Auto vacuum reclaimed %s for %s",
+                    _format_bytes(reclaimed),
+                    label,
+                )
+        update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+    except Exception as exc:
+        LOGGER.warning("Auto maintenance failed for %s: %s", label, exc)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1288,6 +1530,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"catalog: {catalog_db_path} | shard: {shard_db_path}"
     )
     LOGGER.info(startup_info)
+
+    if args.maint_action:
+        return _run_cli_maintenance(args, catalog_db_path)
 
     try:
         since_value = parse_since(getattr(args, "since", None))
@@ -1394,6 +1639,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     print(summary_line)
+    try:
+        maintenance_options = resolve_options(settings_data)
+        _auto_optimize_after_scan(Path(shard_db_path), args.label, maintenance_options)
+    except Exception:
+        LOGGER.debug("Auto maintenance skipped due to configuration error.")
     return 0
 
 
