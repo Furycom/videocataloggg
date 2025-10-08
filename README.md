@@ -32,9 +32,8 @@ PowerShell entry points (`launch-gui.ps1` and `scan-drive.ps1`) automatically lo
 
 ## Rescan modes
 
-The scanner now supports two rescan strategies:
+Delta rescans compare the current drive contents to the existing shard database and only process files that are new, modified, or restored. Items that disappeared are marked as soft-deleted with a timestamp so history is preserved without removing rows.
 
-- **Delta rescan (recommended)** compares the current drive contents with the last catalog snapshot and only processes files that are new, modified, or restored. Files that disappeared are marked as soft-deleted with a timestamp so they can be tracked without losing history.
-- **Full rescan** forces a complete re-hash of every file regardless of previous results. Use this when you need to rebuild the shard from scratch, but be aware it can take significantly longer on large drives.
+Full rescans reprocess every file regardless of previous results. This mode is useful for rebuilding a shard from scratch but can take significantly longer on large drives.
 
-Scans automatically write periodic checkpoints to each shard. If a scan stops unexpectedly, leave the “Resume interrupted scan” option enabled and the next run will continue from the most recent consistent point instead of restarting from zero.
+Each shard stores periodic checkpoints while a scan runs. If a run stops unexpectedly, leave “Resume interrupted scan” enabled and the next launch continues from the last consistent checkpoint instead of starting from zero.

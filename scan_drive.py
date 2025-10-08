@@ -4,17 +4,17 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import hashlib
 import importlib
-import subprocess
 
 from paths import (
     ensure_working_dir_structure,
@@ -29,13 +29,17 @@ DEFAULT_DB_PATH = str(get_catalog_db_path(WORKING_DIR_PATH))
 LOGGER = logging.getLogger("videocatalog.scan")
 
 
-@dataclass
-class FileInfo:
-    path: str
-    size_bytes: int
-    mtime: float
-    mtime_iso: str
-    is_av: bool
+def _expand_user_path(value: str) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    return Path(expanded)
+
+
+_blake3_spec = importlib.util.find_spec("blake3")
+_blake3_hash = importlib.import_module("blake3").blake3 if _blake3_spec is not None else None
+
+
+def _has_cmd(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
 
 
 _VIDEO_EXTS = {
@@ -50,6 +54,10 @@ _VIDEO_EXTS = {
     ".webm",
     ".mpg",
     ".mpeg",
+    ".flv",
+    ".vob",
+    ".ogv",
+    ".3gp",
 }
 _AUDIO_EXTS = {
     ".mp3",
@@ -69,14 +77,25 @@ _AUDIO_EXTS = {
 _AV_EXTS = _VIDEO_EXTS | _AUDIO_EXTS
 
 
-_blake3_spec = importlib.util.find_spec("blake3")
-_blake3_hash = importlib.import_module("blake3").blake3 if _blake3_spec is not None else None
+@dataclass
+class FileInfo:
+    path: str
+    size_bytes: int
+    mtime: float
+    mtime_iso: str
+    is_av: bool
+
+
+@dataclass
+class WorkItem:
+    info: FileInfo
+    op: str  # "insert" or "update"
 
 
 class ProgressEmitter:
     def __init__(self) -> None:
-        self._last_emit: float = 0.0
         self._start: Optional[float] = None
+        self._last_emit: float = 0.0
 
     def emit(
         self,
@@ -93,10 +112,11 @@ class ProgressEmitter:
             self._start = now
         if not force and (now - self._last_emit) < 5.0:
             return
+        elapsed = int(now - (self._start or now))
         payload: Dict[str, object] = {
             "type": "progress",
             "phase": phase,
-            "elapsed_s": int(now - (self._start or now)),
+            "elapsed_s": elapsed,
             "files_seen": files_seen,
             "done_all": files_seen,
             "av_seen": av_seen,
@@ -125,8 +145,7 @@ class ScanStateStore:
     def load(self) -> Dict[str, str]:
         cur = self.conn.cursor()
         cur.execute("SELECT key, value FROM scan_state")
-        data = {row[0]: row[1] for row in cur.fetchall()}
-        return data
+        return {row[0]: row[1] for row in cur.fetchall()}
 
     def save(self, phase: str, last_path: Optional[str]) -> None:
         now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -148,6 +167,189 @@ class ScanStateStore:
         self.conn.commit()
 
 
+class CheckpointManager:
+    def __init__(self, store: Optional[ScanStateStore], seconds: int) -> None:
+        self.store = store
+        self.seconds = max(1, int(seconds))
+        self._last = time.monotonic()
+
+    def maybe(self, phase: str, last_path: Optional[str]) -> None:
+        if not self.store:
+            return
+        now = time.monotonic()
+        if (now - self._last) >= self.seconds:
+            self.store.save(phase, last_path)
+            self._last = now
+
+    def force(self, phase: str, last_path: Optional[str] = "") -> None:
+        if not self.store:
+            return
+        self.store.save(phase, last_path)
+        self._last = time.monotonic()
+
+
+def _hash_file(file_path: str) -> Optional[str]:
+    try:
+        if _blake3_hash is not None:
+            hasher = _blake3_hash()
+        else:
+            hasher = hashlib.sha256()
+        with open(file_path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
+        return None
+
+
+def _mediainfo(file_path: str) -> Optional[dict]:
+    try:
+        result = subprocess.check_output(
+            ["mediainfo", "--Output=JSON", file_path],
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if result.strip():
+            return json.loads(result)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 127:
+            return None
+        return {"error": exc.output.strip() if exc.output else "mediainfo_failed"}
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return {"error": str(exc)}
+    return None
+
+
+def _ffmpeg_verify(file_path: str) -> Optional[bool]:
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-xerror",
+                "-i",
+                file_path,
+                "-f",
+                "null",
+                "-",
+                "-nostdin",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode == 0:
+            return True
+        return False
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return False
+
+
+def _try_smart_overview() -> Optional[str]:
+    if not _has_cmd("smartctl"):
+        return None
+    acc = {"scan": None, "details": []}
+    try:
+        proc = subprocess.run(["smartctl", "--scan-open"], capture_output=True, text=True, check=False)
+        if proc.returncode == 0 and proc.stdout:
+            acc["scan"] = proc.stdout
+        for idx in range(0, 10):
+            detail = subprocess.run(
+                ["smartctl", "-i", "-H", "-A", "-j", fr"\\.\PhysicalDrive{idx}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if detail.returncode == 0 and detail.stdout:
+                try:
+                    acc["details"].append(json.loads(detail.stdout))
+                except json.JSONDecodeError:
+                    pass
+        return json.dumps(acc, ensure_ascii=False)
+    except Exception:
+        return None
+
+
+def _ensure_catalog_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS drives(
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL UNIQUE,
+            mount_path TEXT NOT NULL,
+            total_bytes INTEGER,
+            free_bytes INTEGER,
+            smart_scan TEXT,
+            scanned_at TEXT NOT NULL,
+            scan_mode TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _ensure_shard_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files(
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
+            size_bytes INTEGER,
+            is_av INTEGER DEFAULT 0,
+            hash_blake3 TEXT,
+            media_json TEXT,
+            integrity_ok INTEGER,
+            mtime_utc TEXT,
+            deleted INTEGER DEFAULT 0,
+            deleted_ts TEXT
+        )
+        """
+    )
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(files)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    if "is_av" not in existing_columns:
+        cur.execute("ALTER TABLE files ADD COLUMN is_av INTEGER DEFAULT 0")
+    if "hash_blake3" not in existing_columns:
+        cur.execute("ALTER TABLE files ADD COLUMN hash_blake3 TEXT")
+    if "media_json" not in existing_columns:
+        cur.execute("ALTER TABLE files ADD COLUMN media_json TEXT")
+    if "integrity_ok" not in existing_columns:
+        cur.execute("ALTER TABLE files ADD COLUMN integrity_ok INTEGER")
+    if "mtime_utc" not in existing_columns:
+        cur.execute("ALTER TABLE files ADD COLUMN mtime_utc TEXT")
+    if "deleted" not in existing_columns:
+        cur.execute("ALTER TABLE files ADD COLUMN deleted INTEGER DEFAULT 0")
+    if "deleted_ts" not in existing_columns:
+        cur.execute("ALTER TABLE files ADD COLUMN deleted_ts TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path ON files(path)")
+    conn.commit()
+
+
+def _init_catalog_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    _ensure_catalog_schema(conn)
+    return conn
+
+
+def _init_shard_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    _ensure_shard_schema(conn)
+    return conn
+
+
 class DriveScanner:
     def __init__(
         self,
@@ -163,144 +365,20 @@ class DriveScanner:
     ) -> None:
         self.label = label
         self.mount_path = Path(mount_path)
-        self.catalog_db = Path(catalog_db)
-        self.shard_db = Path(shard_db)
+        self.catalog_db = catalog_db
+        self.shard_db = shard_db
         self.full_rescan = full_rescan
         self.resume = resume
         self.checkpoint_seconds = max(1, int(checkpoint_seconds))
         self.debug_slow = debug_slow
         self.emitter = ProgressEmitter()
-        self._last_checkpoint = 0.0
         self._state_store: Optional[ScanStateStore] = None
-        self._ffmpeg_available = shutil.which("ffmpeg") is not None
-        self._mediainfo_available = shutil.which("mediainfo") is not None
+        self._checkpoints = CheckpointManager(None, self.checkpoint_seconds)
 
-    # ----- schema helpers -----
-    def _ensure_catalog_schema(self, conn: sqlite3.Connection) -> None:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS drives(" \
-            "id INTEGER PRIMARY KEY," \
-            "label TEXT NOT NULL UNIQUE," \
-            "mount_path TEXT NOT NULL," \
-            "total_bytes INTEGER," \
-            "free_bytes INTEGER," \
-            "smart_scan TEXT," \
-            "scanned_at TEXT NOT NULL" \
-            ")"
-        )
-        conn.commit()
-
-    def _ensure_shard_schema(self, conn: sqlite3.Connection) -> None:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS files(" \
-            "id INTEGER PRIMARY KEY," \
-            "drive_label TEXT NOT NULL," \
-            "path TEXT NOT NULL UNIQUE," \
-            "size_bytes INTEGER," \
-            "is_av INTEGER DEFAULT 0," \
-            "hash_blake3 TEXT," \
-            "media_json TEXT," \
-            "integrity_ok INTEGER," \
-            "mtime_utc TEXT," \
-            "deleted INTEGER DEFAULT 0," \
-            "deleted_ts TEXT" \
-            ")"
-        )
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(files)")
-        columns = {row[1] for row in cur.fetchall()}
-        if "is_av" not in columns:
-            cur.execute("ALTER TABLE files ADD COLUMN is_av INTEGER DEFAULT 0")
-        if "deleted" not in columns:
-            cur.execute("ALTER TABLE files ADD COLUMN deleted INTEGER DEFAULT 0")
-        if "deleted_ts" not in columns:
-            cur.execute("ALTER TABLE files ADD COLUMN deleted_ts TEXT")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)"
-        )
-        conn.commit()
-
-    # ----- helpers -----
-    def _hash_file(self, file_path: str) -> Optional[str]:
-        try:
-            if _blake3_hash is not None:
-                hasher = _blake3_hash()
-            else:
-                hasher = hashlib.sha256()
-            with open(file_path, "rb") as handle:
-                while True:
-                    chunk = handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-            return hasher.hexdigest()
-        except Exception:
-            return None
-
-    def _mediainfo(self, file_path: str) -> Optional[dict]:
-        if not self._mediainfo_available:
-            return None
-        try:
-            out = subprocess.check_output(
-                ["mediainfo", "--Output=JSON", file_path],
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            if out.strip():
-                return json.loads(out)
-        except subprocess.CalledProcessError as exc:
-            if exc.returncode == 127:
-                self._mediainfo_available = False
-            return {"error": exc.output.strip() if exc.output else "mediainfo_failed"}
-        except FileNotFoundError:
-            self._mediainfo_available = False
-        except Exception as exc:
-            return {"error": str(exc)}
-        return None
-
-    def _ffmpeg_verify(self, file_path: str) -> Optional[bool]:
-        if not self._ffmpeg_available:
-            return None
-        try:
-            proc = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-v",
-                    "error",
-                    "-xerror",
-                    "-i",
-                    file_path,
-                    "-f",
-                    "null",
-                    "-",
-                    "-nostdin",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if proc.returncode == 0:
-                return True
-            return False
-        except FileNotFoundError:
-            self._ffmpeg_available = False
-            return None
-        except Exception:
-            return False
-
-    def _should_checkpoint(self) -> bool:
-        now = time.time()
-        if (now - self._last_checkpoint) >= self.checkpoint_seconds:
-            self._last_checkpoint = now
-            return True
-        return False
-
-    # ----- enumeration -----
-    def _enumerate_files(self, base: Path) -> List[FileInfo]:
-        stack = [base]
-        files: List[FileInfo] = []
+    # ----- enumeration helpers -----
+    def _enumerate_files(self) -> List[FileInfo]:
+        stack: List[Path] = [self.mount_path]
+        results: List[FileInfo] = []
         total_av = 0
         last_emit = time.perf_counter()
         while stack:
@@ -317,9 +395,9 @@ class DriveScanner:
                             stat = entry.stat(follow_symlinks=False)
                         except FileNotFoundError:
                             continue
-                        mtime_iso = datetime.utcfromtimestamp(stat.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
                         suffix = Path(entry.name).suffix.lower()
                         is_av = suffix in _AV_EXTS
+                        mtime_iso = datetime.utcfromtimestamp(stat.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
                         info = FileInfo(
                             path=entry.path,
                             size_bytes=int(stat.st_size),
@@ -327,62 +405,59 @@ class DriveScanner:
                             mtime_iso=mtime_iso,
                             is_av=is_av,
                         )
-                        files.append(info)
+                        results.append(info)
                         if is_av:
                             total_av += 1
                         now = time.perf_counter()
                         if (now - last_emit) >= 5.0:
-                            self.emitter.emit(
-                                "enumerating",
-                                len(files),
-                                total_av,
-                            )
+                            self.emitter.emit("enumerating", len(results), total_av)
+                            self._checkpoints.maybe("enumerating", entry.path)
                             last_emit = now
-                        if self._state_store and self._should_checkpoint():
-                            self._state_store.save("enumerating", entry.path)
                         if self.debug_slow:
                             time.sleep(0.01)
             except PermissionError:
                 LOGGER.warning("Permission denied while scanning %s", current)
             except FileNotFoundError:
                 continue
-        files.sort(key=lambda f: f.path)
-        self.emitter.emit("enumerating", len(files), total_av, force=True)
-        return files
+        results.sort(key=lambda item: item.path)
+        self.emitter.emit("enumerating", len(results), total_av, force=True)
+        self._checkpoints.force("enumerating", results[-1].path if results else "")
+        return results
 
-    # ----- change detection -----
-    def _load_existing_rows(self, cur: sqlite3.Cursor) -> Dict[str, Dict[str, object]]:
+    # ----- db helpers -----
+    def _load_existing(self, cur: sqlite3.Cursor) -> Dict[str, Dict[str, object]]:
         cur.execute(
-            "SELECT path, size_bytes, mtime_utc, deleted, integrity_ok FROM files WHERE drive_label=?",
-            (self.label,),
+            "SELECT path, size_bytes, is_av, integrity_ok, mtime_utc, deleted FROM files",
         )
-        existing: Dict[str, Dict[str, object]] = {}
-        for path, size_bytes, mtime_utc, deleted, integrity in cur.fetchall():
-            existing[path] = {
+        data: Dict[str, Dict[str, object]] = {}
+        for row in cur.fetchall():
+            path, size_bytes, is_av, integrity_ok, mtime_utc, deleted = row
+            data[path] = {
                 "size_bytes": size_bytes,
+                "is_av": int(is_av or 0),
+                "integrity_ok": integrity_ok,
                 "mtime_utc": mtime_utc,
                 "deleted": int(deleted or 0),
-                "integrity_ok": integrity,
             }
-        return existing
+        return data
 
-    # ----- DB helpers -----
-    def _mark_deleted(self, cur: sqlite3.Cursor, paths: List[str]) -> None:
-        if not paths:
-            return
+    def _mark_deleted(self, cur: sqlite3.Cursor, paths: Iterable[str]) -> int:
+        rows = list(paths)
+        if not rows:
+            return 0
         now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         cur.executemany(
-            "UPDATE files SET deleted=1, deleted_ts=? WHERE path=?",
-            [(now, path) for path in paths],
+            "UPDATE files SET deleted=1, deleted_ts=?, integrity_ok=NULL WHERE path=?",
+            [(now, path) for path in rows],
         )
+        return len(rows)
 
-    def _upsert_files(self, cur: sqlite3.Cursor, rows: List[Tuple]) -> None:
+    def _insert_rows(self, cur: sqlite3.Cursor, rows: List[Tuple]) -> None:
         if not rows:
             return
         cur.executemany(
             """
             INSERT INTO files(
-                drive_label,
                 path,
                 size_bytes,
                 is_av,
@@ -392,39 +467,95 @@ class DriveScanner:
                 mtime_utc,
                 deleted,
                 deleted_ts
-            ) VALUES(?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(path) DO UPDATE SET
-                drive_label=excluded.drive_label,
-                size_bytes=excluded.size_bytes,
-                is_av=excluded.is_av,
-                hash_blake3=excluded.hash_blake3,
-                media_json=excluded.media_json,
-                integrity_ok=excluded.integrity_ok,
-                mtime_utc=excluded.mtime_utc,
-                deleted=excluded.deleted,
-                deleted_ts=excluded.deleted_ts
+            ) VALUES(?,?,?,?,?,?,?,?,?)
             """,
             rows,
         )
 
-    def _update_integrity(self, cur: sqlite3.Cursor, updates: List[Tuple[int, str]]) -> None:
-        if not updates:
+    def _update_rows(self, cur: sqlite3.Cursor, rows: List[Tuple]) -> None:
+        if not rows:
             return
         cur.executemany(
-            "UPDATE files SET integrity_ok=? WHERE path=?",
-            updates,
+            """
+            UPDATE files SET
+                size_bytes=?,
+                is_av=?,
+                hash_blake3=?,
+                media_json=?,
+                integrity_ok=?,
+                mtime_utc=?,
+                deleted=0,
+                deleted_ts=NULL
+            WHERE path=?
+            """,
+            rows,
         )
 
-    # ----- main run -----
+    def _load_pending_ffmpeg(self, cur: sqlite3.Cursor, disk_paths: set[str]) -> List[str]:
+        cur.execute(
+            "SELECT path FROM files WHERE deleted=0 AND is_av=1 AND integrity_ok IS NULL",
+        )
+        return [row[0] for row in cur.fetchall() if row[0] in disk_paths]
+
+    # ----- processing helpers -----
+    def _process_file(self, item: WorkItem) -> Tuple[Optional[Tuple], Optional[Tuple], bool, int]:
+        info = item.info
+        hash_value = _hash_file(info.path)
+        media = _mediainfo(info.path)
+        media_json = json.dumps(media, ensure_ascii=False) if isinstance(media, dict) else None
+        integrity = None
+        needs_ffmpeg = False
+        av_increment = 0
+        if info.is_av:
+            if isinstance(media, dict):
+                if media.get("error"):
+                    integrity = 0
+                    av_increment = 1
+                else:
+                    needs_ffmpeg = True
+                    av_increment = 1
+            else:
+                integrity = None
+        else:
+            integrity = 1
+        insert_row: Optional[Tuple] = None
+        update_row: Optional[Tuple] = None
+        if item.op == "insert":
+            insert_row = (
+                info.path,
+                info.size_bytes,
+                1 if info.is_av else 0,
+                hash_value,
+                media_json,
+                integrity,
+                info.mtime_iso,
+                0,
+                None,
+            )
+        else:
+            update_row = (
+                info.size_bytes,
+                1 if info.is_av else 0,
+                hash_value,
+                media_json,
+                integrity,
+                info.mtime_iso,
+                info.path,
+            )
+        return insert_row, update_row, needs_ffmpeg, av_increment
+
+    # ----- main entry -----
     def run(self) -> None:
         if not self.mount_path.exists():
             print(f"[ERROR] Mount path not found: {self.mount_path}")
             sys.exit(2)
 
+        mediainfo_available = _has_cmd("mediainfo")
+        ffmpeg_available = _has_cmd("ffmpeg")
         missing_tools = []
-        if not self._mediainfo_available:
+        if not mediainfo_available:
             missing_tools.append("mediainfo")
-        if not self._ffmpeg_available:
+        if not ffmpeg_available:
             missing_tools.append("ffmpeg")
         if missing_tools:
             for tool in missing_tools:
@@ -440,108 +571,77 @@ class DriveScanner:
             flush=True,
         )
 
-        with sqlite3.connect(self.catalog_db) as catalog:
-            self._ensure_catalog_schema(catalog)
-            total, _, free = shutil.disk_usage(self.mount_path)
-            smart_blob = None
-            try:
-                proc = subprocess.run(["smartctl", "--scan-open"], capture_output=True, text=True)
-                if proc.returncode == 0:
-                    smart_blob = proc.stdout
-            except Exception:
-                smart_blob = None
-            catalog.execute(
-                """
-                INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
-                VALUES(?,?,?,?,?,datetime('now'))
-                ON CONFLICT(label) DO UPDATE SET
-                    mount_path=excluded.mount_path,
-                    total_bytes=excluded.total_bytes,
-                    free_bytes=excluded.free_bytes,
-                    smart_scan=excluded.smart_scan,
-                    scanned_at=excluded.scanned_at
-                """,
-                (
-                    self.label,
-                    str(self.mount_path.resolve()),
-                    int(total),
-                    int(free),
-                    smart_blob,
-                ),
-            )
-            catalog.commit()
-
-        with sqlite3.connect(self.shard_db) as shard:
-            shard.execute("PRAGMA synchronous=NORMAL;")
-            self._ensure_shard_schema(shard)
-            self._state_store = ScanStateStore(shard)
-            if not self.resume:
+        catalog = _init_catalog_db(self.catalog_db)
+        shard = _init_shard_db(self.shard_db)
+        try:
+            self._state_store = ScanStateStore(shard) if self.resume else None
+            self._checkpoints = CheckpointManager(self._state_store, self.checkpoint_seconds)
+            if not self.resume and self._state_store:
                 self._state_store.clear()
-            state = self._state_store.load() if self.resume else {}
-            cur = shard.cursor()
+            state = self._state_store.load() if self._state_store else {}
 
-            files = self._enumerate_files(self.mount_path)
+            files = self._enumerate_files()
             total_all = len(files)
-            total_av = sum(1 for f in files if f.is_av)
+            total_av = sum(1 for info in files if info.is_av)
 
-            existing = self._load_existing_rows(cur)
-            existing_paths = set(existing.keys())
-            disk_paths = {f.path for f in files}
+            disk_paths = {info.path for info in files}
 
-            deleted_paths = [p for p in existing_paths - disk_paths if existing[p]["deleted"] == 0]
-            if deleted_paths:
-                self._mark_deleted(cur, deleted_paths)
-                shard.commit()
-                sample = ", ".join(deleted_paths[:3])
-                LOGGER.info("Marked %d deleted files (%s%s)", len(deleted_paths), sample, "…" if len(deleted_paths) > 3 else "")
-                preview = sample + ("…" if len(deleted_paths) > 3 else "")
-                print(
-                    f"[INFO] Marked {len(deleted_paths)} deleted files" + (f" ({preview})" if preview else ""),
-                    flush=True,
-                )
+            shard_cur = shard.cursor()
+            existing = self._load_existing(shard_cur)
 
-            to_process: List[FileInfo] = []
-            unchanged_all = 0
+            deleted_count = 0
+            if not self.full_rescan:
+                deleted_candidates = [path for path in existing.keys() if path not in disk_paths and not existing[path]["deleted"]]
+                deleted_count = self._mark_deleted(shard_cur, deleted_candidates)
+                if deleted_count:
+                    LOGGER.info("Marked %s files as deleted", deleted_count)
+
+            work_items: List[WorkItem] = []
+            unchanged = 0
             done_av = 0
             for info in files:
-                rec = existing.get(info.path)
+                previous = existing.get(info.path)
                 if self.full_rescan:
-                    to_process.append(info)
+                    op = "insert" if previous is None else "update"
+                    work_items.append(WorkItem(info=info, op=op))
                     continue
-                if rec is None or rec.get("deleted"):
-                    to_process.append(info)
+                if previous is None or previous.get("deleted"):
+                    work_items.append(WorkItem(info=info, op="insert"))
                     continue
-                if rec.get("size_bytes") != info.size_bytes or rec.get("mtime_utc") != info.mtime_iso:
-                    to_process.append(info)
+                if previous.get("size_bytes") != info.size_bytes or previous.get("mtime_utc") != info.mtime_iso:
+                    work_items.append(WorkItem(info=info, op="update"))
                     continue
-                unchanged_all += 1
-                if info.is_av and rec.get("integrity_ok") in (0, 1):
+                unchanged += 1
+                if info.is_av and previous.get("integrity_ok") in (0, 1):
                     done_av += 1
 
-            to_process.sort(key=lambda f: f.path)
-
-            processed_all = unchanged_all
-            if not state:
-                self.emitter.emit(
-                    "hashing" if to_process else "enumerating",
-                    processed_all,
-                    done_av,
-                    total_all=total_all,
-                    total_av=total_av,
-                    force=True,
-                )
+            work_items.sort(key=lambda item: item.info.path)
+            processed_all = unchanged
 
             if state and state.get("phase") == "hashing":
                 last_path = state.get("last_path_processed") or ""
                 if last_path:
-                    to_process = [info for info in to_process if info.path > last_path]
-            elif state and state.get("phase") == "ffmpeg" and not to_process:
-                to_process = []
+                    skipped = 0
+                    new_items: List[WorkItem] = []
+                    for item in work_items:
+                        if item.info.path <= last_path:
+                            skipped += 1
+                            if item.info.is_av:
+                                done_av += 1
+                            continue
+                        new_items.append(item)
+                    processed_all += skipped
+                    work_items = new_items
+            elif state and state.get("phase") == "ffmpeg":
                 processed_all = total_all
-                done_av = total_av
+                done_av = sum(
+                    1
+                    for info in files
+                    if info.is_av and existing.get(info.path, {}).get("integrity_ok") in (0, 1)
+                )
 
             self.emitter.emit(
-                "hashing" if to_process else "mediainfo",
+                "hashing" if work_items else "mediainfo",
                 processed_all,
                 done_av,
                 total_all=total_all,
@@ -549,39 +649,53 @@ class DriveScanner:
                 force=True,
             )
 
-            batch_rows: List[Tuple] = []
+            insert_rows: List[Tuple] = []
+            update_rows: List[Tuple] = []
             ffmpeg_queue: List[str] = []
-            updates_per_commit = 50
-            workers = min(32, max(1, (os.cpu_count() or 1) * 2))
-            self._last_checkpoint = time.time()
+            max_workers = min(32, max(1, (os.cpu_count() or 1) * 2))
+            self._checkpoints.force("hashing" if work_items else "mediainfo", "")
 
-            def submit_files(files_batch: List[FileInfo]) -> None:
+            def submit_batch(batch: List[WorkItem]) -> None:
                 nonlocal processed_all, done_av
-                if not files_batch:
+                if not batch:
                     return
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    future_map = {executor.submit(self._process_file, info): info for info in files_batch}
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_map = {executor.submit(self._process_file, item): item for item in batch}
                     for future in as_completed(future_map):
-                        info = future_map[future]
+                        item = future_map[future]
+                        info = item.info
                         try:
-                            result = future.result()
+                            insert_row, update_row, needs_ffmpeg, av_inc = future.result()
                         except Exception as exc:
                             LOGGER.error("Worker error on %s: %s", info.path, exc)
                             processed_all += 1
                             if info.is_av:
                                 done_av += 1
+                            self.emitter.emit(
+                                "hashing",
+                                processed_all,
+                                done_av,
+                                total_all=total_all,
+                                total_av=total_av,
+                            )
                             continue
+                        if insert_row:
+                            insert_rows.append(insert_row)
+                        if update_row:
+                            update_rows.append(update_row)
+                        if needs_ffmpeg:
+                            ffmpeg_queue.append(info.path)
                         processed_all += 1
-                        if result:
-                            row, needs_ffmpeg, av_inc = result
-                            batch_rows.append(row)
-                            if needs_ffmpeg:
-                                ffmpeg_queue.append(info.path)
-                            done_av += av_inc
-                        if len(batch_rows) >= updates_per_commit:
-                            self._flush_batch(cur, batch_rows)
-                        if self._state_store and self._should_checkpoint():
-                            self._state_store.save("hashing", info.path)
+                        done_av += av_inc
+                        if len(insert_rows) >= 100:
+                            self._insert_rows(shard_cur, insert_rows)
+                            shard.commit()
+                            insert_rows.clear()
+                        if len(update_rows) >= 100:
+                            self._update_rows(shard_cur, update_rows)
+                            shard.commit()
+                            update_rows.clear()
+                        self._checkpoints.maybe("hashing", info.path)
                         self.emitter.emit(
                             "hashing",
                             processed_all,
@@ -589,43 +703,57 @@ class DriveScanner:
                             total_all=total_all,
                             total_av=total_av,
                         )
-                if batch_rows:
-                    self._flush_batch(cur, batch_rows)
+                if insert_rows:
+                    self._insert_rows(shard_cur, insert_rows)
+                    insert_rows.clear()
+                if update_rows:
+                    self._update_rows(shard_cur, update_rows)
+                    update_rows.clear()
+                shard.commit()
 
-            submit_files(to_process)
+            submit_batch(work_items)
 
-            pending_ffmpeg = self._load_pending_ffmpeg(cur)
-            pending_ffmpeg.extend(ffmpeg_queue)
-            unique_ffmpeg = sorted({p for p in pending_ffmpeg if p in disk_paths})
+            if not work_items:
+                shard.commit()
+
+            pending_ffmpeg = self._load_pending_ffmpeg(shard_cur, disk_paths)
+            ffmpeg_candidates = sorted({*pending_ffmpeg, *ffmpeg_queue})
+
             if state and state.get("phase") == "ffmpeg":
                 last_path = state.get("last_path_processed") or ""
                 if last_path:
-                    unique_ffmpeg = [p for p in unique_ffmpeg if p > last_path]
-            self.emitter.emit(
-                "ffmpeg" if unique_ffmpeg else "mediainfo",
-                processed_all,
-                done_av,
-                total_all=total_all,
-                total_av=total_av,
-                force=True,
-            )
+                    ffmpeg_candidates = [p for p in ffmpeg_candidates if p > last_path]
 
-            if unique_ffmpeg:
-                with ThreadPoolExecutor(max_workers=min(8, workers)) as executor:
-                    future_map = {executor.submit(self._ffmpeg_verify, path): path for path in unique_ffmpeg}
-                    updates: List[Tuple[int, str]] = []
+            if ffmpeg_candidates:
+                self.emitter.emit(
+                    "ffmpeg",
+                    processed_all,
+                    done_av,
+                    total_all=total_all,
+                    total_av=total_av,
+                    force=True,
+                )
+                self._checkpoints.force("ffmpeg", "")
+                updates: List[Tuple[int, str]] = []
+                with ThreadPoolExecutor(max_workers=min(8, max(1, os.cpu_count() or 1))) as executor:
+                    future_map = {executor.submit(_ffmpeg_verify, path): path for path in ffmpeg_candidates}
                     for future in as_completed(future_map):
                         path = future_map[future]
-                        ok = future.result()
+                        try:
+                            ok = future.result()
+                        except Exception:
+                            ok = False
                         if ok is None:
                             continue
                         updates.append((1 if ok else 0, path))
-                        processed_ffmpeg += 1
-                        if len(updates) >= updates_per_commit:
-                            self._update_integrity(cur, updates)
+                        if len(updates) >= 100:
+                            shard_cur.executemany(
+                                "UPDATE files SET integrity_ok=? WHERE path=?",
+                                [(val, p) for val, p in updates],
+                            )
+                            shard.commit()
                             updates.clear()
-                        if self._state_store and self._should_checkpoint():
-                            self._state_store.save("ffmpeg", path)
+                        self._checkpoints.maybe("ffmpeg", path)
                         self.emitter.emit(
                             "ffmpeg",
                             processed_all,
@@ -633,97 +761,60 @@ class DriveScanner:
                             total_all=total_all,
                             total_av=total_av,
                         )
-                    if updates:
-                        self._update_integrity(cur, updates)
+                if updates:
+                    shard_cur.executemany(
+                        "UPDATE files SET integrity_ok=? WHERE path=?",
+                        [(val, p) for val, p in updates],
+                    )
+                    shard.commit()
+            else:
                 shard.commit()
 
-            if self._state_store:
-                self._state_store.save("finalizing", "")
+            self._checkpoints.force("finalizing", "")
             self.emitter.emit(
                 "finalizing",
                 total_all,
-                total_av,
+                done_av,
                 total_all=total_all,
                 total_av=total_av,
                 force=True,
             )
-            shard.commit()
             if self._state_store:
                 self._state_store.clear()
 
-        print(f"[OK] Scan complete for {self.label}. Catalog: {self.catalog_db} | shard: {self.shard_db}")
-
-    def _process_file(self, info: FileInfo) -> Optional[Tuple[Tuple, bool, int]]:
-        try:
-            hash_value = self._hash_file(info.path)
-            media = self._mediainfo(info.path)
-            media_json = json.dumps(media, ensure_ascii=False) if isinstance(media, dict) else None
-            needs_ffmpeg = False
-            av_inc = 0
-            integrity = None
-            if info.is_av:
-                if isinstance(media, dict):
-                    av_inc = 1
-                    if media.get("error"):
-                        integrity = 0
-                        needs_ffmpeg = False
-                    else:
-                        integrity = None
-                        needs_ffmpeg = True
-                else:
-                    needs_ffmpeg = False
-                    av_inc = 0
-            else:
-                integrity = 1
-                av_inc = 0
-            row = (
-                self.label,
-                info.path,
-                info.size_bytes,
-                1 if info.is_av else 0,
-                hash_value,
-                media_json,
-                integrity,
-                info.mtime_iso,
-                0,
-                None,
+            total_bytes, _, free_bytes = shutil.disk_usage(self.mount_path)
+            smart_blob = _try_smart_overview()
+            catalog.execute(
+                """
+                INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at, scan_mode)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(label) DO UPDATE SET
+                    mount_path=excluded.mount_path,
+                    total_bytes=excluded.total_bytes,
+                    free_bytes=excluded.free_bytes,
+                    smart_scan=excluded.smart_scan,
+                    scanned_at=excluded.scanned_at,
+                    scan_mode=excluded.scan_mode
+                """,
+                (
+                    self.label,
+                    str(self.mount_path),
+                    int(total_bytes),
+                    int(free_bytes),
+                    smart_blob,
+                    datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "Full" if self.full_rescan else "Delta",
+                ),
             )
-            return row, needs_ffmpeg, av_inc
-        except Exception as exc:
-            LOGGER.error("Failed to process %s: %s", info.path, exc)
-            error_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
-            row = (
-                self.label,
-                info.path,
-                info.size_bytes,
-                1 if info.is_av else 0,
-                None,
-                error_blob,
-                0,
-                info.mtime_iso,
-                0,
-                None,
-            )
-            return row, False, 1 if info.is_av else 0
+            catalog.commit()
+        finally:
+            catalog.close()
+            shard.close()
 
-    def _flush_batch(self, cur: sqlite3.Cursor, batch_rows: List[Tuple]) -> None:
-        if not batch_rows:
-            return
-        self._upsert_files(cur, batch_rows)
-        cur.connection.commit()
-        batch_rows.clear()
-
-    def _load_pending_ffmpeg(self, cur: sqlite3.Cursor) -> List[str]:
-        cur.execute(
-            "SELECT path FROM files WHERE drive_label=? AND deleted=0 AND is_av=1 AND integrity_ok IS NULL",
-            (self.label,),
+        print(
+            f"[OK] Scan complete for {self.label}. Catalog: {self.catalog_db} | shard: {self.shard_db}",
+            flush=True,
         )
-        return [row[0] for row in cur.fetchall()]
-
-
-def _expand_user_path(value: str) -> Path:
-    expanded = os.path.expandvars(os.path.expanduser(value))
-    return Path(expanded)
 
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
@@ -809,7 +900,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         shard_db=shard_db_path,
         full_rescan=bool(args.full_rescan),
         resume=not bool(args.no_resume),
-        checkpoint_seconds=int(args.checkpoint_seconds or 5),
+        checkpoint_seconds=args.checkpoint_seconds or 5,
         debug_slow=bool(args.debug or args.debug_slow_enumeration),
     )
     scanner.run()

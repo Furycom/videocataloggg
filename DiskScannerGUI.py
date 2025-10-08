@@ -3,11 +3,12 @@
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
 import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from paths import (
     ensure_working_dir_structure,
@@ -143,6 +144,34 @@ def mediainfo_json(file_path: str) -> Optional[dict]:
         log(f"[mediainfo fail] {file_path} -> {e}")
         return {"error": str(e)}
 
+def ffmpeg_verify(file_path: str) -> Optional[bool]:
+    if not has_cmd("ffmpeg"):
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-xerror",
+                "-i",
+                file_path,
+                "-f",
+                "null",
+                "-",
+                "-nostdin",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return proc.returncode == 0
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log(f"[ffmpeg fail] {file_path} -> {exc}")
+        return False
+
 def blake3_hash(file_path: str, chunk: int = 1024*1024) -> Optional[str]:
     try:
         from blake3 import blake3
@@ -257,7 +286,7 @@ def _ensure_shard_schema(con: sqlite3.Connection):
         ("media_json", "TEXT"),
         ("integrity_ok", "INTEGER"),
         ("mtime_utc", "TEXT"),
-        ("deleted", "INTEGER"),
+        ("deleted", "INTEGER DEFAULT 0"),
         ("deleted_ts", "TEXT"),
     ]
     cur.execute("PRAGMA table_info(files)")
@@ -267,13 +296,16 @@ def _ensure_shard_schema(con: sqlite3.Connection):
             cur.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_type}")
 
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_files_path ON files(path);")
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS scan_state("
-        " key TEXT PRIMARY KEY,"
-        " value TEXT"
-        ")"
-    )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_blake3);")
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_state(
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
 
     # integrity_ok semantics:
     #   1 → MediaInfo/scan succeeded (or non-A/V file)
@@ -289,47 +321,79 @@ def init_shard(shard_path: str):
     finally:
         con.close()
 
-
 @dataclass
-class FileEntry:
+class FileInfo:
     path: str
     size_bytes: int
     mtime_iso: str
     is_av: bool
 
 
-class ScanStateStore:
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
+@dataclass
+class WorkItem:
+    info: FileInfo
+    op: str  # "insert" or "update"
 
-    def load(self) -> dict:
+
+class ScanStateStore:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS scan_state("
+            "key TEXT PRIMARY KEY,"
+            "value TEXT"
+            ")"
+        )
+        self.conn.commit()
+
+    def load(self) -> Dict[str, str]:
         cur = self.conn.cursor()
         cur.execute("SELECT key, value FROM scan_state")
         return {row[0]: row[1] for row in cur.fetchall()}
 
-    def save(self, phase: str, last_path: Optional[str]):
-        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        entries = [
+    def save(self, phase: str, last_path: Optional[str]) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        rows = [
             ("phase", phase),
             ("last_path_processed", last_path or ""),
             ("timestamp", now),
         ]
         cur = self.conn.cursor()
-        cur.executemany("REPLACE INTO scan_state(key,value) VALUES(?,?)", entries)
+        cur.executemany("REPLACE INTO scan_state(key, value) VALUES(?, ?)", rows)
         self.conn.commit()
 
-    def clear(self):
+    def clear(self) -> None:
         cur = self.conn.cursor()
         cur.execute("DELETE FROM scan_state")
         self.conn.commit()
 
 
+class CheckpointManager:
+    def __init__(self, store: Optional[ScanStateStore], seconds: int) -> None:
+        self.store = store
+        self.seconds = max(1, int(seconds))
+        self._last = time.monotonic()
+
+    def maybe(self, phase: str, last_path: Optional[str]) -> None:
+        if not self.store:
+            return
+        now = time.monotonic()
+        if (now - self._last) >= self.seconds:
+            self.store.save(phase, last_path)
+            self._last = now
+
+    def force(self, phase: str, last_path: Optional[str] = "") -> None:
+        if not self.store:
+            return
+        self.store.save(phase, last_path)
+        self._last = time.monotonic()
+
 # ---------------- Scanner worker ----------------
 class ScannerWorker(threading.Thread):
     def __init__(self, label: str, mount: str, notes: str, dtype: str,
                  db_catalog: str, blake_for_av: bool, max_workers: int,
-                 stop_evt: threading.Event, event_queue: "queue.Queue[dict]",
-                 delta_rescan: bool, resume_enabled: bool, checkpoint_seconds: int = 5):
+                 full_rescan: bool, resume_enabled: bool, checkpoint_seconds: int,
+                 stop_evt: threading.Event, event_queue: "queue.Queue[dict]"):
         super().__init__(daemon=False)
         self.label = label
         self.mount = mount
@@ -338,11 +402,11 @@ class ScannerWorker(threading.Thread):
         self.db_catalog = db_catalog
         self.blake_for_av = blake_for_av
         self.max_workers = max(1, int(max_workers))
-        self.stop_evt = stop_evt
-        self.queue = event_queue
-        self.delta_rescan = bool(delta_rescan)
+        self.full_rescan = bool(full_rescan)
         self.resume_enabled = bool(resume_enabled)
         self.checkpoint_seconds = max(1, int(checkpoint_seconds))
+        self.stop_evt = stop_evt
+        self.queue = event_queue
         self.job_id: Optional[int] = None
         self._start_monotonic: Optional[float] = None
         self._last_progress_emit: float = 0.0
@@ -350,8 +414,6 @@ class ScannerWorker(threading.Thread):
         self._total_av: int = 0
         self._current_phase: str = "enumerating"
         self._tool_missing_reported = False
-        self._state_store: Optional[ScanStateStore] = None
-        self._last_checkpoint: float = 0.0
 
     def _put(self, payload: dict):
         try:
@@ -404,98 +466,6 @@ class ScannerWorker(threading.Thread):
         self._put({"type": "tool_missing", "tool": tool})
         self._put({"type": "done", "status": "Error", "message": message})
 
-    def _should_checkpoint(self) -> bool:
-        now = time.time()
-        if (now - self._last_checkpoint) >= self.checkpoint_seconds:
-            self._last_checkpoint = now
-            return True
-        return False
-
-    def _enumerate_files(self, base: Path) -> list[FileEntry]:
-        stack = [base]
-        files: list[FileEntry] = []
-        total_av = 0
-        while stack:
-            current = stack.pop()
-            try:
-                with os.scandir(current) as iterator:
-                    for entry in iterator:
-                        if self.stop_evt.is_set():
-                            break
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-                            continue
-                        if not entry.is_file(follow_symlinks=False):
-                            continue
-                        try:
-                            stat = entry.stat(follow_symlinks=False)
-                        except FileNotFoundError:
-                            continue
-                        mtime_iso = datetime.utcfromtimestamp(stat.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        is_av = Path(entry.name).suffix.lower() in AV_EXTS
-                        files.append(FileEntry(entry.path, int(stat.st_size), mtime_iso, is_av))
-                        if is_av:
-                            total_av += 1
-                        self._emit_progress("enumerating", len(files), total_av)
-                    if self.stop_evt.is_set():
-                        break
-            except PermissionError:
-                log(f"[Job {self.job_id}] permission denied: {current}")
-            except FileNotFoundError:
-                continue
-        files.sort(key=lambda entry: entry.path)
-        return files
-
-    def _load_existing_rows(self, cur: sqlite3.Cursor) -> dict[str, dict]:
-        cur.execute("SELECT path, size_bytes, is_av, integrity_ok, mtime_utc, deleted FROM files")
-        rows: dict[str, dict] = {}
-        for path, size_bytes, is_av, integrity_ok, mtime_utc, deleted in cur.fetchall():
-            rows[path] = {
-                "size_bytes": size_bytes,
-                "is_av": int(is_av or 0),
-                "integrity_ok": integrity_ok,
-                "mtime_utc": mtime_utc,
-                "deleted": int(deleted or 0),
-            }
-        return rows
-
-    def _mark_deleted(self, cur: sqlite3.Cursor, paths: list[str]):
-        if not paths:
-            return
-        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        cur.executemany("UPDATE files SET deleted=1, deleted_ts=? WHERE path=?", [(now, p) for p in paths])
-
-    def _upsert_files(self, cur: sqlite3.Cursor, rows: list[tuple]):
-        if not rows:
-            return
-        cur.executemany(
-            """
-            INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc,deleted,deleted_ts)
-            VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(path) DO UPDATE SET
-                size_bytes=excluded.size_bytes,
-                is_av=excluded.is_av,
-                hash_blake3=excluded.hash_blake3,
-                media_json=excluded.media_json,
-                integrity_ok=excluded.integrity_ok,
-                mtime_utc=excluded.mtime_utc,
-                deleted=excluded.deleted,
-                deleted_ts=excluded.deleted_ts
-            """,
-            rows,
-        )
-
-    def _update_integrity(self, cur: sqlite3.Cursor, updates: list[tuple[int, str]]):
-        if not updates:
-            return
-        cur.executemany("UPDATE files SET integrity_ok=? WHERE path=?", updates)
-
-    def _load_pending_ffmpeg(self, cur: sqlite3.Cursor) -> list[str]:
-        cur.execute(
-            "SELECT path FROM files WHERE deleted=0 AND is_av=1 AND integrity_ok IS NULL"
-        )
-        return [row[0] for row in cur.fetchall()]
-
     def run(self):
         try:
             self._run()
@@ -533,286 +503,479 @@ class ScannerWorker(threading.Thread):
         shard_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._put({"type": "status", "message": "Enumerating files…"})
-        entries = self._enumerate_files(mount)
-        self._total_all = len(entries)
-        self._total_av = sum(1 for entry in entries if entry.is_av)
-        self._current_phase = "enumerating"
-        self._emit_progress(
-            self._current_phase,
-            self._total_all,
-            self._total_av,
-            total_all=self._total_all,
-            force=True,
-        )
-        if self.stop_evt.is_set():
-            self._put({"type": "status", "message": "Scan stopped."})
-            self._put({"type": "done", "status": "Stopped"})
-            return
-
-        started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        smart_blob = try_smart_overview()
-        total_bytes, free_bytes = disk_usage_bytes(mount)
+        ffmpeg_available = has_cmd("ffmpeg")
 
         with sqlite3.connect(self.db_catalog) as catalog:
             ccur = catalog.cursor()
-            ccur.execute(
-                """INSERT INTO drives(label, mount_path, fs_format, total_bytes, free_bytes, smart_scan, scanned_at, drive_type, notes, scan_mode)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(label) DO UPDATE SET
-                    mount_path=excluded.mount_path, fs_format=excluded.fs_format, total_bytes=excluded.total_bytes,
-                    free_bytes=excluded.free_bytes, smart_scan=excluded.smart_scan, scanned_at=excluded.scanned_at,
-                    drive_type=excluded.drive_type, notes=excluded.notes, scan_mode=excluded.scan_mode""",
-                (self.label, str(mount), None, total_bytes, free_bytes, smart_blob, started_at, self.dtype, self.notes, "Auto"),
-            )
-            ccur.execute(
-                """INSERT INTO jobs(drive_label, started_at, status, total_av, total_all, done_av, duration_sec, message)
-                            VALUES(?, datetime('now'), 'Running', ?, ?, 0, NULL, ?)""",
-                (
-                    self.label,
-                    self._total_av,
-                    self._total_all,
-                    f"Found AV {self._total_av} / Total {self._total_all}",
-                ),
-            )
-            self.job_id = ccur.lastrowid
-            catalog.commit()
-
-            log(f"[Job {self.job_id}] Found AV {self._total_av} of TOTAL {self._total_all} at {self.mount}")
-            self._put({"type": "refresh_jobs"})
-
-            init_shard(str(shard_path))
-            self._put({"type": "status", "message": "Scanning files…"})
-
-            t0 = time.perf_counter()
-            processed_all = 0
-            done_av = 0
-            max_workers = max(1, min(self.max_workers, 32))
-            log(f"[Job {self.job_id}] scanning with {max_workers} worker thread(s)")
-            self._current_phase = "hashing" if self.blake_for_av else "mediainfo"
-
             with sqlite3.connect(str(shard_path)) as shard:
                 _ensure_shard_schema(shard)
-                scur = shard.cursor()
-                self._state_store = ScanStateStore(shard)
-                if not self.resume_enabled:
-                    self._state_store.clear()
-                state = self._state_store.load() if self.resume_enabled else {}
+                state_store = ScanStateStore(shard) if self.resume_enabled else None
+                if not self.resume_enabled and state_store:
+                    state_store.clear()
+                checkpoints = CheckpointManager(state_store, self.checkpoint_seconds)
+                state = state_store.load() if state_store else {}
 
-                existing_rows = self._load_existing_rows(scur)
-                disk_paths = {entry.path for entry in entries}
-                deleted_paths = [
-                    path
-                    for path, row in existing_rows.items()
-                    if not row.get("deleted") and path not in disk_paths
-                ]
-                if deleted_paths:
-                    self._mark_deleted(scur, deleted_paths)
-                    shard.commit()
-                    preview = ", ".join(deleted_paths[:3])
-                    if len(deleted_paths) > 3:
-                        preview = preview + "…"
-                    log(f"[Job {self.job_id}] Marked {len(deleted_paths)} deleted file(s) {preview}")
+                def enumerate_files(base: Path) -> tuple[List[FileInfo], int]:
+                    stack = [base]
+                    results: List[FileInfo] = []
+                    av_count = 0
+                    last_emit = time.perf_counter()
+                    while stack and not self.stop_evt.is_set():
+                        current = stack.pop()
+                        try:
+                            with os.scandir(current) as iterator:
+                                for entry in iterator:
+                                    if self.stop_evt.is_set():
+                                        break
+                                    if entry.is_dir(follow_symlinks=False):
+                                        stack.append(Path(entry.path))
+                                        continue
+                                    if not entry.is_file(follow_symlinks=False):
+                                        continue
+                                    try:
+                                        stat = entry.stat(follow_symlinks=False)
+                                    except FileNotFoundError:
+                                        continue
+                                    suffix = Path(entry.name).suffix.lower()
+                                    is_av = suffix in AV_EXTS
+                                    mtime_iso = datetime.utcfromtimestamp(stat.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                    info = FileInfo(
+                                        path=entry.path,
+                                        size_bytes=int(stat.st_size),
+                                        mtime_iso=mtime_iso,
+                                        is_av=is_av,
+                                    )
+                                    results.append(info)
+                                    if is_av:
+                                        av_count += 1
+                                    now = time.perf_counter()
+                                    if (now - last_emit) >= 5:
+                                        self._emit_progress("enumerating", len(results), av_count)
+                                        checkpoints.maybe("enumerating", entry.path)
+                                        last_emit = now
+                        except PermissionError:
+                            log(f"[ScannerWorker] permission denied: {current}")
+                        except FileNotFoundError:
+                            continue
+                    results.sort(key=lambda item: item.path)
+                    checkpoints.force("enumerating", results[-1].path if results else "")
+                    return results, av_count
 
-                to_process: list[FileEntry] = []
-                unchanged_all = 0
+                self._current_phase = "enumerating"
+                files, total_av = enumerate_files(mount)
+                self._total_all = len(files)
+                self._total_av = total_av
+                self._emit_progress(
+                    self._current_phase,
+                    self._total_all,
+                    total_av,
+                    total_all=self._total_all,
+                    force=True,
+                )
+                total_all = self._total_all
+                if self.stop_evt.is_set():
+                    self._put({"type": "status", "message": "Scan stopped."})
+                    self._put({"type": "done", "status": "Stopped"})
+                    return
+
+                started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                smart_blob = try_smart_overview()
+                total_bytes, free_bytes = disk_usage_bytes(mount)
+
+                ccur.execute(
+                    """
+                    INSERT INTO drives(label, mount_path, fs_format, total_bytes, free_bytes, smart_scan, scanned_at, drive_type, notes, scan_mode)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(label) DO UPDATE SET
+                        mount_path=excluded.mount_path,
+                        fs_format=excluded.fs_format,
+                        total_bytes=excluded.total_bytes,
+                        free_bytes=excluded.free_bytes,
+                        smart_scan=excluded.smart_scan,
+                        scanned_at=excluded.scanned_at,
+                        drive_type=excluded.drive_type,
+                        notes=excluded.notes,
+                        scan_mode=excluded.scan_mode
+                    """,
+                    (
+                        self.label,
+                        str(mount),
+                        None,
+                        total_bytes,
+                        free_bytes,
+                        smart_blob,
+                        started_at,
+                        self.dtype,
+                        self.notes,
+                        "Full" if self.full_rescan else "Delta",
+                    ),
+                )
+
+                ccur.execute(
+                    """
+                    INSERT INTO jobs(drive_label, started_at, status, total_av, total_all, done_av, duration_sec, message)
+                    VALUES(?, datetime('now'), 'Running', ?, ?, 0, NULL, ?)
+                    """,
+                    (
+                        self.label,
+                        total_av,
+                        total_all,
+                        f"Found AV {total_av} / Total {total_all}",
+                    ),
+                )
+                self.job_id = ccur.lastrowid
+                catalog.commit()
+
+                log(f"[Job {self.job_id}] Found AV {total_av} of TOTAL {total_all} at {self.mount}")
+                self._put({"type": "refresh_jobs"})
+
+                self._put({"type": "status", "message": "Scanning files…"})
+
+                t0 = time.perf_counter()
+                processed_all = 0
                 done_av = 0
-                for entry in entries:
-                    rec = existing_rows.get(entry.path)
-                    if not self.delta_rescan or rec is None or rec.get("deleted"):
-                        to_process.append(entry)
+                max_workers = max(1, min(self.max_workers, 32))
+                log(f"[Job {self.job_id}] scanning with {max_workers} worker thread(s)")
+
+                scur = shard.cursor()
+                existing_rows: Dict[str, Dict[str, object]] = {}
+                scur.execute("SELECT path, size_bytes, is_av, integrity_ok, mtime_utc, deleted FROM files")
+                for path, size_bytes, is_av, integrity_ok, mtime_utc, deleted in scur.fetchall():
+                    existing_rows[path] = {
+                        "size_bytes": size_bytes,
+                        "is_av": int(is_av or 0),
+                        "integrity_ok": integrity_ok,
+                        "mtime_utc": mtime_utc,
+                        "deleted": int(deleted or 0),
+                    }
+
+                disk_paths = {info.path for info in files}
+                if not self.full_rescan:
+                    stale_paths = [p for p, row in existing_rows.items() if p not in disk_paths and not row.get("deleted")]
+                    if stale_paths:
+                        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                        scur.executemany(
+                            "UPDATE files SET deleted=1, deleted_ts=?, integrity_ok=NULL WHERE path=?",
+                            [(now, p) for p in stale_paths],
+                        )
+                        shard.commit()
+                        for p in stale_paths:
+                            existing_rows[p]["deleted"] = 1
+                        examples = ", ".join(Path(p).name for p in stale_paths[:5])
+                        log(f"[Job {self.job_id}] Soft-deleted {len(stale_paths)} file(s){' — ' + examples if examples else ''}")
+
+                work_items: List[WorkItem] = []
+                for info in files:
+                    prev = existing_rows.get(info.path)
+                    if self.full_rescan:
+                        op = "insert" if prev is None else "update"
+                        work_items.append(WorkItem(info=info, op=op))
                         continue
-                    if (
-                        rec.get("size_bytes") != entry.size_bytes
-                        or rec.get("mtime_utc") != entry.mtime_iso
-                    ):
-                        to_process.append(entry)
+                    if prev is None or prev.get("deleted"):
+                        work_items.append(WorkItem(info=info, op="insert"))
                         continue
-                    unchanged_all += 1
-                    if entry.is_av and rec.get("integrity_ok") in (0, 1):
+                    if prev.get("size_bytes") != info.size_bytes or prev.get("mtime_utc") != info.mtime_iso:
+                        work_items.append(WorkItem(info=info, op="update"))
+                        continue
+                    processed_all += 1
+                    if info.is_av and prev.get("integrity_ok") in (0, 1):
                         done_av += 1
 
-                to_process.sort(key=lambda e: e.path)
-                processed_all = unchanged_all
+                work_items.sort(key=lambda item: item.info.path)
 
-                if state and state.get("phase") == "hashing":
+                if state.get("phase") == "hashing":
                     last_path = state.get("last_path_processed") or ""
                     if last_path:
-                        to_process = [entry for entry in to_process if entry.path > last_path]
-                elif state and state.get("phase") == "ffmpeg" and not to_process:
-                    processed_all = self._total_all
-                    done_av = self._total_av
+                        skipped = 0
+                        new_items: List[WorkItem] = []
+                        for item in work_items:
+                            if item.info.path <= last_path:
+                                skipped += 1
+                                if item.info.is_av:
+                                    done_av += 1
+                                continue
+                            new_items.append(item)
+                        processed_all += skipped
+                        work_items = new_items
+                elif state.get("phase") == "ffmpeg":
+                    processed_all = total_all
+                    done_av = sum(
+                        1
+                        for info in files
+                        if info.is_av and existing_rows.get(info.path, {}).get("integrity_ok") in (0, 1)
+                    )
 
+                self._current_phase = "hashing" if work_items else "mediainfo"
                 self._emit_progress(
                     self._current_phase,
                     processed_all,
                     done_av,
-                    total_all=self._total_all,
+                    total_all=total_all,
+                    total_av=total_av,
                     force=True,
                 )
+                checkpoints.force(self._current_phase, "")
 
-                batch: list[tuple] = []
-                ffmpeg_candidates: list[str] = []
+                insert_rows: List[Tuple] = []
+                update_rows: List[Tuple] = []
+                ffmpeg_queue: List[str] = []
                 BATCH_SIZE = 200
-                self._last_checkpoint = time.time()
 
-                def flush_batch():
-                    if not batch:
-                        return
-                    self._upsert_files(scur, batch)
+                def flush_batches() -> None:
+                    if insert_rows:
+                        scur.executemany(
+                            "INSERT INTO files(path,size_bytes,is_av,hash_blake3,media_json,integrity_ok,mtime_utc,deleted,deleted_ts) VALUES(?,?,?,?,?,?,?,?,?)",
+                            insert_rows,
+                        )
+                        insert_rows.clear()
+                    if update_rows:
+                        scur.executemany(
+                            """
+                            UPDATE files SET
+                                size_bytes=?,
+                                is_av=?,
+                                hash_blake3=?,
+                                media_json=?,
+                                integrity_ok=?,
+                                mtime_utc=?,
+                                deleted=0,
+                                deleted_ts=NULL
+                            WHERE path=?
+                            """,
+                            update_rows,
+                        )
+                        update_rows.clear()
                     shard.commit()
-                    batch.clear()
 
-                def process_entry(entry: FileEntry):
+                def process_item(item: WorkItem):
+                    info = item.info
                     if self.stop_evt.is_set():
                         return None
                     try:
-                        media = mediainfo_json(entry.path)
-                        media_blob = json.dumps(media, ensure_ascii=False) if isinstance(media, dict) else None
+                        hash_value = blake3_hash(info.path)
+                        media = mediainfo_json(info.path)
+                        media_json = json.dumps(media, ensure_ascii=False) if isinstance(media, dict) else None
+                        integrity = None
                         needs_ffmpeg = False
                         av_inc = 0
-                        integrity = None
-                        if entry.is_av:
+                        if info.is_av:
                             if isinstance(media, dict):
-                                av_inc = 1
                                 if media.get("error"):
                                     integrity = 0
+                                    av_inc = 1
                                 else:
                                     needs_ffmpeg = True
+                                    av_inc = 1
                             else:
-                                needs_ffmpeg = False
-                                av_inc = 0
+                                integrity = None
                         else:
                             integrity = 1
-                            av_inc = 0
-                        hb3 = blake3_hash(entry.path) if (entry.is_av and self.blake_for_av) else None
+                        if item.op == "insert":
+                            row = (
+                                info.path,
+                                info.size_bytes,
+                                1 if info.is_av else 0,
+                                hash_value,
+                                media_json,
+                                integrity,
+                                info.mtime_iso,
+                                0,
+                                None,
+                            )
+                            return ("insert", row, needs_ffmpeg, av_inc, info.path)
                         row = (
-                            entry.path,
-                            entry.size_bytes,
-                            1 if entry.is_av else 0,
-                            hb3,
-                            media_blob,
+                            info.size_bytes,
+                            1 if info.is_av else 0,
+                            hash_value,
+                            media_json,
                             integrity,
-                            entry.mtime_iso,
-                            0,
-                            None,
+                            info.mtime_iso,
+                            info.path,
                         )
-                        return row, needs_ffmpeg, av_inc
+                        return ("update", row, needs_ffmpeg, av_inc, info.path)
                     except Exception as exc:
-                        log(f"[Job {self.job_id}] error on {entry.path}: {exc}")
+                        log(f"[job {self.job_id}] error on {info.path}: {exc}")
                         error_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                        if item.op == "insert":
+                            row = (
+                                info.path,
+                                None,
+                                1 if info.is_av else 0,
+                                None,
+                                error_blob,
+                                0,
+                                None,
+                                0,
+                                None,
+                            )
+                            return ("insert", row, False, 1 if info.is_av else 0, info.path)
                         row = (
-                            entry.path,
-                            entry.size_bytes,
-                            1 if entry.is_av else 0,
+                            None,
+                            1 if info.is_av else 0,
                             None,
                             error_blob,
-                            0 if entry.is_av else 1,
-                            entry.mtime_iso,
                             0,
                             None,
+                            info.path,
                         )
-                        return row, False, 1 if entry.is_av else 0
+                        return ("update", row, False, 1 if info.is_av else 0, info.path)
 
-                if to_process:
-                    executor = ThreadPoolExecutor(max_workers=max_workers)
-                    try:
-                        for entry, result in zip(to_process, executor.map(process_entry, to_process)):
-                            if self.stop_evt.is_set():
-                                break
-                            if result is None:
-                                continue
-                            row, needs_ffmpeg, av_inc = result
-                            batch.append(row)
-                            if needs_ffmpeg:
-                                ffmpeg_candidates.append(entry.path)
-                            if len(batch) >= BATCH_SIZE:
-                                flush_batch()
-                            processed_all += 1
-                            if av_inc:
+                if work_items and not self.stop_evt.is_set():
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_map = {executor.submit(process_item, item): item for item in work_items}
+                        try:
+                            for future in as_completed(future_map):
+                                item = future_map[future]
+                                if self.stop_evt.is_set():
+                                    break
+                                try:
+                                    result = future.result()
+                                except Exception as exc:
+                                    log(f"[job {self.job_id}] worker failure on {item.info.path}: {exc}")
+                                    processed_all += 1
+                                    if item.info.is_av:
+                                        done_av += 1
+                                    self._emit_progress(
+                                        self._current_phase,
+                                        processed_all,
+                                        done_av,
+                                        total_all=total_all,
+                                        total_av=total_av,
+                                    )
+                                    continue
+                                if not result:
+                                    continue
+                                op, row, needs_ffmpeg, av_inc, path = result
+                                if op == "insert":
+                                    insert_rows.append(row)
+                                else:
+                                    update_rows.append(row)
+                                if needs_ffmpeg and ffmpeg_available:
+                                    ffmpeg_queue.append(path)
+                                processed_all += 1
                                 done_av += av_inc
-                            if self._state_store and self._should_checkpoint():
-                                self._state_store.save("hashing", entry.path)
-                            self._emit_progress(
-                                self._current_phase,
-                                processed_all,
-                                done_av,
-                                total_all=self._total_all,
-                            )
-                    finally:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                flush_batch()
+                                if len(insert_rows) >= BATCH_SIZE or len(update_rows) >= BATCH_SIZE:
+                                    flush_batches()
+                                checkpoints.maybe("hashing", path)
+                                self._emit_progress(
+                                    self._current_phase,
+                                    processed_all,
+                                    done_av,
+                                    total_all=total_all,
+                                    total_av=total_av,
+                                )
+                        finally:
+                            executor.shutdown(wait=False, cancel_futures=True)
 
-                pending_ffmpeg = self._load_pending_ffmpeg(scur)
-                pending_ffmpeg.extend(ffmpeg_candidates)
-                unique_ffmpeg = sorted({p for p in pending_ffmpeg if p in disk_paths})
-                if state and state.get("phase") == "ffmpeg":
+                flush_batches()
+
+                pending_ffmpeg: List[str] = []
+                if ffmpeg_available:
+                    scur.execute(
+                        "SELECT path FROM files WHERE deleted=0 AND is_av=1 AND integrity_ok IS NULL",
+                    )
+                    pending_ffmpeg = [row[0] for row in scur.fetchall() if row[0] in disk_paths]
+
+                ffmpeg_candidates = sorted({*pending_ffmpeg, *ffmpeg_queue})
+                if state.get("phase") == "ffmpeg":
                     last_path = state.get("last_path_processed") or ""
                     if last_path:
-                        unique_ffmpeg = [p for p in unique_ffmpeg if p > last_path]
+                        ffmpeg_candidates = [p for p in ffmpeg_candidates if p > last_path]
 
-                phase_for_emit = "ffmpeg" if unique_ffmpeg else "finalizing"
-                self._current_phase = phase_for_emit
+                if ffmpeg_available and ffmpeg_candidates and not self.stop_evt.is_set():
+                    self._current_phase = "ffmpeg"
+                    self._emit_progress(
+                        self._current_phase,
+                        processed_all,
+                        done_av,
+                        total_all=total_all,
+                        total_av=total_av,
+                        force=True,
+                    )
+                    checkpoints.force("ffmpeg", "")
+                    updates: List[Tuple[int, str]] = []
+                    with ThreadPoolExecutor(max_workers=min(8, max(1, self.max_workers))) as executor:
+                        future_map = {executor.submit(ffmpeg_verify, path): path for path in ffmpeg_candidates}
+                        try:
+                            for future in as_completed(future_map):
+                                path = future_map[future]
+                                if self.stop_evt.is_set():
+                                    break
+                                try:
+                                    ok = future.result()
+                                except Exception as exc:
+                                    log(f"[job {self.job_id}] ffmpeg error on {path}: {exc}")
+                                    ok = False
+                                if ok is None:
+                                    continue
+                                updates.append((1 if ok else 0, path))
+                                if len(updates) >= BATCH_SIZE:
+                                    scur.executemany(
+                                        "UPDATE files SET integrity_ok=? WHERE path=?",
+                                        updates,
+                                    )
+                                    shard.commit()
+                                    updates.clear()
+                                checkpoints.maybe("ffmpeg", path)
+                                self._emit_progress(
+                                    self._current_phase,
+                                    processed_all,
+                                    done_av,
+                                    total_all=total_all,
+                                    total_av=total_av,
+                                )
+                        finally:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                    if updates:
+                        scur.executemany(
+                            "UPDATE files SET integrity_ok=? WHERE path=?",
+                            updates,
+                        )
+                        shard.commit()
+                else:
+                    shard.commit()
+
+                self._current_phase = "finalizing"
                 self._emit_progress(
                     self._current_phase,
-                    processed_all,
+                    total_all,
                     done_av,
-                    total_all=self._total_all,
+                    total_all=total_all,
+                    total_av=total_av,
                     force=True,
                 )
+                checkpoints.force("finalizing", "")
+                if state_store and not self.stop_evt.is_set():
+                    state_store.clear()
 
-                if unique_ffmpeg:
-                    updates: list[tuple[int, str]] = []
-                    executor = ThreadPoolExecutor(max_workers=min(8, max_workers))
-                    try:
-                        for path, ok in zip(unique_ffmpeg, executor.map(ffmpeg_verify, unique_ffmpeg)):
-                            if ok is None:
-                                continue
-                            updates.append((1 if ok else 0, path))
-                            if len(updates) >= BATCH_SIZE:
-                                self._update_integrity(scur, updates)
-                                shard.commit()
-                                updates.clear()
-                            if self._state_store and self._should_checkpoint():
-                                self._state_store.save("ffmpeg", path)
-                    finally:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                    if updates:
-                        self._update_integrity(scur, updates)
-                        shard.commit()
+                duration = int(time.perf_counter() - t0)
+                status = "Stopped" if self.stop_evt.is_set() else "Done"
+                ccur.execute(
+                    """
+                    UPDATE jobs SET finished_at=datetime('now'), status=?, done_av=?, duration_sec=?, message=?
+                    WHERE id=?
+                    """,
+                    (
+                        status,
+                        done_av,
+                        duration,
+                        f"Completed ({done_av}/{total_av}); scanned {total_all} files total",
+                        self.job_id,
+                    ),
+                )
+                catalog.commit()
 
-                if self._state_store:
-                    self._state_store.save("finalizing", "")
-                    self._state_store.clear()
-
-            duration = int(time.perf_counter() - t0)
-            status = "Stopped" if self.stop_evt.is_set() else "Done"
-            ccur.execute(
-                """UPDATE jobs SET finished_at=datetime('now'), status=?, done_av=?, duration_sec=?, message=?
-                            WHERE id=?""",
-                (
-                    status,
-                    done_av,
-                    duration,
-                    f"Completed ({done_av}/{self._total_av}); scanned {self._total_all} files total",
-                    self.job_id,
-                ),
-            )
-            catalog.commit()
-
-            self._put({"type": "refresh_jobs"})
-            final_msg = "Scan stopped." if self.stop_evt.is_set() else "Scan complete."
-            self._put({"type": "status", "message": final_msg})
-            self._put(
-                {
+                self._put({"type": "refresh_jobs"})
+                final_msg = "Scan stopped." if self.stop_evt.is_set() else "Scan complete."
+                self._put({"type": "status", "message": final_msg})
+                self._put({
                     "type": "done",
                     "status": status,
-                    "total_all": self._total_all,
+                    "total_all": total_all,
                     "done_av": done_av,
                     "total_av": self._total_av,
                     "duration": duration,
-                }
-            )
-
+                })
 # ---------------- GUI ----------------
 class App:
     def __init__(self, root: Tk):
@@ -1085,11 +1248,27 @@ class App:
 
         ttk.Checkbutton(scan_frame, text="BLAKE3 hashing for A/V (slower)", variable=self.blake_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 12))
 
-        rescan_frame = ttk.Frame(scan_frame, style="Card.TFrame")
-        rescan_frame.grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 12))
-        ttk.Radiobutton(rescan_frame, text="Delta rescan (recommended)", variable=self.rescan_mode_var, value="delta").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(rescan_frame, text="Full rescan (force re-hash everything)", variable=self.rescan_mode_var, value="full").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Checkbutton(rescan_frame, text="Resume interrupted scan", variable=self.resume_var).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        mode_frame = ttk.Frame(scan_frame, style="Card.TFrame")
+        mode_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        mode_frame.columnconfigure(0, weight=1)
+        mode_frame.columnconfigure(1, weight=1)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Delta rescan (recommended)",
+            variable=self.rescan_mode_var,
+            value="delta",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            mode_frame,
+            text="Full rescan (force re-hash everything)",
+            variable=self.rescan_mode_var,
+            value="full",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(
+            mode_frame,
+            text="Resume interrupted scan",
+            variable=self.resume_var,
+        ).grid(row=0, column=1, rowspan=2, sticky="w", padx=(24, 0))
 
         actions = ttk.Frame(scan_frame, style="Card.TFrame")
         actions.grid(row=7, column=0, columnspan=4, sticky="ew")
@@ -1609,11 +1788,11 @@ class App:
             db_catalog=self.db_path.get(),
             blake_for_av=bool(self.blake_var.get()),
             max_workers=threads,
-            stop_evt=self.stop_evt,
-            event_queue=self.worker_queue,
-            delta_rescan=(self.rescan_mode_var.get() != "full"),
+            full_rescan=(self.rescan_mode_var.get() == "full"),
             resume_enabled=bool(self.resume_var.get()),
             checkpoint_seconds=5,
+            stop_evt=self.stop_evt,
+            event_queue=self.worker_queue
         )
         self.clear_banner()
         self.show_banner("Scan started", "INFO")
