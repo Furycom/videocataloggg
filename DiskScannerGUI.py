@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, List, Literal, Optional
+from types import SimpleNamespace
 
 import scan_drive
 
@@ -454,6 +455,7 @@ class ScannerWorker(threading.Thread):
         dtype: str,
         db_catalog: str,
         blake_for_av: bool,
+        light_analysis: bool,
         inventory_only: bool,
         max_workers: int,
         full_rescan: bool,
@@ -470,6 +472,7 @@ class ScannerWorker(threading.Thread):
         self.dtype = dtype
         self.db_catalog = db_catalog
         self.blake_for_av = blake_for_av
+        self.light_analysis = bool(light_analysis)
         self.inventory_only = bool(inventory_only)
         self.max_workers = max(1, int(max_workers))
         self.full_rescan = bool(full_rescan)
@@ -525,6 +528,7 @@ class ScannerWorker(threading.Thread):
                 settings=settings_data,
                 perf_overrides=perf_overrides,
                 robust_overrides=robust_overrides,
+                light_analysis=False,
                 progress_callback=self._inventory_progress_callback,
             )
         except SystemExit as exc:
@@ -652,14 +656,16 @@ class ScannerWorker(threading.Thread):
             self._run_inventory_only(mount, shard_path)
             return
 
+        settings_data = load_settings(WORKING_DIR_PATH)
         perf_payload = None
+        perf_cfg = None
         try:
             overrides: Dict[str, object] = {}
             if self.max_workers:
                 overrides["worker_threads"] = self.max_workers
             perf_cfg = resolve_performance_config(
                 str(mount),
-                settings=load_settings(WORKING_DIR_PATH),
+                settings=settings_data,
                 cli_overrides=overrides,
             )
             perf_payload = {
@@ -741,9 +747,24 @@ class ScannerWorker(threading.Thread):
         smart_blob = try_smart_overview(self.tool_paths.get("smartctl"))
         total_bytes, free_bytes = disk_usage_bytes(mount)
 
+        light_cfg = scan_drive._resolve_light_analysis(settings_data, self.light_analysis)
+        light_pipeline: Optional[scan_drive.LightAnalysisPipeline] = None
+        light_summary: Optional[Dict[str, object]] = None
+
         init_shard(str(shard_path))
         with sqlite3.connect(str(shard_path)) as shard:
             _ensure_shard_schema(shard)
+            if light_cfg.enabled:
+                perf_profile = str(perf_cfg.profile) if perf_cfg else "AUTO"
+                light_pipeline = scan_drive.LightAnalysisPipeline(
+                    settings=light_cfg,
+                    connection=shard,
+                    ffmpeg_path=self.tool_paths.get("ffmpeg"),
+                    perf_profile=perf_profile,
+                    progress_callback=self._put,
+                    start_time=self._start_monotonic or time.perf_counter(),
+                )
+                light_pipeline.prepare()
             state_store = ShardScanState(shard, interval_seconds=self.checkpoint_seconds)
             if not self.resume_enabled:
                 state_store.clear()
@@ -963,6 +984,11 @@ class ScannerWorker(threading.Thread):
                     (path, size, is_av, hb3, media_blob, integrity, mtime),
                 )
                 shard.commit()
+                if light_pipeline and path and size is not None:
+                    try:
+                        light_pipeline.process(SimpleNamespace(path=path, fs_path=path))
+                    except Exception:
+                        pass
                 processed_all += 1
                 if av_increment:
                     done_av += av_increment
@@ -1032,6 +1058,8 @@ class ScannerWorker(threading.Thread):
 
             duration = int(time.perf_counter() - t0)
             status = "Stopped" if self.stop_evt.is_set() else "Done"
+            if light_pipeline is not None:
+                light_summary = light_pipeline.finalize()
 
         with sqlite3.connect(self.db_catalog) as catalog:
             catalog.execute(
@@ -1056,6 +1084,7 @@ class ScannerWorker(threading.Thread):
             "done_av": done_av,
             "total_av": total_av,
             "duration": duration,
+            "light_analysis": light_summary,
         })
 
 
@@ -1706,7 +1735,14 @@ class App:
         self.label_var = StringVar()
         self.type_var  = StringVar()
         self.notes_var = StringVar()
+        light_settings = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_light = _SETTINGS.get("light_analysis")
+            if isinstance(maybe_light, dict):
+                light_settings = maybe_light
+        light_default = bool(light_settings.get("enabled_default", False))
         self.blake_var = IntVar(value=0)
+        self.light_analysis_var = IntVar(value=1 if light_default else 0)
         self.inventory_var = IntVar(value=0)
         self.rescan_mode_var = StringVar(value="delta")
         self.resume_var = IntVar(value=1)
@@ -2132,12 +2168,17 @@ class App:
         ttk.Checkbutton(scan_frame, text="BLAKE3 hashing for A/V (slower)", variable=self.blake_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 12))
         ttk.Checkbutton(
             scan_frame,
+            text="Light Analysis (images & video thumbnails)",
+            variable=self.light_analysis_var,
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(
+            scan_frame,
             text="Inventory Only (skip hashing & media analysis)",
             variable=self.inventory_var,
-        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 12))
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(0, 12))
 
         rescan_options = ttk.Frame(scan_frame, style="Card.TFrame")
-        rescan_options.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        rescan_options.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(0, 12))
         rescan_options.columnconfigure(0, weight=1)
         ttk.Radiobutton(
             rescan_options,
@@ -2158,7 +2199,7 @@ class App:
         ).grid(row=0, column=1, rowspan=2, sticky="w", padx=(24, 0))
 
         actions = ttk.Frame(scan_frame, style="Card.TFrame")
-        actions.grid(row=7, column=0, columnspan=4, sticky="ew")
+        actions.grid(row=9, column=0, columnspan=4, sticky="ew")
         for c in range(5):
             actions.columnconfigure(c, weight=1)
         ttk.Button(actions, text="Scan", command=self.start_scan, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
@@ -2177,7 +2218,7 @@ class App:
         self.exports_button = exports_menu_btn
 
         status_activity = ttk.Frame(scan_frame, style="Card.TFrame")
-        status_activity.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        status_activity.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(12, 0))
         status_activity.columnconfigure(1, weight=1)
 
         self.activity_indicator = ttk.Progressbar(
@@ -3088,6 +3129,7 @@ class App:
             dtype=self.type_var.get().strip(),
             db_catalog=self.db_path.get(),
             blake_for_av=bool(self.blake_var.get()),
+            light_analysis=bool(self.light_analysis_var.get()),
             inventory_only=bool(self.inventory_var.get()),
             max_workers=threads,
             full_rescan=self.rescan_mode_var.get().lower() == "full",
@@ -3267,6 +3309,17 @@ class App:
             self.progress_snapshot = None
             self.last_progress_ts = None
             self._update_status_line(force=True)
+        elif etype == "light_analysis_status":
+            la_status = str(event.get("status") or "").lower()
+            message = event.get("message") or "Light analysis update."
+            if la_status == "error":
+                self.show_banner(message, "ERROR")
+                self._set_status(message, "error")
+            elif la_status == "warning":
+                self.show_banner(message, "WARNING")
+                self._set_status(message, "warning")
+            else:
+                self._set_status(message, "info")
         elif etype == "refresh_jobs":
             self.refresh_jobs()
         elif etype == "error":
@@ -3340,6 +3393,22 @@ class App:
                         "Inventory done — total files: "
                         f"{(total_all or 0):,} — duration: {self._format_elapsed(duration)}"
                     )
+                    light_info = event.get("light_analysis")
+                    light_line = None
+                    if isinstance(light_info, dict):
+                        la_status = str(light_info.get("status") or "").lower()
+                        if la_status == "ok":
+                            light_line = (
+                                "Light analysis — images: "
+                                f"{int(light_info.get('images', 0)):,}, videos: {int(light_info.get('videos', 0)):,}, "
+                                f"avg dim: {int(light_info.get('avg_dim', 0))}"
+                            )
+                            if light_info.get("warning"):
+                                light_line += f" (warning: {light_info.get('warning')})"
+                        elif la_status in {"error", "skipped"} and light_info.get("message"):
+                            light_line = f"Light analysis skipped — {light_info.get('message')}"
+                    if light_line:
+                        summary_text = f"{summary_text} • {light_line}"
                     self.status_line_idle_text = summary_text
                     action = (
                         "View summary",
@@ -3355,6 +3424,22 @@ class App:
                         "Done — total files: "
                         f"{(total_all or 0):,} — AV files: {(total_av or 0):,} — duration: {self._format_elapsed(duration)}"
                     )
+                    light_info = event.get("light_analysis")
+                    light_line = None
+                    if isinstance(light_info, dict):
+                        la_status = str(light_info.get("status") or "").lower()
+                        if la_status == "ok":
+                            light_line = (
+                                "Light analysis — images: "
+                                f"{int(light_info.get('images', 0)):,}, videos: {int(light_info.get('videos', 0)):,}, "
+                                f"avg dim: {int(light_info.get('avg_dim', 0))}"
+                            )
+                            if light_info.get("warning"):
+                                light_line += f" (warning: {light_info.get('warning')})"
+                        elif la_status in {"error", "skipped"} and light_info.get("message"):
+                            light_line = f"Light analysis skipped — {light_info.get('message')}"
+                    if light_line:
+                        summary_text = f"{summary_text} • {light_line}"
                     self.status_line_idle_text = summary_text
                     action = None
                     if self._recent_export_paths:

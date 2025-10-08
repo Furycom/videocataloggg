@@ -21,6 +21,37 @@ Both the CLI (`scan_drive.py`) and the GUI offer a toggle between these modes. A
 - Optional multi-threaded metadata extraction to speed up large scans while keeping full detail.
 - Live log viewer embedded in the GUI so you can observe progress without opening the log file.
 - Automatic shard schema migration that ensures legacy shard databases gain the `is_av` column and other metadata fields.
+- Optional **Light Analysis** mode extracts compact MobileNetV3-Small embeddings for images and a couple of sampled video frames. Results are stored in a dedicated `features` table (path → kind → normalized float32 vector) so the primary `files` inventory stays lean. The CLI exposes a `--light-analysis` flag and the GUI adds a “Light Analysis (images & video thumbnails)” toggle; both default to off. Supply a MobileNetV3 ONNX file under `<working_dir>/models/mobilenetv3-small.onnx` (or set `light_analysis.model_path` in `settings.json`) and the app will reuse it across runs. Missing FFmpeg gracefully limits analysis to still images and posts a banner warning.
+
+### Light Analysis mode
+
+When light analysis is enabled the scanner loads a small MobileNetV3-Small ONNX model via CPU-only ONNXRuntime, resizes frames with Pillow, and L2-normalizes the resulting embeddings. For videos, two thumbnails (≈5% and 50% of the runtime, capped by `light_analysis.max_video_frames`) are sampled via FFmpeg; the vectors are averaged and normalized before being written. On USB and NETWORK profiles the sampler throttles itself and falls back to a single frame to keep I/O gentle.
+
+Each processed asset writes a single row into the shard-local `features` table:
+
+```
+CREATE TABLE features (
+  path TEXT PRIMARY KEY,
+  kind TEXT CHECK(kind IN ('image','video')),
+  vec BLOB NOT NULL,
+  dim INTEGER NOT NULL,
+  frames_used INTEGER NOT NULL,
+  updated_utc TEXT NOT NULL
+);
+```
+
+Vectors are serialized as float32 arrays so downstream tools can read them directly. A post-scan summary line reports how many images/videos were embedded and the average dimensionality. Disable or override defaults through `settings.json`:
+
+```json
+"light_analysis": {
+  "enabled_default": false,
+  "model_path": "models/mobilenetv3-small.onnx",
+  "max_video_frames": 2,
+  "prefer_ffmpeg": true
+}
+```
+
+If the ONNX model or runtime cannot be loaded the scanner posts a red banner, skips feature extraction, and continues hashing/metadata work as usual.
 
 ## Performance Profiles
 

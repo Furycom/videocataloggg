@@ -1,4 +1,8 @@
-﻿blake3
+blake3
 tqdm
 rich
 sqlite-utils
+numpy
+Pillow
+onnxruntime
+opencv-python-headless

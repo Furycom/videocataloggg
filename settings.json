@@ -1,3 +1,9 @@
 {
-  "catalog_db": "C:/Users/Administrator/VideoCatalog/catalog.db"
+  "catalog_db": "C:/Users/Administrator/VideoCatalog/catalog.db",
+  "light_analysis": {
+    "enabled_default": false,
+    "model_path": null,
+    "max_video_frames": 2,
+    "prefer_ffmpeg": true
+  }
 }
