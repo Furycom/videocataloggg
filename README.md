@@ -21,6 +21,41 @@ Both the CLI (`scan_drive.py`) and the GUI offer a toggle between these modes. A
 - Live log viewer embedded in the GUI so you can observe progress without opening the log file.
 - Automatic shard schema migration that ensures legacy shard databases gain the `is_av` column and other metadata fields.
 
+## Performance Profiles
+
+`scan_drive.py` and the GUI automatically benchmark the selected mount point to choose one of four performance profiles: **SSD**, **HDD**, **USB**, or **NETWORK**. The profile controls worker-thread counts, hashing chunk sizes, FFmpeg parallelism, and whether gentle I/O backoff is enabled. NETWORK scans always include a small per-file pause so SMB/CIFS shares stay responsive, while slower USB media lower concurrency and shrink read chunks to avoid thrashing.
+
+Default targets:
+
+- **SSD** – up to 32 workers (2× CPU), 1 MB hash chunks, FFmpeg parallelism up to 4.
+- **HDD** – up to 16 workers, 512 KB hash chunks, FFmpeg parallelism up to 2.
+- **USB** – up to 8 workers, 256 KB hash chunks, gentle I/O enabled.
+- **NETWORK** – fixed 6 workers, 256 KB hash chunks, FFmpeg single-threaded with gentle I/O always on.
+
+Manual overrides can be supplied in `settings.json` or per run:
+
+```json
+{
+  "performance": {
+    "profile": "SSD",
+    "worker_threads": 12,
+    "hash_chunk_bytes": 1048576,
+    "ffmpeg_parallel": 2,
+    "gentle_io": true
+  }
+}
+```
+
+CLI flags override both detection and persisted settings when needed:
+
+- `--perf-profile AUTO|SSD|HDD|USB|NETWORK`
+- `--perf-threads N`
+- `--perf-chunk BYTES`
+- `--perf-ffmpeg N`
+- `--perf-gentle-io` / `--no-perf-gentle-io`
+
+The GUI shows the active profile above the progress bars so you can confirm how the scan is tuned in real time.
+
 ## Paths & working directory
 
 The scanner now resolves its working directory deterministically:

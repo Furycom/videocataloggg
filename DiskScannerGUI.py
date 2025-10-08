@@ -24,6 +24,7 @@ from paths import (
     update_settings,
 )
 from exports import ExportFilters, export_shard
+from perf import resolve_performance_config
 from tools import (
     bootstrap_local_bin,
     get_winget_candidates,
@@ -485,6 +486,32 @@ class ScannerWorker(threading.Thread):
 
         shard_path = shard_path_for(self.label)
         shard_path.parent.mkdir(parents=True, exist_ok=True)
+
+        perf_payload = None
+        try:
+            overrides: Dict[str, object] = {}
+            if self.max_workers:
+                overrides["worker_threads"] = self.max_workers
+            perf_cfg = resolve_performance_config(
+                str(mount),
+                settings=load_settings(WORKING_DIR_PATH),
+                cli_overrides=overrides,
+            )
+            perf_payload = {
+                "type": "performance",
+                "profile": perf_cfg.profile,
+                "auto_profile": perf_cfg.auto_profile,
+                "source": perf_cfg.source,
+                "worker_threads": perf_cfg.worker_threads,
+                "hash_chunk_bytes": perf_cfg.hash_chunk_bytes,
+                "ffmpeg_parallel": perf_cfg.ffmpeg_parallel,
+                "gentle_io": bool(perf_cfg.gentle_io),
+            }
+        except Exception as exc:
+            log(f"[ScannerWorker] performance detection failed: {exc}")
+            perf_payload = None
+        if perf_payload:
+            self._put(perf_payload)
 
         self._put({"type": "status", "message": "Enumerating files…"})
         self._current_phase = "enumerating"
@@ -1527,6 +1554,13 @@ class App:
         self.status_label = ttk.Label(header, textvariable=self.status_var, style="StatusInfo.TLabel")
         self.status_label.grid(row=0, column=1, sticky="e")
 
+        self.performance_var = StringVar(value="Performance: —")
+        ttk.Label(
+            header,
+            textvariable=self.performance_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         bars = ttk.Frame(progress_frame, style="Card.TFrame")
         bars.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         bars.columnconfigure(1, weight=1)
@@ -1566,6 +1600,29 @@ class App:
         style = self.status_styles.get(level, "StatusInfo.TLabel")
         if hasattr(self, "status_label"):
             self.status_label.configure(style=style)
+
+    def _update_performance_display(self, payload: dict):
+        if not hasattr(self, "performance_var"):
+            return
+        profile = str(payload.get("profile") or "—")
+        label = f"Performance: {profile}"
+        extras: list[str] = []
+        threads = payload.get("worker_threads")
+        if isinstance(threads, int) and threads > 0:
+            extras.append(f"threads={threads}")
+        chunk = payload.get("hash_chunk_bytes")
+        if isinstance(chunk, int) and chunk > 0:
+            if chunk >= 1_048_576:
+                chunk_str = f"{chunk / 1_048_576:.0f}MB"
+            else:
+                chunk_str = f"{max(1, chunk // 1024)}KB"
+            extras.append(f"chunk={chunk_str}")
+        ffmpeg = payload.get("ffmpeg_parallel")
+        if isinstance(ffmpeg, int) and ffmpeg > 0:
+            extras.append(f"ffmpeg={ffmpeg}")
+        if extras:
+            label += " (" + ", ".join(extras) + ")"
+        self.performance_var.set(label)
 
     def _show_toast(self, message: str, level: str = "success", duration: int = 4000):
         toast = Toplevel(self.root)
@@ -2218,6 +2275,8 @@ class App:
         }
         self.heartbeat_active = False
         self.status_line_idle_text = "Ready."
+        if hasattr(self, "performance_var"):
+            self.performance_var.set("Performance: detecting…")
         self._start_activity_indicator()
         self._update_status_line(force=True)
         self.worker.start()
@@ -2322,6 +2381,8 @@ class App:
             else:
                 level = "info"
             self._set_status(msg, level)
+        elif etype == "performance":
+            self._update_performance_display(event)
         elif etype == "tool_missing":
             tool = str(event.get("tool", "")).strip() or "tool"
             self.scan_in_progress = False
@@ -2430,6 +2491,8 @@ class App:
             self.av_progress["value"] = 0
             self.av_progress["maximum"] = 1
             self._update_progress_styles(0, 0)
+            if hasattr(self, "performance_var"):
+                self.performance_var.set("Performance: —")
             self.progress_snapshot = None
             self._update_status_line(force=True)
 

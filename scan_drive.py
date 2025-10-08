@@ -5,10 +5,13 @@ import importlib.util
 import json
 import logging
 import os
+import queue
+import random
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,10 +22,17 @@ from paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
     get_shard_db_path,
+    load_settings,
     resolve_working_dir,
 )
 from exports import ExportFilters, export_catalog, parse_since
 from tools import bootstrap_local_bin, probe_tool
+
+from perf import (
+    RateController,
+    enumerate_sleep_range,
+    resolve_performance_config,
+)
 
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
@@ -74,6 +84,15 @@ class FileInfo:
     size_bytes: int
     mtime_utc: str
     is_av: bool
+
+
+@dataclass(slots=True)
+class WorkerResult:
+    info: FileInfo
+    hash_value: Optional[str]
+    media_blob: Optional[str]
+    integrity_ok: Optional[int]
+    error_message: Optional[str] = None
 
 
 class ScanStateStore:
@@ -160,17 +179,28 @@ def ffmpeg_verify(file_path: str, executable: Optional[str]) -> bool:
     code, out, err = run([executable, "-v", "error", "-xerror", "-i", file_path, "-f", "null", "-", "-nostdin"])
     return code == 0
 
-def hash_blake3(file_path: str, chunk: int = 1024*1024) -> str:
+def hash_blake3(
+    file_path: str,
+    chunk: int = 1024 * 1024,
+    *,
+    on_chunk: Optional[Callable[[int, float], None]] = None,
+) -> str:
     if _blake3_hash is None:
         h = hashlib.sha256()
     else:
         h = _blake3_hash()
     with open(file_path, "rb") as f:
         while True:
+            start = time.perf_counter()
             b = f.read(chunk)
+            elapsed = time.perf_counter() - start
             if not b:
+                if on_chunk is not None and elapsed > 0:
+                    on_chunk(0, elapsed)
                 break
             h.update(b)
+            if on_chunk is not None:
+                on_chunk(len(b), elapsed)
     return h.hexdigest()
 
 
@@ -187,6 +217,7 @@ def _enumerate_files(
     *,
     debug_slow: bool = False,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    gentle_sleep: Optional[Tuple[float, float]] = None,
 ) -> List[FileInfo]:
     stack: List[Path] = [base_path]
     results: List[FileInfo] = []
@@ -213,6 +244,8 @@ def _enumerate_files(
                         is_av=_is_av(entry.path),
                     )
                     results.append(info)
+                    if gentle_sleep:
+                        time.sleep(random.uniform(*gentle_sleep))
                     if debug_slow:
                         time.sleep(0.01)
                     if progress_callback and (time.monotonic() - last_emit) >= 5:
@@ -402,11 +435,47 @@ def scan_drive(
     resume: bool = True,
     checkpoint_seconds: int = 5,
     debug_slow: bool = False,
+    settings: Optional[Dict[str, object]] = None,
+    perf_overrides: Optional[Dict[str, object]] = None,
 ) -> dict:
     mount = Path(mount_path)
     if not mount.exists():
         print(f"[ERROR] Mount path not found: {mount_path}")
         sys.exit(2)
+
+    effective_settings = settings or load_settings(WORKING_DIR_PATH)
+    perf_overrides = perf_overrides or {}
+    perf_config = resolve_performance_config(
+        str(mount),
+        settings=effective_settings,
+        cli_overrides=perf_overrides,
+    )
+    LOGGER.info(
+        "Perf: profile=%s threads=%s chunk=%s ffmpeg_parallel=%s gentle_io=%s",
+        perf_config.profile,
+        perf_config.worker_threads,
+        perf_config.hash_chunk_bytes,
+        perf_config.ffmpeg_parallel,
+        str(bool(perf_config.gentle_io)).lower(),
+    )
+    try:
+        print(
+            json.dumps(
+                {
+                    "type": "performance",
+                    "profile": perf_config.profile,
+                    "auto_profile": perf_config.auto_profile,
+                    "source": perf_config.source,
+                    "worker_threads": perf_config.worker_threads,
+                    "hash_chunk_bytes": perf_config.hash_chunk_bytes,
+                    "ffmpeg_parallel": perf_config.ffmpeg_parallel,
+                    "gentle_io": bool(perf_config.gentle_io),
+                }
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
 
     LOGGER.info(
         "Delta rescan = %s, resume = %s, checkpoint = %ss",
@@ -466,7 +535,13 @@ def scan_drive(
         if resume:
             state_store.checkpoint(phase, None)
 
-    file_infos = _enumerate_files(mount, debug_slow=debug_slow, progress_callback=_progress_event)
+    enumeration_sleep = enumerate_sleep_range(perf_config.profile, perf_config.gentle_io)
+    file_infos = _enumerate_files(
+        mount,
+        debug_slow=debug_slow,
+        progress_callback=_progress_event,
+        gentle_sleep=enumeration_sleep,
+    )
     existing_rows = _load_existing(conn, label)
 
     enumerated_paths = {info.path for info in file_infos}
@@ -522,44 +597,154 @@ def scan_drive(
         last_path = pending[processed_files - 1].path if processed_files > 0 else None
         state_store.checkpoint("hashing", last_path, force=True)
 
-    for info in work_list:
-        hash_value = None
-        media_blob = None
-        integrity_ok: Optional[int] = 1
-        try:
-            hash_value = hash_blake3(info.path)
-            metadata = mediainfo_json(info.path, TOOL_PATHS.get("mediainfo")) if info.is_av else None
-            if metadata is not None:
-                media_blob = json.dumps(metadata, ensure_ascii=False)
-                integrity_ok = 0 if metadata.get("error") else 1
-            else:
-                media_blob = None
-                integrity_ok = None if info.is_av else 1
-            if info.is_av:
-                ok = ffmpeg_verify(info.path, TOOL_PATHS.get("ffmpeg"))
-                if ok is False:
-                    integrity_ok = 0
-        except Exception as exc:
-            LOGGER.exception("Failed to process %s", info.path)
-            media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
-            integrity_ok = 0
-        _upsert_file(
-            conn,
-            label,
-            info,
-            hash_value=hash_value,
-            media_blob=media_blob,
-            integrity_ok=integrity_ok,
+    results_expected = len(work_list)
+    last_processed_path = pending[processed_files - 1].path if processed_files > 0 else None
+
+    if work_list:
+        base_sleep_range = None
+        if perf_config.profile == "NETWORK":
+            base_sleep_range = (0.002, 0.005)
+        elif perf_config.gentle_io and perf_config.profile == "USB":
+            base_sleep_range = (0.0015, 0.003)
+
+        rate_controller = RateController(
+            enabled=bool(perf_config.gentle_io or perf_config.profile == "NETWORK"),
+            worker_threads=perf_config.worker_threads,
+            base_sleep_range=base_sleep_range,
+            latency_threshold=0.05 if perf_config.profile == "NETWORK" else 0.04,
         )
-        processed_files += 1
-        if info.is_av:
-            processed_av += 1
-        if resume:
-            state_store.checkpoint("hashing", info.path)
+        ffmpeg_semaphore = threading.Semaphore(max(1, perf_config.ffmpeg_parallel))
+        task_queue: "queue.Queue[object]" = queue.Queue()
+        result_queue: "queue.Queue[WorkerResult]" = queue.Queue()
+        sentinel = object()
+        mediainfo_path = TOOL_PATHS.get("mediainfo")
+        ffmpeg_path = TOOL_PATHS.get("ffmpeg")
+        retry_delays = (0.1, 0.3, 0.9)
+
+        def _process_file(info: FileInfo) -> WorkerResult:
+            integrity_ok: Optional[int] = None if info.is_av else 1
+            media_blob: Optional[str] = None
+            hash_value: Optional[str] = None
+            error_message: Optional[str] = None
+            attempts = 0
+
+            while True:
+                try:
+                    delay = rate_controller.before_task(task_queue.qsize())
+                    if delay > 0:
+                        time.sleep(delay)
+
+                    def _on_chunk(bytes_read: int, elapsed: float) -> None:
+                        if bytes_read > 0:
+                            rate_controller.note_io(elapsed)
+
+                    hash_value = hash_blake3(
+                        info.path,
+                        chunk=perf_config.hash_chunk_bytes,
+                        on_chunk=_on_chunk,
+                    )
+                    metadata = (
+                        mediainfo_json(info.path, mediainfo_path) if info.is_av else None
+                    )
+                    if metadata is not None:
+                        media_blob = json.dumps(metadata, ensure_ascii=False)
+                        integrity_ok = 0 if metadata.get("error") else 1
+                    else:
+                        media_blob = None
+                        integrity_ok = None if info.is_av else 1
+                    if info.is_av:
+                        with ffmpeg_semaphore:
+                            ok = ffmpeg_verify(info.path, ffmpeg_path)
+                        if ok is False:
+                            integrity_ok = 0
+                    rate_controller.note_success()
+                    error_message = None
+                    break
+                except (OSError, IOError) as exc:
+                    rate_controller.note_error()
+                    attempts += 1
+                    if attempts < len(retry_delays):
+                        time.sleep(retry_delays[attempts - 1])
+                        continue
+                    LOGGER.warning("I/O error while processing %s: %s", info.path, exc)
+                    media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                    integrity_ok = 0
+                    hash_value = None
+                    error_message = str(exc)
+                    break
+                except Exception as exc:
+                    rate_controller.note_error()
+                    LOGGER.exception("Failed to process %s", info.path)
+                    media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                    integrity_ok = 0
+                    hash_value = None
+                    error_message = str(exc)
+                    break
+
+            return WorkerResult(
+                info=info,
+                hash_value=hash_value,
+                media_blob=media_blob,
+                integrity_ok=integrity_ok,
+                error_message=error_message,
+            )
+
+        def _worker() -> None:
+            while True:
+                item = task_queue.get()
+                try:
+                    if item is sentinel:
+                        break
+                    assert isinstance(item, FileInfo)
+                    result_queue.put(_process_file(item))
+                finally:
+                    task_queue.task_done()
+
+        workers: List[threading.Thread] = []
+        for _ in range(perf_config.worker_threads):
+            thread = threading.Thread(target=_worker, name="scan-worker")
+            thread.daemon = True
+            thread.start()
+            workers.append(thread)
+
+        for info in work_list:
+            task_queue.put(info)
+        for _ in workers:
+            task_queue.put(sentinel)
+
+        completed = 0
+        while completed < results_expected:
+            try:
+                result = result_queue.get(timeout=1.0)
+            except queue.Empty:
+                if resume:
+                    state_store.checkpoint("hashing", last_processed_path)
+                continue
+            _upsert_file(
+                conn,
+                label,
+                result.info,
+                hash_value=result.hash_value,
+                media_blob=result.media_blob,
+                integrity_ok=result.integrity_ok,
+            )
+            processed_files += 1
+            if result.info.is_av:
+                processed_av += 1
+            completed += 1
+            last_processed_path = result.info.path
+            if resume:
+                state_store.checkpoint("hashing", result.info.path)
+            if result.error_message:
+                LOGGER.debug("Recorded warning for %s: %s", result.info.path, result.error_message)
+
+        task_queue.join()
+        for thread in workers:
+            thread.join()
 
     if resume:
         if work_list:
-            state_store.checkpoint("hashing", work_list[-1].path, force=True)
+            state_store.checkpoint("hashing", last_processed_path, force=True)
         state_store.checkpoint("finalizing", None, force=True)
         state_store.clear()
 
@@ -579,6 +764,7 @@ def scan_drive(
         "unchanged": len(unchanged),
         "deleted": deleted_count,
         "duration_seconds": duration,
+        "performance": perf_config.as_dict(),
     }
 
 
@@ -633,6 +819,41 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=5,
         help="Seconds between resume checkpoints (default: 5).",
     )
+    parser.add_argument(
+        "--perf-profile",
+        choices=["AUTO", "SSD", "HDD", "USB", "NETWORK"],
+        help="Override automatic performance profile detection.",
+    )
+    parser.add_argument(
+        "--perf-threads",
+        type=int,
+        help="Override worker thread count.",
+    )
+    parser.add_argument(
+        "--perf-chunk",
+        type=int,
+        help="Override hash chunk size in bytes.",
+    )
+    parser.add_argument(
+        "--perf-ffmpeg",
+        type=int,
+        help="Override FFmpeg parallelism.",
+    )
+    parser.add_argument(
+        "--perf-gentle-io",
+        dest="perf_gentle_io",
+        action="store_const",
+        const=True,
+        help="Force-enable gentle I/O throttling.",
+    )
+    parser.add_argument(
+        "--no-perf-gentle-io",
+        dest="perf_gentle_io",
+        action="store_const",
+        const=False,
+        help="Disable gentle I/O throttling even if recommended.",
+    )
+    parser.set_defaults(perf_gentle_io=None)
     parser.add_argument(
         "--export-csv",
         nargs="?",
@@ -748,6 +969,20 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     debug_flag = bool(args.debug or args.debug_slow_enumeration)
     checkpoint_seconds = max(1, int(getattr(args, "checkpoint_seconds", 5)))
+    perf_cli_overrides: Dict[str, object] = {}
+    if getattr(args, "perf_profile", None) is not None:
+        perf_cli_overrides["profile"] = args.perf_profile
+    if getattr(args, "perf_threads", None) is not None:
+        perf_cli_overrides["worker_threads"] = args.perf_threads
+    if getattr(args, "perf_chunk", None) is not None:
+        perf_cli_overrides["hash_chunk_bytes"] = args.perf_chunk
+    if getattr(args, "perf_ffmpeg", None) is not None:
+        perf_cli_overrides["ffmpeg_parallel"] = args.perf_ffmpeg
+    if getattr(args, "perf_gentle_io", None) is not None:
+        perf_cli_overrides["gentle_io"] = args.perf_gentle_io
+
+    settings_data = load_settings(WORKING_DIR_PATH)
+
     result = scan_drive(
         args.label,
         args.mount_path,
@@ -756,6 +991,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         resume=not bool(getattr(args, "no_resume", False)),
         checkpoint_seconds=checkpoint_seconds,
         debug_slow=debug_flag,
+        settings=settings_data,
+        perf_overrides=perf_cli_overrides,
     )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
