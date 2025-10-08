@@ -1,0 +1,26 @@
+# Environments
+.venv/
+venv/
+__pycache__/
+
+# SQLite artifacts & logs (keep tracked baseline DBs)
+*.db-shm
+*.db-wal
+*.log
+
+# Generated exports & shards
+exports/
+shards/
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+
+# Local scan outputs
+env_scan_*.json
+env_scan_*.txt
+
+# Platform detritus
+.DS_Store
+Thumbs.db

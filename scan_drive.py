@@ -19,6 +19,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
+from analyzers import (
+    FeatureRecord,
+    FeatureWriter,
+    ImageEmbedder,
+    ImageEmbedderConfig,
+    LightAnalysisModelError,
+    VideoThumbnailAnalyzer,
+    ensure_features_table,
+)
 from paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
@@ -104,6 +113,17 @@ _blake3_hash = importlib.import_module("blake3").blake3 if _blake3_spec is not N
 VIDEO_EXTS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.ts','.m2ts','.webm','.mpg','.mpeg'}
 AUDIO_EXTS = {'.mp3','.flac','.aac','.m4a','.wav','.wma','.ogg','.opus','.alac','.aiff','.ape','.dsf','.dff'}
 AV_EXTS = VIDEO_EXTS | AUDIO_EXTS
+IMAGE_EXTS = {
+    '.jpg',
+    '.jpeg',
+    '.png',
+    '.gif',
+    '.bmp',
+    '.tif',
+    '.tiff',
+    '.webp',
+    '.heic',
+}
 
 
 @dataclass(slots=True)
@@ -124,6 +144,210 @@ class WorkerResult:
     media_blob: Optional[str]
     integrity_ok: Optional[int]
     error_message: Optional[str] = None
+
+
+@dataclass
+class LightAnalysisSettings:
+    enabled: bool
+    model_path: Path
+    max_video_frames: int
+    prefer_ffmpeg: bool
+
+
+class LightAnalysisPipeline:
+    def __init__(
+        self,
+        *,
+        settings: LightAnalysisSettings,
+        connection: sqlite3.Connection,
+        ffmpeg_path: Optional[str],
+        perf_profile: str,
+        progress_callback: Optional[Callable[[dict], None]],
+        start_time: float,
+    ) -> None:
+        self._requested = bool(settings.enabled)
+        self._settings = settings
+        self._conn = connection
+        self._ffmpeg_path = ffmpeg_path
+        self._profile = perf_profile
+        self._progress_callback = progress_callback
+        self._start = start_time
+        self._last_emit = 0.0
+        self._writer: Optional[FeatureWriter] = None
+        self._embedder: Optional[ImageEmbedder] = None
+        self._video: Optional[VideoThumbnailAnalyzer] = None
+        self._active = False
+        self._error: Optional[str] = None
+        self._warning: Optional[str] = None
+
+    def prepare(self) -> None:
+        if not self._requested:
+            return
+        ensure_features_table(self._conn)
+        try:
+            self._embedder = ImageEmbedder(
+                ImageEmbedderConfig(model_path=self._settings.model_path)
+            )
+        except LightAnalysisModelError as exc:
+            self._error = str(exc)
+            self._emit_status("error", self._error)
+            return
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._error = f"Light analysis unavailable: {exc}"
+            self._emit_status("error", self._error)
+            return
+        self._writer = FeatureWriter(self._conn, batch_size=48)
+        if self._ffmpeg_path:
+            self._video = VideoThumbnailAnalyzer(
+                embedder=self._embedder,
+                ffmpeg_path=self._ffmpeg_path,
+                prefer_ffmpeg=self._settings.prefer_ffmpeg,
+                max_frames=self._settings.max_video_frames,
+                rate_limit_profile=self._profile,
+            )
+        else:
+            self._warning = "FFmpeg not available — video thumbnails skipped."
+            self._emit_status("warning", self._warning)
+        self._active = True
+
+    def process(self, info: FileInfo) -> None:
+        if not self._active or not self._embedder or not self._writer:
+            return
+        try:
+            suffix = Path(info.path).suffix.lower()
+        except Exception:
+            return
+        if suffix in IMAGE_EXTS:
+            vector = self._embedder.embed_path(Path(info.fs_path))
+            if vector is not None:
+                record = FeatureRecord(
+                    path=info.path,
+                    kind="image",
+                    vector=vector,
+                    frames_used=1,
+                )
+                self._writer.add(record)
+                self._emit_progress()
+        elif suffix in VIDEO_EXTS:
+            if not self._video:
+                return
+            vector, frames_used = self._video.extract_features(Path(info.fs_path))
+            if vector is None:
+                return
+            record = FeatureRecord(
+                path=info.path,
+                kind="video",
+                vector=vector,
+                frames_used=max(1, frames_used),
+            )
+            self._writer.add(record)
+            self._emit_progress()
+
+    def finalize(self) -> Dict[str, object]:
+        summary = {
+            "requested": self._requested,
+            "active": self._active,
+            "images": 0,
+            "videos": 0,
+            "avg_dim": 0,
+        }
+        if not self._active or not self._writer:
+            if self._error:
+                summary["status"] = "error"
+                summary["message"] = self._error
+            elif self._warning:
+                summary["status"] = "skipped"
+                summary["message"] = self._warning
+            else:
+                summary["status"] = "skipped"
+                if self._requested and not self._error:
+                    summary["message"] = "Light analysis disabled."
+            return summary
+        self._writer.close()
+        summary["images"] = self._writer.total_images
+        summary["videos"] = self._writer.total_videos
+        summary["avg_dim"] = self._writer.average_dimension()
+        summary["status"] = "ok"
+        if self._warning:
+            summary["warning"] = self._warning
+        self._emit_progress(force=True)
+        return summary
+
+    def _emit_progress(self, force: bool = False) -> None:
+        if not self._writer:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_emit) < 5:
+            return
+        elapsed = int(time.perf_counter() - self._start)
+        payload = {
+            "type": "progress",
+            "phase": "light-analysis",
+            "elapsed_s": elapsed,
+            "light_images": self._writer.total_images,
+            "light_videos": self._writer.total_videos,
+            "light_avg_dim": self._writer.average_dimension(),
+        }
+        if self._progress_callback is not None:
+            try:
+                self._progress_callback(payload)
+            except Exception:
+                pass
+        else:
+            try:
+                print(json.dumps(payload), flush=True)
+            except Exception:
+                pass
+        self._last_emit = now
+
+    def _emit_status(self, status: str, message: str) -> None:
+        payload = {"type": "light_analysis_status", "status": status, "message": message}
+        if self._progress_callback is not None:
+            try:
+                self._progress_callback(payload)
+            except Exception:
+                pass
+        else:
+            try:
+                print(json.dumps(payload), flush=True)
+            except Exception:
+                pass
+
+
+def _resolve_light_analysis(
+    settings: Optional[Dict[str, object]], override: Optional[bool]
+) -> LightAnalysisSettings:
+    config: Dict[str, object] = {}
+    if isinstance(settings, dict):
+        maybe = settings.get("light_analysis")
+        if isinstance(maybe, dict):
+            config = maybe
+    enabled_default = bool(config.get("enabled_default", False))
+    if override is not None:
+        enabled = bool(override)
+    else:
+        enabled = enabled_default
+    model_value = config.get("model_path") if isinstance(config, dict) else None
+    if isinstance(model_value, str) and model_value.strip():
+        candidate = Path(model_value.strip())
+        if not candidate.is_absolute():
+            model_path = WORKING_DIR_PATH / candidate
+        else:
+            model_path = candidate
+    else:
+        model_path = WORKING_DIR_PATH / "models" / "mobilenetv3-small.onnx"
+    max_frames_value = config.get("max_video_frames", 2) if isinstance(config, dict) else 2
+    try:
+        max_frames = max(1, int(max_frames_value))
+    except Exception:
+        max_frames = 2
+    prefer_ffmpeg = bool(config.get("prefer_ffmpeg", True)) if isinstance(config, dict) else True
+    return LightAnalysisSettings(
+        enabled=enabled,
+        model_path=model_path,
+        max_video_frames=max_frames,
+        prefer_ffmpeg=prefer_ffmpeg,
+    )
 
 
 class ScanStateStore:
@@ -411,6 +635,7 @@ def init_db(db_path: str):
         if name not in existing_cols:
             c.execute(ddl)
     conn.commit()
+    ensure_features_table(conn)
     return conn
 
 
@@ -735,6 +960,7 @@ def scan_drive(
     settings: Optional[Dict[str, object]] = None,
     perf_overrides: Optional[Dict[str, object]] = None,
     robust_overrides: Optional[Dict[str, object]] = None,
+    light_analysis: Optional[bool] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     mount = Path(mount_path)
@@ -746,6 +972,7 @@ def scan_drive(
 
     effective_settings = settings or load_settings(WORKING_DIR_PATH)
     perf_overrides = perf_overrides or {}
+    light_cfg = _resolve_light_analysis(effective_settings, light_analysis)
     perf_config = resolve_performance_config(
         str(mount),
         settings=effective_settings,
@@ -803,6 +1030,17 @@ def scan_drive(
 
     total, used, free = shutil.disk_usage(mount)
     conn = init_db(str(shard_path))
+    light_pipeline: Optional[LightAnalysisPipeline] = None
+    if not inventory_only:
+        light_pipeline = LightAnalysisPipeline(
+            settings=light_cfg,
+            connection=conn,
+            ffmpeg_path=TOOL_PATHS.get("ffmpeg"),
+            perf_profile=str(perf_config.profile),
+            progress_callback=progress_callback,
+            start_time=start_time,
+        )
+        light_pipeline.prepare()
     conn.execute(
         """
         INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
@@ -1119,6 +1357,8 @@ def scan_drive(
                         info.mtime_utc,
                     )
                 )
+            if light_pipeline is not None:
+                light_pipeline.process(info)
             _flush_db(force=False)
             _emit_progress("hashing")
 
@@ -1397,6 +1637,9 @@ def scan_drive(
         metrics["skipped_ignored"],
         metrics["retries"],
     )
+    light_summary: Optional[Dict[str, object]] = None
+    if light_pipeline is not None:
+        light_summary = light_pipeline.finalize()
     conn.close()
     return {
         "total_files": metrics["files_seen"],
@@ -1409,6 +1652,7 @@ def scan_drive(
         "skipped_perm": metrics["skipped_perm"],
         "skipped_toolong": metrics["skipped_toolong"],
         "skipped_ignored": metrics["skipped_ignored"],
+        "light_analysis": light_summary,
     }
 
 
@@ -1587,6 +1831,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         dest="since",
         help="Only include files updated at or after the given ISO 8601 UTC timestamp.",
     )
+    parser.add_argument(
+        "--light-analysis",
+        dest="light_analysis",
+        action="store_true",
+        help="Enable lightweight embeddings for images and sampled video frames.",
+    )
+    parser.add_argument(
+        "--no-light-analysis",
+        dest="light_analysis",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(light_analysis=None)
     parser.add_argument(
         "positional",
         nargs="*",
@@ -1937,6 +2194,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         settings=settings_data,
         perf_overrides=perf_cli_overrides,
         robust_overrides=robust_cli_overrides,
+        light_analysis=getattr(args, "light_analysis", None),
     )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
@@ -1949,12 +2207,27 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"audio: {int(totals.get('audio', 0)):,} — image: {int(totals.get('image', 0)):,} "
             f"— duration: {_format_duration(duration_seconds)}"
         )
+        light_line = None
     else:
         av_files = int(result.get("av_files", 0)) if isinstance(result, dict) else 0
         summary_line = (
             "Done — total files: "
             f"{total_files:,} — AV files: {av_files:,} — duration: {_format_duration(duration_seconds)}"
         )
+        light_line = None
+        light_info = result.get("light_analysis") if isinstance(result, dict) else None
+        if isinstance(light_info, dict):
+            status = str(light_info.get("status") or "").lower()
+            if status == "ok":
+                light_line = (
+                    "Light analysis — images: "
+                    f"{int(light_info.get('images', 0)):,}, videos: {int(light_info.get('videos', 0)):,}, "
+                    f"avg dim: {int(light_info.get('avg_dim', 0))}"
+                )
+                if light_info.get("warning"):
+                    light_line += f" (warning: {light_info.get('warning')})"
+            elif status in {"error", "skipped"} and light_info.get("message"):
+                light_line = f"Light analysis skipped — {light_info.get('message')}"
 
     export_requests: list[tuple[str, Optional[str]]] = []
     if getattr(args, "export_csv", None) is not None:
@@ -1994,6 +2267,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
     print(summary_line)
+    if not getattr(args, "inventory_only", False) and light_line:
+        print(light_line)
     if not getattr(args, "inventory_only", False):
         try:
             maintenance_options = resolve_options(settings_data)
