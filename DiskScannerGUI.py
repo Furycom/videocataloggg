@@ -1579,6 +1579,8 @@ class App:
 
         self.progress_detail_var = StringVar(value="No scan running.")
         ttk.Label(progress_frame, textvariable=self.progress_detail_var, style="Subtle.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.skipped_detail_var = StringVar(value="Skipped: perm=0, long=0, ignored=0")
+        ttk.Label(progress_frame, textvariable=self.skipped_detail_var, style="Subtle.TLabel").grid(row=3, column=0, sticky="w", pady=(4, 0))
 
         log_frame = ttk.LabelFrame(self.content, text="Live log", padding=(16, 12), style="Card.TLabelframe")
         log_frame.grid(row=6, column=0, sticky=(N, S, E, W))
@@ -2265,6 +2267,7 @@ class App:
         self.scan_in_progress = True
         self.scan_start_ts = time.time()
         self.last_progress_ts = self.scan_start_ts
+        self.skipped_detail_var.set("Skipped: perm=0, long=0, ignored=0")
         self.progress_snapshot = {
             "phase": "enumerating",
             "files_total": None,
@@ -2272,6 +2275,9 @@ class App:
             "av_seen": 0,
             "elapsed_s": 0,
             "total_av": None,
+            "skipped_perm": 0,
+            "skipped_toolong": 0,
+            "skipped_ignored": 0,
         }
         self.heartbeat_active = False
         self.status_line_idle_text = "Ready."
@@ -2323,6 +2329,18 @@ class App:
             total_av = event.get("total_av")
             if total_av is None and self.progress_snapshot:
                 total_av = self.progress_snapshot.get("total_av")
+            skipped_perm = event.get("skipped_perm")
+            skipped_long = event.get("skipped_toolong")
+            skipped_ignored = event.get("skipped_ignored")
+            if skipped_perm is None and self.progress_snapshot:
+                skipped_perm = self.progress_snapshot.get("skipped_perm")
+            if skipped_long is None and self.progress_snapshot:
+                skipped_long = self.progress_snapshot.get("skipped_toolong")
+            if skipped_ignored is None and self.progress_snapshot:
+                skipped_ignored = self.progress_snapshot.get("skipped_ignored")
+            skipped_perm = int(skipped_perm or 0)
+            skipped_long = int(skipped_long or 0)
+            skipped_ignored = int(skipped_ignored or 0)
             phase = event.get("phase") or (self.progress_snapshot or {}).get("phase") or "working"
             elapsed = event.get("elapsed_s")
 
@@ -2351,6 +2369,9 @@ class App:
                 detail = "Gathering files…"
                 status_text = "Scanning…"
             self.progress_detail_var.set(detail)
+            self.skipped_detail_var.set(
+                f"Skipped: perm={skipped_perm:,}, long={skipped_long:,}, ignored={skipped_ignored:,}"
+            )
             self._set_status(status_text, "accent")
             self._update_progress_styles(overall_pct, av_pct if total_av not in (None, 0) else 0.0)
 
@@ -2363,6 +2384,9 @@ class App:
                 "total_av": total_av,
                 "done_av": av_seen if av_seen is not None else 0,
                 "done_all": files_seen,
+                "skipped_perm": skipped_perm,
+                "skipped_toolong": skipped_long,
+                "skipped_ignored": skipped_ignored,
             }
             if event.get("total_all") is not None:
                 self.progress_snapshot["total_all"] = event.get("total_all")
@@ -2491,6 +2515,7 @@ class App:
             self.av_progress["value"] = 0
             self.av_progress["maximum"] = 1
             self._update_progress_styles(0, 0)
+            self.skipped_detail_var.set("Skipped: perm=0, long=0, ignored=0")
             if hasattr(self, "performance_var"):
                 self.performance_var.set("Performance: —")
             self.progress_snapshot = None
