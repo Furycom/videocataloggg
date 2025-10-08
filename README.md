@@ -17,6 +17,7 @@ Both the CLI (`scan_drive.py`) and the GUI offer a toggle between these modes. A
 
 ### Recent updates
 
+- Eco-IO **Inventory Only** mode records every file's path, size, timestamps, extension, MIME guess (libmagic when available, otherwise extension heuristics), and category without hashing or FFmpeg analysis. Results land in the lightweight `inventory` table with per-scan summaries under `inventory_stats` and the GUI offers a dedicated toggle plus a completion dialog with per-category counts.
 - Optional multi-threaded metadata extraction to speed up large scans while keeping full detail.
 - Live log viewer embedded in the GUI so you can observe progress without opening the log file.
 - Automatic shard schema migration that ensures legacy shard databases gain the `is_av` column and other metadata fields.

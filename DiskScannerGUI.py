@@ -10,6 +10,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, List, Literal, Optional
 
+import scan_drive
+
 from db_maint import (
     MaintenanceOptions,
     check_integrity,
@@ -452,6 +454,7 @@ class ScannerWorker(threading.Thread):
         dtype: str,
         db_catalog: str,
         blake_for_av: bool,
+        inventory_only: bool,
         max_workers: int,
         full_rescan: bool,
         resume_enabled: bool,
@@ -467,6 +470,7 @@ class ScannerWorker(threading.Thread):
         self.dtype = dtype
         self.db_catalog = db_catalog
         self.blake_for_av = blake_for_av
+        self.inventory_only = bool(inventory_only)
         self.max_workers = max(1, int(max_workers))
         self.full_rescan = bool(full_rescan)
         self.resume_enabled = bool(resume_enabled)
@@ -492,6 +496,81 @@ class ScannerWorker(threading.Thread):
             self.queue.put_nowait(payload)
         except queue.Full:
             pass
+
+    def _inventory_progress_callback(self, payload: dict) -> None:
+        if self.stop_evt.is_set():
+            return
+        payload = dict(payload)
+        self._current_phase = payload.get("phase", self._current_phase)
+        self._put(payload)
+
+    def _run_inventory_only(self, mount: Path, shard_path: Path) -> None:
+        self._current_phase = "enumerating"
+        self._put({"type": "status", "message": "Inventory Only — enumerating files…"})
+        settings_data = load_settings(WORKING_DIR_PATH)
+        perf_overrides: Dict[str, object] = {}
+        if self.max_workers:
+            perf_overrides["worker_threads"] = self.max_workers
+        robust_overrides: Dict[str, object] = {}
+        try:
+            result = scan_drive.scan_drive(
+                self.label,
+                str(mount),
+                self.db_catalog,
+                shard_db_path=str(shard_path),
+                inventory_only=True,
+                resume=True,
+                checkpoint_seconds=self.checkpoint_seconds,
+                debug_slow=False,
+                settings=settings_data,
+                perf_overrides=perf_overrides,
+                robust_overrides=robust_overrides,
+                progress_callback=self._inventory_progress_callback,
+            )
+        except SystemExit as exc:
+            message = f"Inventory failed ({exc.code})."
+            self._put({"type": "error", "title": "Inventory error", "message": message})
+            self._put({"type": "done", "status": "Error", "message": message})
+            return
+        except Exception as exc:
+            message = f"Inventory error: {exc}"
+            self._put({"type": "error", "title": "Inventory error", "message": message})
+            self._put({"type": "done", "status": "Error", "message": message})
+            return
+
+        totals: Dict[str, int] = {}
+        if isinstance(result, dict):
+            maybe_totals = result.get("totals")
+            if isinstance(maybe_totals, dict):
+                totals = {k: int(v or 0) for k, v in maybe_totals.items()}
+        total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
+        duration_seconds = float(result.get("duration_seconds", 0.0)) if isinstance(result, dict) else 0.0
+        total_seconds = int(round(duration_seconds))
+        hours, remainder = divmod(max(0, total_seconds), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration_text = f"{hours:02}:{minutes:02}:{seconds:02}"
+        summary_line = (
+            "Inventory done — total files: "
+            f"{total_files:,} — video: {totals.get('video', 0):,} — "
+            f"audio: {totals.get('audio', 0):,} — image: {totals.get('image', 0):,} "
+            f"— duration: {duration_text}"
+        )
+        self._put({"type": "status", "message": summary_line})
+        self._put(
+            {
+                "type": "done",
+                "status": "Done",
+                "total_all": total_files,
+                "done_av": 0,
+                "total_av": 0,
+                "duration": int(round(duration_seconds)),
+                "message": summary_line,
+                "inventory_totals": totals,
+                "skipped_perm": int(result.get("skipped_perm", 0)) if isinstance(result, dict) else 0,
+                "skipped_toolong": int(result.get("skipped_toolong", 0)) if isinstance(result, dict) else 0,
+                "skipped_ignored": int(result.get("skipped_ignored", 0)) if isinstance(result, dict) else 0,
+            }
+        )
 
     def _emit_progress(
         self,
@@ -568,6 +647,10 @@ class ScannerWorker(threading.Thread):
 
         shard_path = shard_path_for(self.label)
         shard_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.inventory_only:
+            self._run_inventory_only(mount, shard_path)
+            return
 
         perf_payload = None
         try:
@@ -1624,6 +1707,7 @@ class App:
         self.type_var  = StringVar()
         self.notes_var = StringVar()
         self.blake_var = IntVar(value=0)
+        self.inventory_var = IntVar(value=0)
         self.rescan_mode_var = StringVar(value="delta")
         self.resume_var = IntVar(value=1)
         cpu_count = os.cpu_count() or 1
@@ -2046,6 +2130,11 @@ class App:
         threads_spin.grid(row=4, column=1, sticky="w", padx=(12, 12))
 
         ttk.Checkbutton(scan_frame, text="BLAKE3 hashing for A/V (slower)", variable=self.blake_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 12))
+        ttk.Checkbutton(
+            scan_frame,
+            text="Inventory Only (skip hashing & media analysis)",
+            variable=self.inventory_var,
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 12))
 
         rescan_options = ttk.Frame(scan_frame, style="Card.TFrame")
         rescan_options.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(0, 12))
@@ -2387,6 +2476,47 @@ class App:
             self._banner_visible = True
         if level_key == "SUCCESS":
             self.banner_after_id = self.root.after(8000, self.clear_banner)
+
+    def _open_inventory_summary_dialog(self, total_files: int, totals: Dict[str, int], event: dict) -> None:
+        dialog = Toplevel(self.root)
+        dialog.title("Inventory summary")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=(16, 12))
+        frame.grid(row=0, column=0, sticky="nsew")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        ttk.Label(frame, text=f"Total files: {total_files:,}", style="Heading.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        categories = [
+            ("Video", "video"),
+            ("Audio", "audio"),
+            ("Image", "image"),
+            ("Document", "document"),
+            ("Archive", "archive"),
+            ("Executable", "executable"),
+            ("Other", "other"),
+        ]
+        for idx, (label, key) in enumerate(categories, start=1):
+            value = int(totals.get(key, 0) or 0)
+            ttk.Label(frame, text=f"{label}:").grid(row=idx, column=0, sticky="w", pady=2)
+            ttk.Label(frame, text=f"{value:,}").grid(row=idx, column=1, sticky="e", pady=2)
+        skipped_perm = int(event.get("skipped_perm") or 0)
+        skipped_long = int(event.get("skipped_toolong") or 0)
+        skipped_ignored = int(event.get("skipped_ignored") or 0)
+        skip_row = len(categories) + 1
+        ttk.Separator(frame).grid(row=skip_row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        ttk.Label(frame, text="Skipped (permissions):").grid(row=skip_row + 1, column=0, sticky="w")
+        ttk.Label(frame, text=f"{skipped_perm:,}").grid(row=skip_row + 1, column=1, sticky="e")
+        ttk.Label(frame, text="Skipped (path too long):").grid(row=skip_row + 2, column=0, sticky="w")
+        ttk.Label(frame, text=f"{skipped_long:,}").grid(row=skip_row + 2, column=1, sticky="e")
+        ttk.Label(frame, text="Skipped (ignored patterns):").grid(row=skip_row + 3, column=0, sticky="w")
+        ttk.Label(frame, text=f"{skipped_ignored:,}").grid(row=skip_row + 3, column=1, sticky="e")
+        ttk.Button(frame, text="Close", command=dialog.destroy).grid(
+            row=skip_row + 4, column=0, columnspan=2, pady=(12, 0)
+        )
+        dialog.geometry("320x320")
 
     def clear_banner(self):
         if self.banner_after_id:
@@ -2958,6 +3088,7 @@ class App:
             dtype=self.type_var.get().strip(),
             db_catalog=self.db_path.get(),
             blake_for_av=bool(self.blake_var.get()),
+            inventory_only=bool(self.inventory_var.get()),
             max_workers=threads,
             full_rescan=self.rescan_mode_var.get().lower() == "full",
             resume_enabled=bool(self.resume_var.get()),
@@ -3203,16 +3334,33 @@ class App:
                 duration = summary_snapshot.get("elapsed_s")
             if status == "Done":
                 self._set_status("Ready.", "success")
-                summary_text = (
-                    "Done — total files: "
-                    f"{(total_all or 0):,} — AV files: {(total_av or 0):,} — duration: {self._format_elapsed(duration)}"
-                )
-                self.status_line_idle_text = summary_text
-                action = None
-                if self._recent_export_paths:
-                    action = ("Open exports folder", self.open_exports_folder)
-                self.show_banner(summary_text, "SUCCESS", action=action)
-                self._trigger_auto_maintenance(self._last_scan_label or self.label_var.get().strip())
+                inventory_totals = event.get("inventory_totals")
+                if isinstance(inventory_totals, dict):
+                    summary_text = event.get("message") or (
+                        "Inventory done — total files: "
+                        f"{(total_all or 0):,} — duration: {self._format_elapsed(duration)}"
+                    )
+                    self.status_line_idle_text = summary_text
+                    action = (
+                        "View summary",
+                        lambda totals=inventory_totals, snapshot=event: self._open_inventory_summary_dialog(
+                            total_all or 0,
+                            totals,
+                            snapshot,
+                        ),
+                    )
+                    self.show_banner(summary_text, "SUCCESS", action=action)
+                else:
+                    summary_text = (
+                        "Done — total files: "
+                        f"{(total_all or 0):,} — AV files: {(total_av or 0):,} — duration: {self._format_elapsed(duration)}"
+                    )
+                    self.status_line_idle_text = summary_text
+                    action = None
+                    if self._recent_export_paths:
+                        action = ("Open exports folder", self.open_exports_folder)
+                    self.show_banner(summary_text, "SUCCESS", action=action)
+                    self._trigger_auto_maintenance(self._last_scan_label or self.label_var.get().strip())
             elif status == "Stopped":
                 self._set_status("Scan stopped.", "warning")
                 self.status_line_idle_text = "Scan canceled."
@@ -3234,7 +3382,12 @@ class App:
             self.av_progress["value"] = 0
             self.av_progress["maximum"] = 1
             self._update_progress_styles(0, 0)
-            self.skipped_detail_var.set("Skipped: perm=0, long=0, ignored=0")
+            skipped_perm = int(event.get("skipped_perm") or 0)
+            skipped_long = int(event.get("skipped_toolong") or 0)
+            skipped_ignored = int(event.get("skipped_ignored") or 0)
+            self.skipped_detail_var.set(
+                f"Skipped: perm={skipped_perm:,}, long={skipped_long:,}, ignored={skipped_ignored:,}"
+            )
             if hasattr(self, "performance_var"):
                 self.performance_var.set("Performance: —")
             self.progress_snapshot = None
