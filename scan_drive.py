@@ -29,6 +29,7 @@ from paths import (
     safe_label,
 )
 from exports import ExportFilters, export_catalog, parse_since
+from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
 from tools import bootstrap_local_bin, probe_tool
 
 from perf import (
@@ -44,6 +45,7 @@ from robust import (
     is_hidden,
     is_transient,
     key_for_path,
+    normalize_path,
     merge_settings,
     should_ignore,
     to_fs_path,
@@ -377,6 +379,21 @@ def init_db(db_path: str):
     CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive_label);
     CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_blake3);
     CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+    CREATE TABLE IF NOT EXISTS inventory(
+        path TEXT PRIMARY KEY,
+        size_bytes INTEGER NOT NULL,
+        mtime_utc TEXT NOT NULL,
+        ext TEXT,
+        mime TEXT,
+        category TEXT,
+        drive_label TEXT,
+        drive_type TEXT,
+        indexed_utc TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_inventory_ext ON inventory(ext);
+    CREATE INDEX IF NOT EXISTS idx_inventory_mime ON inventory(mime);
+    CREATE INDEX IF NOT EXISTS idx_inventory_category ON inventory(category);
+    CREATE INDEX IF NOT EXISTS idx_inventory_mtime ON inventory(mtime_utc);
     CREATE TABLE IF NOT EXISTS scan_state(
         key TEXT PRIMARY KEY,
         value TEXT
@@ -396,6 +413,300 @@ def init_db(db_path: str):
     conn.commit()
     return conn
 
+
+def ensure_catalog_inventory_tables(db_path: str) -> None:
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_stats (
+                id INTEGER PRIMARY KEY,
+                scan_ts_utc TEXT NOT NULL,
+                drive_label TEXT NOT NULL,
+                total_files INTEGER NOT NULL,
+                by_video INTEGER NOT NULL,
+                by_audio INTEGER NOT NULL,
+                by_image INTEGER NOT NULL,
+                by_document INTEGER NOT NULL,
+                by_archive INTEGER NOT NULL,
+                by_executable INTEGER NOT NULL,
+                by_other INTEGER NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_inventory_stats(
+    db_path: str,
+    *,
+    drive_label: str,
+    totals: Dict[str, int],
+    total_files: int,
+) -> None:
+    ensure_catalog_inventory_tables(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO inventory_stats(
+                scan_ts_utc,
+                drive_label,
+                total_files,
+                by_video,
+                by_audio,
+                by_image,
+                by_document,
+                by_archive,
+                by_executable,
+                by_other
+            )
+            VALUES(datetime('now'),?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                drive_label,
+                int(total_files),
+                int(totals.get("video", 0)),
+                int(totals.get("audio", 0)),
+                int(totals.get("image", 0)),
+                int(totals.get("document", 0)),
+                int(totals.get("archive", 0)),
+                int(totals.get("executable", 0)),
+                int(totals.get("other", 0)),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _iso_from_stat(stat_result: os.stat_result) -> str:
+    return datetime.utcfromtimestamp(stat_result.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _inventory_scan(
+    *,
+    shard_conn: sqlite3.Connection,
+    catalog_db_path: str,
+    drive_label: str,
+    drive_type: str,
+    mount_path: Path,
+    perf_config,
+    robust_cfg,
+    debug_slow: bool,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+) -> Dict[str, object]:
+    totals: Dict[str, int] = {
+        "video": 0,
+        "audio": 0,
+        "image": 0,
+        "document": 0,
+        "archive": 0,
+        "executable": 0,
+        "other": 0,
+    }
+    metrics = {
+        "dirs_scanned": 0,
+        "files_seen": 0,
+        "skipped_perm": 0,
+        "skipped_toolong": 0,
+        "skipped_ignored": 0,
+    }
+
+    start_time = time.perf_counter()
+    writer = InventoryWriter(
+        shard_conn,
+        batch_size=max(1, int(getattr(robust_cfg, "batch_files", 1000))),
+        flush_interval=max(0.5, float(getattr(robust_cfg, "batch_seconds", 2.0))),
+    )
+
+    try:
+        root_display = normalize_path(str(mount_path))
+        root_fs = to_fs_path(root_display, mode=robust_cfg.long_paths)
+    except PathTooLongError:
+        metrics["skipped_toolong"] += 1
+        return {
+            "total_files": 0,
+            "totals": totals,
+            "duration_seconds": 0.0,
+            "skipped_perm": metrics["skipped_perm"],
+            "skipped_toolong": metrics["skipped_toolong"],
+            "skipped_ignored": metrics["skipped_ignored"],
+        }
+
+    queue: Deque[Tuple[str, str]] = deque()
+    queue.append((root_display, root_fs))
+    visited_dirs: set[Tuple[int, int]] = set()
+    if robust_cfg.follow_symlinks:
+        try:
+            root_stat = os.stat(root_fs, follow_symlinks=True)
+            visited_dirs.add((root_stat.st_dev, root_stat.st_ino))
+        except OSError:
+            pass
+
+    progress_last_emit = 0.0
+
+    def emit_progress(force: bool = False) -> None:
+        nonlocal progress_last_emit
+        now = time.monotonic()
+        if not force and (now - progress_last_emit) < 5:
+            return
+        payload = {
+            "type": "progress",
+            "phase": "enumerating",
+            "elapsed_s": int(now - start_time),
+            "dirs_scanned": metrics["dirs_scanned"],
+            "files_total": metrics["files_seen"],
+            "files_seen": metrics["files_seen"],
+            "av_seen": 0,
+            "inventory_written": writer.total_written,
+            "skipped_perm": metrics["skipped_perm"],
+            "skipped_toolong": metrics["skipped_toolong"],
+            "skipped_ignored": metrics["skipped_ignored"],
+        }
+        if progress_callback is not None:
+            try:
+                progress_callback(payload)
+            except Exception:
+                pass
+        else:
+            try:
+                print(json.dumps(payload), flush=True)
+            except Exception:
+                pass
+        progress_last_emit = now
+
+    sleep_range = enumerate_sleep_range(perf_config.profile, bool(perf_config.gentle_io))
+
+    while queue:
+        display_dir, fs_dir = queue.popleft()
+        try:
+            iterator = os.scandir(fs_dir)
+        except PermissionError:
+            metrics["skipped_perm"] += 1
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if is_transient(exc):
+                continue
+            LOGGER.debug("Inventory: failed to scandir %s: %s", fs_dir, exc)
+            continue
+
+        with iterator as entries:
+            for entry in entries:
+                fs_path = os.path.join(fs_dir, entry.name)
+                display_path = normalize_path(from_fs_path(fs_path))
+
+                try:
+                    if entry.is_dir(follow_symlinks=robust_cfg.follow_symlinks):
+                        if robust_cfg.skip_hidden and is_hidden(entry, fs_path=fs_path, display_path=display_path):
+                            metrics["skipped_ignored"] += 1
+                            continue
+                        if should_ignore(display_path, patterns=robust_cfg.skip_globs):
+                            metrics["skipped_ignored"] += 1
+                            continue
+                        if robust_cfg.follow_symlinks:
+                            try:
+                                stat_dir = entry.stat(follow_symlinks=True)
+                                key = (stat_dir.st_dev, stat_dir.st_ino)
+                                if key in visited_dirs:
+                                    continue
+                                visited_dirs.add(key)
+                            except OSError:
+                                pass
+                        metrics["dirs_scanned"] += 1
+                        queue.append((display_path, fs_path))
+                        continue
+                except PermissionError:
+                    metrics["skipped_perm"] += 1
+                    continue
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    if is_transient(exc):
+                        continue
+                    LOGGER.debug("Inventory: error inspecting %s: %s", fs_path, exc)
+                    continue
+
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+
+                if robust_cfg.skip_hidden and is_hidden(entry, fs_path=fs_path, display_path=display_path):
+                    metrics["skipped_ignored"] += 1
+                    continue
+                if should_ignore(display_path, patterns=robust_cfg.skip_globs):
+                    metrics["skipped_ignored"] += 1
+                    continue
+
+                try:
+                    stat_result = entry.stat(follow_symlinks=False)
+                except PermissionError:
+                    metrics["skipped_perm"] += 1
+                    continue
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    if is_transient(exc):
+                        continue
+                    LOGGER.debug("Inventory: stat failed for %s: %s", fs_path, exc)
+                    continue
+
+                metrics["files_seen"] += 1
+                mime, ext = detect_mime(fs_path)
+                category = categorize(mime, ext)
+                totals[category] = totals.get(category, 0) + 1
+                indexed_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                row = InventoryRow(
+                    path=display_path,
+                    size_bytes=int(stat_result.st_size),
+                    mtime_utc=_iso_from_stat(stat_result),
+                    ext=ext or None,
+                    mime=mime,
+                    category=category,
+                    drive_label=drive_label,
+                    drive_type=drive_type,
+                    indexed_utc=indexed_utc,
+                )
+                writer.add(row)
+                emit_progress()
+
+        if sleep_range:
+            time.sleep(random.uniform(*sleep_range))
+        elif debug_slow:
+            time.sleep(0.01)
+
+    writer.flush(force=True)
+    emit_progress(force=True)
+
+    duration_seconds = time.perf_counter() - start_time
+    total_files = metrics["files_seen"]
+    record_inventory_stats(
+        catalog_db_path,
+        drive_label=drive_label,
+        totals=totals,
+        total_files=total_files,
+    )
+    return {
+        "total_files": total_files,
+        "duration_seconds": duration_seconds,
+        "totals": totals,
+        "skipped_perm": metrics["skipped_perm"],
+        "skipped_toolong": metrics["skipped_toolong"],
+        "skipped_ignored": metrics["skipped_ignored"],
+        "inventory_written": writer.total_written,
+    }
+
 def try_smart_overview(executable: Optional[str]) -> Optional[str]:
     # Best-effort: capture smartctl --scan-open and a subset of PhysicalDrive outputs
     if not executable:
@@ -413,8 +724,10 @@ def try_smart_overview(executable: Optional[str]) -> Optional[str]:
 def scan_drive(
     label: str,
     mount_path: str,
-    db_path: str,
+    catalog_db_path: str,
     *,
+    shard_db_path: Optional[str] = None,
+    inventory_only: bool = False,
     full_rescan: bool = False,
     resume: bool = True,
     checkpoint_seconds: int = 5,
@@ -422,11 +735,14 @@ def scan_drive(
     settings: Optional[Dict[str, object]] = None,
     perf_overrides: Optional[Dict[str, object]] = None,
     robust_overrides: Optional[Dict[str, object]] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     mount = Path(mount_path)
     if not mount.exists():
         print(f"[ERROR] Mount path not found: {mount_path}")
         sys.exit(2)
+
+    shard_path = Path(shard_db_path) if shard_db_path else get_shard_db_path(WORKING_DIR_PATH, label)
 
     effective_settings = settings or load_settings(WORKING_DIR_PATH)
     perf_overrides = perf_overrides or {}
@@ -473,7 +789,7 @@ def scan_drive(
 
     statuses = _refresh_tool_status()
     missing_required = [tool for tool in REQUIRED_TOOLS if not statuses.get(tool, {}).get("present")]
-    if missing_required:
+    if missing_required and not inventory_only:
         for tool in missing_required:
             print(json.dumps({"type": "tool_missing", "tool": tool}), flush=True)
             print(
@@ -486,7 +802,7 @@ def scan_drive(
         LOGGER.warning("smartctl not found. SMART data will be skipped.")
 
     total, used, free = shutil.disk_usage(mount)
-    conn = init_db(db_path)
+    conn = init_db(str(shard_path))
     conn.execute(
         """
         INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
@@ -534,6 +850,22 @@ def scan_drive(
         ignore_patterns = ordered_patterns
     else:
         ignore_patterns = []
+
+    if inventory_only:
+        drive_type_value = str(perf_config.profile)
+        result = _inventory_scan(
+            shard_conn=conn,
+            catalog_db_path=str(catalog_db_path),
+            drive_label=label,
+            drive_type=drive_type_value,
+            mount_path=mount,
+            perf_config=perf_config,
+            robust_cfg=robust_cfg,
+            debug_slow=debug_slow,
+            progress_callback=progress_callback,
+        )
+        conn.close()
+        return result
 
     state_store = ScanStateStore(conn, label, interval_seconds=int(checkpoint_seconds))
     if not resume:
@@ -587,10 +919,16 @@ def scan_drive(
         }
         if metrics["av_total"]:
             payload["total_av"] = metrics["av_total"]
-        try:
-            print(json.dumps(payload), flush=True)
-        except Exception:
-            pass
+        if progress_callback is not None:
+            try:
+                progress_callback(payload)
+            except Exception:
+                pass
+        else:
+            try:
+                print(json.dumps(payload), flush=True)
+            except Exception:
+                pass
         LOGGER.debug(
             "%s — dirs=%s files=%s processed=%s skipped=(perm=%s,long=%s,ignored=%s)",
             phase,
@@ -1172,6 +1510,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Force a full rescan of all files, ignoring the delta optimizer.",
     )
     parser.add_argument(
+        "--inventory-only",
+        action="store_true",
+        help="Enumerate files without hashing and populate the lightweight inventory table.",
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Start a new scan even if a checkpoint is present.",
@@ -1585,6 +1928,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.label,
         args.mount_path,
         str(catalog_db_path),
+        shard_db_path=str(shard_db_path),
+        inventory_only=bool(getattr(args, "inventory_only", False)),
         full_rescan=bool(getattr(args, "full_rescan", False)),
         resume=not bool(getattr(args, "no_resume", False)),
         checkpoint_seconds=checkpoint_seconds,
@@ -1595,12 +1940,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
-    av_files = int(result.get("av_files", 0)) if isinstance(result, dict) else 0
     duration_seconds = float(result.get("duration_seconds", 0.0)) if isinstance(result, dict) else 0.0
-    summary_line = (
-        "Done — total files: "
-        f"{total_files:,} — AV files: {av_files:,} — duration: {_format_duration(duration_seconds)}"
-    )
+    if getattr(args, "inventory_only", False):
+        totals = result.get("totals", {}) if isinstance(result, dict) else {}
+        summary_line = (
+            "Inventory done — total files: "
+            f"{total_files:,} — video: {int(totals.get('video', 0)):,} — "
+            f"audio: {int(totals.get('audio', 0)):,} — image: {int(totals.get('image', 0)):,} "
+            f"— duration: {_format_duration(duration_seconds)}"
+        )
+    else:
+        av_files = int(result.get("av_files", 0)) if isinstance(result, dict) else 0
+        summary_line = (
+            "Done — total files: "
+            f"{total_files:,} — AV files: {av_files:,} — duration: {_format_duration(duration_seconds)}"
+        )
 
     export_requests: list[tuple[str, Optional[str]]] = []
     if getattr(args, "export_csv", None) is not None:
@@ -1608,42 +1962,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     if getattr(args, "export_jsonl", None) is not None:
         export_requests.append(("jsonl", args.export_jsonl))
 
-    for fmt, override in export_requests:
-        override_path = None if not override else _expand_user_path(override)
-        target_display = str(override_path) if override_path else "default"
-        LOGGER.info(
-            "%s export starting → %s (%s)",
-            fmt.upper(),
-            target_display,
-            _format_filter_summary(filters),
-        )
-        try:
-            export_result = export_catalog(
-                catalog_db_path,
-                WORKING_DIR_PATH,
-                args.label,
-                filters,
-                fmt=fmt,
-                output_path=override_path,
+    if not getattr(args, "inventory_only", False):
+        for fmt, override in export_requests:
+            override_path = None if not override else _expand_user_path(override)
+            target_display = str(override_path) if override_path else "default"
+            LOGGER.info(
+                "%s export starting → %s (%s)",
+                fmt.upper(),
+                target_display,
+                _format_filter_summary(filters),
             )
-        except Exception as exc:
-            LOGGER.error("%s export failed: %s", fmt.upper(), exc)
-            print(f"[ERROR] {fmt.upper()} export failed: {exc}", file=sys.stderr)
-            print(summary_line)
-            return 5
-        LOGGER.info(
-            "%s export finished: %s (%s rows)",
-            fmt.upper(),
-            export_result.path,
-            export_result.rows,
-        )
+            try:
+                export_result = export_catalog(
+                    catalog_db_path,
+                    WORKING_DIR_PATH,
+                    args.label,
+                    filters,
+                    fmt=fmt,
+                    output_path=override_path,
+                )
+            except Exception as exc:
+                LOGGER.error("%s export failed: %s", fmt.upper(), exc)
+                print(f"[ERROR] {fmt.upper()} export failed: {exc}", file=sys.stderr)
+                print(summary_line)
+                return 5
+            LOGGER.info(
+                "%s export finished: %s (%s rows)",
+                fmt.upper(),
+                export_result.path,
+                export_result.rows,
+            )
 
     print(summary_line)
-    try:
-        maintenance_options = resolve_options(settings_data)
-        _auto_optimize_after_scan(Path(shard_db_path), args.label, maintenance_options)
-    except Exception:
-        LOGGER.debug("Auto maintenance skipped due to configuration error.")
+    if not getattr(args, "inventory_only", False):
+        try:
+            maintenance_options = resolve_options(settings_data)
+            _auto_optimize_after_scan(Path(shard_db_path), args.label, maintenance_options)
+        except Exception:
+            LOGGER.debug("Auto maintenance skipped due to configuration error.")
     return 0
 
 
