@@ -12,6 +12,7 @@ from paths import (
     get_shard_db_path,
     resolve_working_dir,
 )
+from exports import ExportFilters, export_catalog, parse_since
 from tools import bootstrap_local_bin, probe_tool
 
 WORKING_DIR_PATH = resolve_working_dir()
@@ -54,6 +55,9 @@ _blake3_spec = importlib.util.find_spec("blake3")
 _blake3_hash = importlib.import_module("blake3").blake3 if _blake3_spec is not None else None
 
 VIDEO_EXTS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.ts','.m2ts','.webm','.mpg','.mpeg'}
+AUDIO_EXTS = {'.mp3','.flac','.aac','.m4a','.wav','.wma','.ogg','.opus','.alac','.aiff','.ape','.dsf','.dff'}
+AV_EXTS = VIDEO_EXTS | AUDIO_EXTS
+
 
 def run(cmd:list[str]) -> tuple[int,str,str]:
     try:
@@ -151,6 +155,8 @@ def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = Fal
         print(f"[ERROR] Mount path not found: {mount_path}")
         sys.exit(2)
 
+    start_time = time.perf_counter()
+
     statuses = _refresh_tool_status()
     missing_required = [tool for tool in REQUIRED_TOOLS if not statuses.get(tool, {}).get("present")]
     if missing_required:
@@ -169,7 +175,6 @@ def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = Fal
     conn = init_db(db_path)
     c = conn.cursor()
 
-    # SMART best-effort (won't fail the scan if smartctl missing)
     smart_blob = try_smart_overview(TOOL_PATHS.get("smartctl"))
 
     c.execute("""INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
@@ -177,10 +182,15 @@ def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = Fal
               (label, str(mount.resolve()), int(total), int(free), smart_blob, ))
     conn.commit()
 
-    file_paths = []
+    file_paths: list[str] = []
+    av_files = 0
     for root, dirs, files in os.walk(mount):
-        for f in files:
-            file_paths.append(os.path.join(root, f))
+        for fname in files:
+            full_path = os.path.join(root, fname)
+            file_paths.append(full_path)
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in AV_EXTS:
+                av_files += 1
             if debug_slow:
                 time.sleep(0.01)
 
@@ -195,13 +205,20 @@ def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = Fal
                          VALUES(?,?,?,?,?,?,?)""",
                       (label, fp, int(size), hb3, json.dumps(mi, ensure_ascii=False) if mi else None, int(ok), mtime))
         except Exception as e:
-            # Keep scanning on errors
             c.execute("""INSERT INTO files(drive_label, path, size_bytes, hash_blake3, media_json, integrity_ok, mtime_utc)
                          VALUES(?,?,?,?,?,?,?)""",
                       (label, fp, None, None, json.dumps({"error": str(e)}, ensure_ascii=False), 0, None))
     conn.commit()
     conn.close()
-    print(f"[OK] Scan complete for {label}. DB: {db_path}")
+
+    duration = time.perf_counter() - start_time
+    LOGGER.info("Scan complete for %s. DB: %s", label, db_path)
+    return {
+        "total_files": len(file_paths),
+        "av_files": av_files,
+        "duration_seconds": duration,
+    }
+
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -239,6 +256,33 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--export-csv",
+        nargs="?",
+        const="",
+        help="Export results to CSV after scanning. Optional path overrides the default.",
+    )
+    parser.add_argument(
+        "--export-jsonl",
+        nargs="?",
+        const="",
+        help="Export results to JSONL after scanning. Optional path overrides the default.",
+    )
+    parser.add_argument(
+        "--include-deleted",
+        action="store_true",
+        help="Include rows marked as deleted in exports.",
+    )
+    parser.add_argument(
+        "--av-only",
+        action="store_true",
+        help="Only include audio/video files in exports.",
+    )
+    parser.add_argument(
+        "--since",
+        dest="since",
+        help="Only include files updated at or after the given ISO 8601 UTC timestamp.",
+    )
+    parser.add_argument(
         "positional",
         nargs="*",
         help=argparse.SUPPRESS,
@@ -269,6 +313,20 @@ def _ensure_directory(path: Path) -> None:
         sys.exit(4)
 
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = int(round(max(0.0, float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02}:{minutes:02}:{secs:02}"
+
+
+def _format_filter_summary(filters: ExportFilters) -> str:
+    since = filters.since_utc or "—"
+    include = "true" if filters.include_deleted else "false"
+    av_only = "true" if filters.av_only else "false"
+    return f"include_deleted={include}, av_only={av_only}, since={since}"
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
 
@@ -297,8 +355,67 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     LOGGER.info(startup_info)
 
+    try:
+        since_value = parse_since(getattr(args, "since", None))
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    filters = ExportFilters(
+        include_deleted=bool(getattr(args, "include_deleted", False)),
+        av_only=bool(getattr(args, "av_only", False)),
+        since_utc=since_value,
+    )
+
     debug_flag = bool(args.debug or args.debug_slow_enumeration)
-    scan_drive(args.label, args.mount_path, str(catalog_db_path), debug_slow=debug_flag)
+    result = scan_drive(args.label, args.mount_path, str(catalog_db_path), debug_slow=debug_flag)
+
+    total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
+    av_files = int(result.get("av_files", 0)) if isinstance(result, dict) else 0
+    duration_seconds = float(result.get("duration_seconds", 0.0)) if isinstance(result, dict) else 0.0
+    summary_line = (
+        "Done — total files: "
+        f"{total_files:,} — AV files: {av_files:,} — duration: {_format_duration(duration_seconds)}"
+    )
+
+    export_requests: list[tuple[str, Optional[str]]] = []
+    if getattr(args, "export_csv", None) is not None:
+        export_requests.append(("csv", args.export_csv))
+    if getattr(args, "export_jsonl", None) is not None:
+        export_requests.append(("jsonl", args.export_jsonl))
+
+    for fmt, override in export_requests:
+        override_path = None if not override else _expand_user_path(override)
+        target_display = str(override_path) if override_path else "default"
+        LOGGER.info(
+            "%s export starting → %s (%s)",
+            fmt.upper(),
+            target_display,
+            _format_filter_summary(filters),
+        )
+        try:
+            export_result = export_catalog(
+                catalog_db_path,
+                WORKING_DIR_PATH,
+                args.label,
+                filters,
+                fmt=fmt,
+                output_path=override_path,
+            )
+        except Exception as exc:
+            LOGGER.error("%s export failed: %s", fmt.upper(), exc)
+            print(f"[ERROR] {fmt.upper()} export failed: {exc}", file=sys.stderr)
+            print(summary_line)
+            return 5
+        LOGGER.info(
+            "%s export finished: %s (%s rows)",
+            fmt.upper(),
+            export_result.path,
+            export_result.rows,
+        )
+
+    print(summary_line)
     return 0
 
 
