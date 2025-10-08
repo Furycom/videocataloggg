@@ -10,6 +10,18 @@ from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, List, Literal, Optional
 
+from db_maint import (
+    MaintenanceOptions,
+    check_integrity,
+    database_size_bytes,
+    light_backup,
+    quick_optimize,
+    reindex_and_analyze,
+    resolve_options,
+    update_maintenance_metadata,
+    vacuum_if_needed,
+)
+
 from paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
@@ -20,6 +32,7 @@ from paths import (
     get_shard_db_path,
     get_shards_dir,
     load_settings,
+    safe_label,
     resolve_working_dir,
     update_settings,
 )
@@ -136,6 +149,64 @@ def log(s: str):
 
 
 log(f"[INFO] {_STARTUP_INFO}")
+
+
+def format_bytes(num: int) -> str:
+    if num <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} PB"
+
+
+class SimpleTooltip:
+    def __init__(self, widget):
+        self.widget = widget
+        self.text: str = ""
+        self.tipwindow: Optional[Toplevel] = None
+        widget.bind("<Enter>", self._on_enter)
+        widget.bind("<Leave>", self._on_leave)
+
+    def set_text(self, text: str) -> None:
+        self.text = text or ""
+        if self.tipwindow and not self.text:
+            self._hide()
+
+    def _on_enter(self, _event=None):
+        if self.text:
+            self._show()
+
+    def _on_leave(self, _event=None):
+        self._hide()
+
+    def _show(self):
+        if self.tipwindow or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 16
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        except Exception:
+            return
+        self.tipwindow = tw = Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        frame = ttk.Frame(tw, padding=(6, 4), style="Card.TFrame")
+        frame.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(frame, text=self.text, justify="left", style="Subtle.TLabel", wraplength=320).grid(
+            row=0, column=0, sticky="w"
+        )
+
+    def _hide(self):
+        if self.tipwindow is not None:
+            try:
+                self.tipwindow.destroy()
+            except Exception:
+                pass
+            self.tipwindow = None
 
 @lru_cache(maxsize=None)
 def has_cmd(cmd: str) -> bool:
@@ -321,6 +392,17 @@ class FileInfo:
     size_bytes: int
     mtime_utc: str
     is_av: bool
+
+
+@dataclass(slots=True)
+class MaintenanceTarget:
+    identifier: str
+    name: str
+    path: Path
+    kind: Literal["catalog", "shard"]
+    size_bytes: int
+    label: str
+    safe_label: str
 
 
 class ShardScanState:
@@ -954,6 +1036,541 @@ class CatalogExportWorker(threading.Thread):
         self._put({"type": "export_done", "path": str(result.path), "count": result.rows})
 
 
+class MaintenanceProgressDialog(Toplevel):
+    def __init__(self, parent: Toplevel, message: str, on_cancel: Callable[[], None]):
+        super().__init__(parent)
+        self.title("Maintenance in progress…")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self._on_cancel_cb = on_cancel
+        container = ttk.Frame(self, padding=(20, 16), style="Content.TFrame")
+        container.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.message_var = StringVar(value=message)
+        ttk.Label(
+            container,
+            textvariable=self.message_var,
+            style="Subtle.TLabel",
+            wraplength=360,
+        ).grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(
+            container,
+            orient="horizontal",
+            mode="indeterminate",
+            length=320,
+            style="Info.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(12, 8))
+        self.progress.start(100)
+        self.cancel_button = ttk.Button(
+            container,
+            text="Cancel",
+            command=self._on_cancel,
+            style="Danger.TButton",
+        )
+        self.cancel_button.grid(row=2, column=0, sticky="e")
+
+    def update_message(self, message: str) -> None:
+        self.message_var.set(message)
+
+    def _on_cancel(self) -> None:
+        if self._on_cancel_cb:
+            try:
+                self._on_cancel_cb()
+            except Exception:
+                pass
+        self.cancel_button.configure(state="disabled")
+        self.message_var.set("Cancel requested…")
+
+    def close(self) -> None:
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+class MaintenanceDialog(Toplevel):
+    def __init__(self, app: "App"):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Database Maintenance")
+        self.transient(app.root)
+        self.grab_set()
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.options = self._load_options()
+        self.targets: List[MaintenanceTarget] = []
+        self.worker_thread: Optional[threading.Thread] = None
+        self.cancel_event: Optional[threading.Event] = None
+        self.queue: "queue.Queue[dict]" = queue.Queue()
+        self.progress_dialog: Optional[MaintenanceProgressDialog] = None
+        self.status_var = StringVar(value="Ready.")
+        self._running_action: Optional[str] = None
+        self._scan_active = bool(self.app.scan_in_progress)
+        self._active_scan_safe = safe_label(self.app.label_var.get()) if hasattr(self.app, "label_var") else ""
+        self._tooltips: Dict[str, SimpleTooltip] = {}
+
+        self._build_ui()
+        self.refresh_targets()
+        self.after(200, self._poll_queue)
+
+    def _load_options(self) -> MaintenanceOptions:
+        return resolve_options(load_settings(WORKING_DIR_PATH))
+
+    def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        container = ttk.Frame(self, padding=(18, 16), style="Content.TFrame")
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(3, weight=1)
+
+        ttk.Label(
+            container,
+            text="Select a database and run maintenance actions.",
+            style="Subtle.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        tree_frame = ttk.Frame(container, style="Card.TFrame")
+        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=("name", "kind", "size", "path"),
+            show="headings",
+            height=6,
+        )
+        self.tree.heading("name", text="Database")
+        self.tree.heading("kind", text="Type")
+        self.tree.heading("size", text="Size")
+        self.tree.heading("path", text="Path")
+        self.tree.column("name", width=240, anchor="w")
+        self.tree.column("kind", width=80, anchor="w")
+        self.tree.column("size", width=90, anchor="e")
+        self.tree.column("path", width=320, anchor="w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.bind("<<TreeviewSelect>>", lambda _evt: self._update_button_states())
+
+        buttons = ttk.Frame(container, style="Card.TFrame")
+        buttons.grid(row=2, column=0, sticky="ew", pady=(12, 4))
+        for idx in range(5):
+            buttons.columnconfigure(idx, weight=1)
+
+        self.buttons: Dict[str, ttk.Button] = {}
+        self.buttons["quick"] = ttk.Button(
+            buttons,
+            text="Quick Optimize",
+            command=lambda: self._start_action("quick"),
+        )
+        self.buttons["quick"].grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        self.buttons["integrity"] = ttk.Button(
+            buttons,
+            text="Check Integrity",
+            command=lambda: self._start_action("integrity"),
+        )
+        self.buttons["integrity"].grid(row=0, column=1, padx=(0, 8), sticky="ew")
+        self.buttons["full"] = ttk.Button(
+            buttons,
+            text="Full Maintenance",
+            command=lambda: self._start_action("full"),
+            style="Accent.TButton",
+        )
+        self.buttons["full"].grid(row=0, column=2, padx=(0, 8), sticky="ew")
+        self.buttons["vacuum"] = ttk.Button(
+            buttons,
+            text="VACUUM (force)",
+            command=lambda: self._start_action("vacuum", force=True),
+        )
+        self.buttons["vacuum"].grid(row=0, column=3, padx=(0, 8), sticky="ew")
+        self.buttons["backup"] = ttk.Button(
+            buttons,
+            text="Backup Now",
+            command=lambda: self._start_action("backup"),
+        )
+        self.buttons["backup"].grid(row=0, column=4, sticky="ew")
+        for key, button in self.buttons.items():
+            self._tooltips[key] = SimpleTooltip(button)
+
+        log_frame = ttk.LabelFrame(container, text="Maintenance log", padding=(12, 10), style="Card.TLabelframe")
+        log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log_widget = ScrolledText(
+            log_frame,
+            height=10,
+            width=100,
+            state="disabled",
+            relief="flat",
+            borderwidth=0,
+            background=self.app.colors["background"],
+            foreground=self.app.colors["text"],
+            font=("Consolas", 10),
+        )
+        self.log_widget.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(container, textvariable=self.status_var, style="Subtle.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+
+        self._update_button_states()
+
+    def _append_log(self, line: str) -> None:
+        self.log_widget.configure(state="normal")
+        self.log_widget.insert(END, line + "\n")
+        self.log_widget.see(END)
+        self.log_widget.configure(state="disabled")
+
+    def _set_status(self, message: str) -> None:
+        self.status_var.set(message)
+        self.app._set_status(message, "accent")
+
+    def refresh_targets(self) -> None:
+        previous = self.tree.selection()
+        selected_id = previous[0] if previous else None
+        self.tree.delete(*self.tree.get_children())
+        self.targets = []
+
+        mapping: Dict[str, str] = {}
+        catalog_path = Path(self.app.db_path.get())
+        try:
+            with sqlite3.connect(self.app.db_path.get()) as conn:
+                rows = conn.execute("SELECT label FROM drives").fetchall()
+                for (label,) in rows:
+                    mapping[safe_label(label)] = label
+        except Exception:
+            pass
+
+        def _insert_target(target: MaintenanceTarget) -> None:
+            display_name = target.name
+            if self._is_scan_active(target):
+                display_name += " (scan active)"
+            size_text = format_bytes(target.size_bytes)
+            self.tree.insert(
+                "",
+                END,
+                iid=target.identifier,
+                values=(display_name, target.kind.title(), size_text, str(target.path)),
+            )
+
+        if catalog_path.exists():
+            catalog_size = database_size_bytes(catalog_path)
+        else:
+            catalog_size = 0
+        catalog_target = MaintenanceTarget(
+            identifier="catalog",
+            name="Catalog database",
+            path=catalog_path,
+            kind="catalog",
+            size_bytes=catalog_size,
+            label="Catalog",
+            safe_label="catalog",
+        )
+        self.targets.append(catalog_target)
+        _insert_target(catalog_target)
+
+        shards_dir = SHARDS_DIR_PATH
+        try:
+            shards_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        for shard_path in sorted(Path(shards_dir).glob("*.db")):
+            safe_name = shard_path.stem
+            display = mapping.get(safe_name) or safe_name.replace("_", " ")
+            size = database_size_bytes(shard_path) if shard_path.exists() else 0
+            target = MaintenanceTarget(
+                identifier=f"shard:{safe_name}",
+                name=f"Shard — {display}",
+                path=shard_path,
+                kind="shard",
+                size_bytes=size,
+                label=display,
+                safe_label=safe_name,
+            )
+            self.targets.append(target)
+            _insert_target(target)
+
+        if selected_id and self.tree.exists(selected_id):
+            self.tree.selection_set(selected_id)
+        elif self.targets:
+            self.tree.selection_set(self.targets[0].identifier)
+        self._update_button_states()
+
+    def _get_selected_target(self) -> Optional[MaintenanceTarget]:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        selected = selection[0]
+        for target in self.targets:
+            if target.identifier == selected:
+                return target
+        return None
+
+    def _is_scan_active(self, target: Optional[MaintenanceTarget]) -> bool:
+        if not target:
+            return False
+        if not self._scan_active:
+            return False
+        if target.kind == "catalog":
+            return True
+        return bool(self._active_scan_safe and self._active_scan_safe == target.safe_label)
+
+    def _update_button_states(self) -> None:
+        target = self._get_selected_target()
+        running = bool(self.worker_thread and self.worker_thread.is_alive())
+        active_scan = self._is_scan_active(target)
+        for key, button in self.buttons.items():
+            tooltip = self._tooltips.get(key)
+            if running:
+                button.configure(state="disabled")
+                if tooltip:
+                    tooltip.set_text("Maintenance already running.")
+            elif target is None:
+                button.configure(state="disabled")
+                if tooltip:
+                    tooltip.set_text("Select a database first.")
+            elif active_scan:
+                button.configure(state="disabled")
+                if tooltip:
+                    tooltip.set_text("Disabled while a scan is active for this database.")
+            else:
+                button.configure(state="normal")
+                if tooltip:
+                    tooltip.set_text("")
+
+    def _start_action(self, action: str, *, force: bool = False) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        target = self._get_selected_target()
+        if target is None:
+            messagebox.showinfo("Maintenance", "Please select a database first.")
+            return
+        if self._is_scan_active(target):
+            messagebox.showwarning("Maintenance", "Cannot run maintenance while a scan is active for this database.")
+            return
+        self.options = self._load_options()
+        self.cancel_event = threading.Event()
+        self.worker_thread = threading.Thread(
+            target=self._worker_main,
+            args=(target, action, force),
+            daemon=True,
+        )
+        self._running_action = action
+        message = f"Running {action} on {target.label}…"
+        self.progress_dialog = MaintenanceProgressDialog(self, message, self.cancel_event.set)
+        self.worker_thread.start()
+        self._set_status(message)
+        self._update_button_states()
+
+    def _worker_main(self, target: MaintenanceTarget, action: str, force: bool) -> None:
+        busy_ms = self.options.busy_timeout_ms
+        thresholds = {"vacuum_free_bytes_min": self.options.vacuum_free_bytes_min}
+        start_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.queue.put({"type": "log", "line": f"[{start_ts}] {action} started for {target.label}"})
+        try:
+            if action == "integrity":
+                result = check_integrity(target.path, busy_timeout_ms=busy_ms)
+                self.queue.put({"type": "result", "action": action, "target": target, "result": result})
+                update_maintenance_metadata(
+                    last_run=datetime.utcnow(),
+                    last_integrity_ok=bool(result.get("ok")),
+                    working_dir=WORKING_DIR_PATH,
+                )
+            elif action == "quick":
+                if self.cancel_event and self.cancel_event.is_set():
+                    raise RuntimeError("Cancelled")
+                backup = light_backup(target.path, f"quick_{target.safe_label}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=busy_ms)
+                self.queue.put({"type": "log", "line": f"Backup created → {backup}"})
+                if self.cancel_event and self.cancel_event.is_set():
+                    raise RuntimeError("Cancelled")
+                metrics = reindex_and_analyze(target.path, busy_timeout_ms=busy_ms)
+                self.queue.put({"type": "result", "action": action, "target": target, "result": {"backup": str(backup), "metrics": metrics}})
+                update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+            elif action == "full":
+                backup = light_backup(target.path, f"full_{target.safe_label}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=busy_ms)
+                self.queue.put({"type": "log", "line": f"Backup created → {backup}"})
+                metrics = reindex_and_analyze(target.path, busy_timeout_ms=busy_ms)
+                self.queue.put({"type": "log", "line": "Reindex & ANALYZE completed."})
+                if self.cancel_event and self.cancel_event.is_set():
+                    raise RuntimeError("Cancelled")
+                vacuum_result = vacuum_if_needed(
+                    target.path,
+                    thresholds=thresholds,
+                    busy_timeout_ms=busy_ms,
+                    force=force,
+                    active_check=lambda: self._scan_active,
+                )
+                self.queue.put(
+                    {
+                        "type": "result",
+                        "action": action,
+                        "target": target,
+                        "result": {
+                            "backup": str(backup),
+                            "metrics": metrics,
+                            "vacuum": vacuum_result,
+                        },
+                    }
+                )
+                update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+            elif action == "vacuum":
+                backup = light_backup(target.path, f"vacuum_{target.safe_label}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=busy_ms)
+                self.queue.put({"type": "log", "line": f"Backup created → {backup}"})
+                vacuum_result = vacuum_if_needed(
+                    target.path,
+                    thresholds=thresholds,
+                    busy_timeout_ms=busy_ms,
+                    force=force,
+                    active_check=lambda: self._scan_active,
+                )
+                self.queue.put({"type": "result", "action": action, "target": target, "result": {"backup": str(backup), "vacuum": vacuum_result}})
+                update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+            elif action == "backup":
+                backup = light_backup(target.path, f"manual_{target.safe_label}", working_dir=WORKING_DIR_PATH, busy_timeout_ms=busy_ms)
+                self.queue.put({"type": "result", "action": action, "target": target, "result": {"backup": str(backup)}})
+            else:
+                raise RuntimeError(f"Unknown maintenance action: {action}")
+        except RuntimeError as exc:
+            if "Cancelled" in str(exc):
+                self.queue.put({"type": "log", "line": "Maintenance cancelled."})
+                self.queue.put({"type": "cancelled"})
+            else:
+                self.queue.put({"type": "error", "message": str(exc)})
+        except Exception as exc:
+            self.queue.put({"type": "error", "message": str(exc)})
+        finally:
+            self.queue.put({"type": "done"})
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                event = self.queue.get_nowait()
+                etype = event.get("type")
+                if etype == "log":
+                    self._append_log(event.get("line", ""))
+                elif etype == "result":
+                    target: MaintenanceTarget = event.get("target")
+                    action = event.get("action")
+                    result = event.get("result", {})
+                    self._handle_result(target, action, result)
+                elif etype == "error":
+                    message = event.get("message") or "Maintenance failed."
+                    self._append_log(f"ERROR — {message}")
+                    messagebox.showerror("Maintenance", message)
+                elif etype == "cancelled":
+                    self._append_log("Cancelled by user.")
+                    self._set_status("Maintenance cancelled.")
+                elif etype == "done":
+                    self._on_worker_done()
+                if self.progress_dialog and etype in {"log", "result"}:
+                    self.progress_dialog.update_message(self.status_var.get())
+        except queue.Empty:
+            pass
+        finally:
+            if self.winfo_exists():
+                self.after(200, self._poll_queue)
+
+    def _handle_result(self, target: MaintenanceTarget, action: str, result: Dict[str, object]) -> None:
+        if action == "integrity":
+            ok = bool(result.get("ok"))
+            issues = result.get("issues") or []
+            summary = "Integrity OK" if ok else f"Integrity FAILED ({len(issues)} issues)"
+            self._append_log(summary)
+            for issue in list(issues)[:10]:
+                self._append_log(f"  • {issue}")
+            if ok:
+                self._set_status(f"Integrity OK for {target.label}.")
+                self.app.show_banner(f"Integrity OK for {target.label}.", "SUCCESS")
+            else:
+                self._set_status(f"Integrity issues found for {target.label}.")
+                self.app.show_banner(
+                    f"Integrity issues detected for {target.label}. Make a backup, run full maintenance, then retry.",
+                    "ERROR",
+                )
+        elif action in {"quick", "full"}:
+            metrics = result.get("metrics") or {}
+            backup = result.get("backup")
+            if backup:
+                self._append_log(f"Backup stored at {backup}")
+            indexes = metrics.get("indexes_after")
+            duration = metrics.get("duration_s")
+            if isinstance(duration, (int, float)):
+                self._append_log(f"Reindex completed — indexes={indexes} duration={duration:.2f}s")
+            else:
+                self._append_log("Reindex completed.")
+            vac = result.get("vacuum")
+            if isinstance(vac, dict):
+                if vac.get("skipped"):
+                    reason = vac.get("reason") or "threshold"
+                    self._append_log(f"VACUUM skipped ({reason}).")
+                else:
+                    reclaimed = int(vac.get("reclaimed_bytes") or 0)
+                    self._append_log(f"VACUUM reclaimed {format_bytes(reclaimed)}.")
+            self._set_status(f"{action.title()} maintenance completed for {target.label}.")
+        elif action == "vacuum":
+            backup = result.get("backup")
+            vac = result.get("vacuum") or {}
+            if backup:
+                self._append_log(f"Backup stored at {backup}")
+            if vac.get("skipped"):
+                self._append_log("VACUUM skipped (threshold not met).")
+            else:
+                reclaimed = int(vac.get("reclaimed_bytes") or 0)
+                self._append_log(f"VACUUM reclaimed {format_bytes(reclaimed)}.")
+            self._set_status(f"VACUUM finished for {target.label}.")
+        elif action == "backup":
+            backup = result.get("backup")
+            self._append_log(f"Backup stored at {backup}")
+            self._set_status(f"Backup complete for {target.label}.")
+
+    def _on_worker_done(self) -> None:
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+        self.worker_thread = None
+        self.cancel_event = None
+        self._running_action = None
+        self.refresh_targets()
+        self._set_status("Maintenance ready.")
+        self._update_button_states()
+        if self.app._maintenance_window is self:
+            self.app._set_status("Ready.")
+
+    def _on_close(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            if not messagebox.askyesno("Maintenance", "Maintenance is running. Cancel and close?"):
+                return
+            if self.cancel_event:
+                self.cancel_event.set()
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        if self.app._maintenance_window is self:
+            self.app._maintenance_window = None
+        self.destroy()
+
+    def on_scan_state_change(self, active: bool, label: Optional[str]) -> None:
+        self._scan_active = bool(active)
+        self._active_scan_safe = safe_label(label or "") if label else ""
+        self.refresh_targets()
+
+    def select_catalog(self) -> None:
+        if self.tree.exists("catalog"):
+            self.tree.selection_set("catalog")
+            self.tree.see("catalog")
+            self._update_button_states()
+
+
 # ---------------- GUI ----------------
 class App:
     def __init__(self, root: Tk):
@@ -998,6 +1615,8 @@ class App:
         self.root.geometry("1020x820")
         self.root.minsize(900, 720)
         self.db_path = StringVar(value=DB_DEFAULT)
+        self._maintenance_window: Optional[MaintenanceDialog] = None
+        self._last_scan_label: Optional[str] = None
 
         # inputs
         self.path_var  = StringVar()
@@ -1322,6 +1941,7 @@ class App:
 
         mtools = Menu(menubar, tearoff=0)
         mtools.add_command(label="Export Current Catalog DB", command=self.export_db)
+        mtools.add_command(label="Maintenance…", command=self.open_maintenance_dialog)
         mtools.add_separator()
         mtools.add_command(label="Diagnostics…", command=self.open_diagnostics_dialog)
         menubar.add_cascade(label="Tools", menu=mtools)
@@ -1332,6 +1952,19 @@ class App:
         mexports.add_separator()
         mexports.add_command(label="Open exports folder", command=self.open_exports_folder)
         menubar.add_cascade(label="Exports", menu=mexports)
+
+    def open_maintenance_dialog(self) -> Optional[MaintenanceDialog]:
+        if self._maintenance_window and self._maintenance_window.winfo_exists():
+            try:
+                self._maintenance_window.lift()
+                self._maintenance_window.focus_set()
+                self._maintenance_window.refresh_targets()
+            except Exception:
+                pass
+            return self._maintenance_window
+        dialog = MaintenanceDialog(self)
+        self._maintenance_window = dialog
+        return dialog
 
     def _build_form(self):
         self.root.grid_rowconfigure(0, weight=0)
@@ -1602,6 +2235,60 @@ class App:
         style = self.status_styles.get(level, "StatusInfo.TLabel")
         if hasattr(self, "status_label"):
             self.status_label.configure(style=style)
+
+    def _notify_maintenance_scan_state(self) -> None:
+        if self._maintenance_window and self._maintenance_window.winfo_exists():
+            label = self._last_scan_label or self.label_var.get().strip()
+            self._maintenance_window.on_scan_state_change(self.scan_in_progress, label)
+
+    def _trigger_auto_maintenance(self, label: Optional[str]) -> None:
+        if not label:
+            return
+        shard_path = shard_path_for(label)
+        if not shard_path.exists():
+            return
+
+        def worker():
+            settings = load_settings(WORKING_DIR_PATH)
+            options = resolve_options(settings)
+            safe = safe_label(label)
+            try:
+                log(f"[Maintenance] Auto optimize for shard {label} starting.")
+                quick_optimize(shard_path, busy_timeout_ms=options.busy_timeout_ms)
+                if options.auto_vacuum_after_scan:
+                    backup = light_backup(
+                        shard_path,
+                        f"auto_{safe}",
+                        working_dir=WORKING_DIR_PATH,
+                        busy_timeout_ms=options.busy_timeout_ms,
+                    )
+                    log(f"[Maintenance] Auto vacuum backup stored at {backup}")
+                    vacuum_result = vacuum_if_needed(
+                        shard_path,
+                        thresholds={"vacuum_free_bytes_min": options.vacuum_free_bytes_min},
+                        busy_timeout_ms=options.busy_timeout_ms,
+                        force=False,
+                        active_check=lambda: self.scan_in_progress,
+                    )
+                    if vacuum_result.get("skipped"):
+                        reason = vacuum_result.get("reason") or "threshold"
+                        log(f"[Maintenance] Auto vacuum skipped for {label}: {reason}")
+                    else:
+                        reclaimed = int(vacuum_result.get("reclaimed_bytes") or 0)
+                        log(
+                            f"[Maintenance] Auto vacuum reclaimed {format_bytes(reclaimed)} for {label}"
+                        )
+                update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+            except Exception as exc:
+                log(f"[Maintenance] Auto optimize failed for {label}: {exc}")
+            finally:
+                if self._maintenance_window and self._maintenance_window.winfo_exists():
+                    try:
+                        self.root.after(0, self._maintenance_window.refresh_targets)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _update_performance_display(self, payload: dict):
         if not hasattr(self, "performance_var"):
@@ -1910,10 +2597,37 @@ class App:
         self.refresh_all()
 
     def db_vacuum(self):
-        con = sqlite3.connect(self.db_path.get()); cur = con.cursor()
-        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);"); con.commit()
-        cur.execute("VACUUM;"); con.commit(); con.close()
-        messagebox.showinfo("VACUUM", "Done.")
+        if self.scan_in_progress:
+            messagebox.showwarning("VACUUM", "Cannot run VACUUM while a scan is active.")
+            return
+        options = resolve_options(load_settings(WORKING_DIR_PATH))
+        db_path = Path(self.db_path.get())
+        try:
+            backup = light_backup(
+                db_path,
+                "catalog_manual",
+                working_dir=WORKING_DIR_PATH,
+                busy_timeout_ms=options.busy_timeout_ms,
+            )
+            result = vacuum_if_needed(
+                db_path,
+                thresholds={"vacuum_free_bytes_min": options.vacuum_free_bytes_min},
+                busy_timeout_ms=options.busy_timeout_ms,
+                force=True,
+                active_check=lambda: self.scan_in_progress,
+            )
+            update_maintenance_metadata(last_run=datetime.utcnow(), working_dir=WORKING_DIR_PATH)
+        except Exception as exc:
+            messagebox.showerror("VACUUM", f"VACUUM failed:\n{exc}")
+            return
+        reclaimed = int(result.get("reclaimed_bytes") or 0)
+        messagebox.showinfo(
+            "VACUUM",
+            f"Backup stored at:\n{backup}\n\nReclaimed: {format_bytes(reclaimed)}",
+        )
+        self._set_status("Catalog VACUUM completed.", "success")
+        if self._maintenance_window and self._maintenance_window.winfo_exists():
+            self._maintenance_window.refresh_targets()
 
     # ----- Buttons
     def choose_path(self):
@@ -2264,6 +2978,7 @@ class App:
         self.av_progress["value"] = 0
         self.av_progress["maximum"] = 1
         self._update_progress_styles(0, 0)
+        self._last_scan_label = self.label_var.get().strip()
         self.scan_in_progress = True
         self.scan_start_ts = time.time()
         self.last_progress_ts = self.scan_start_ts
@@ -2287,6 +3002,7 @@ class App:
         self._update_status_line(force=True)
         self.worker.start()
         self.root.after(800, self.refresh_jobs)
+        self._notify_maintenance_scan_state()
 
     def stop_scan(self):
         if self.stop_evt:
@@ -2410,6 +3126,7 @@ class App:
         elif etype == "tool_missing":
             tool = str(event.get("tool", "")).strip() or "tool"
             self.scan_in_progress = False
+            self._notify_maintenance_scan_state()
             self._stop_activity_indicator()
             message = f"Error — {tool} not found. Please install {tool} and try again."
             self.show_banner(message, "ERROR")
@@ -2469,6 +3186,7 @@ class App:
             self._await_worker_completion()
             status = event.get("status", "Ready")
             self.scan_in_progress = False
+            self._notify_maintenance_scan_state()
             self._stop_activity_indicator()
             self.heartbeat_active = False
             self.last_progress_ts = None
@@ -2494,6 +3212,7 @@ class App:
                 if self._recent_export_paths:
                     action = ("Open exports folder", self.open_exports_folder)
                 self.show_banner(summary_text, "SUCCESS", action=action)
+                self._trigger_auto_maintenance(self._last_scan_label or self.label_var.get().strip())
             elif status == "Stopped":
                 self._set_status("Scan stopped.", "warning")
                 self.status_line_idle_text = "Scan canceled."
