@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Callable, Dict, List, Literal, Optional
 
 from paths import (
     ensure_working_dir_structure,
@@ -22,6 +22,7 @@ from paths import (
     resolve_working_dir,
     update_settings,
 )
+from exports import ExportFilters, export_shard
 from tools import (
     bootstrap_local_bin,
     get_winget_candidates,
@@ -624,6 +625,67 @@ class ScannerWorker(threading.Thread):
                 "duration": duration,
             })
 
+
+class CatalogExportWorker(threading.Thread):
+    def __init__(
+        self,
+        drive_label: str,
+        shard_path: Path,
+        fmt: str,
+        include_deleted: bool,
+        av_only: bool,
+        event_queue: "queue.Queue[dict]",
+    ):
+        super().__init__(daemon=True)
+        self.drive_label = drive_label
+        self.shard_path = Path(shard_path)
+        self.format = fmt.lower()
+        self.filters = ExportFilters(include_deleted=include_deleted, av_only=av_only, since_utc=None)
+        self.queue = event_queue
+        self.token = f"export-{id(self)}"
+
+    def _put(self, payload: dict):
+        data = {
+            "type": payload.get("type"),
+            "format": self.format,
+            "drive_label": self.drive_label,
+            "token": self.token,
+        }
+        data.update(payload)
+        try:
+            self.queue.put_nowait(data)
+        except queue.Full:
+            pass
+
+    def _on_progress(self, rows: int):
+        self._put({"type": "export_progress", "rows": rows})
+
+    def run(self):
+        filters_desc = (
+            f"include_deleted={str(self.filters.include_deleted).lower()}, "
+            f"av_only={str(self.filters.av_only).lower()}, "
+            f"since={self.filters.since_utc or '—'}"
+        )
+        log(f"[Export] {self.drive_label} → {self.format.upper()} starting ({filters_desc})")
+        try:
+            result = export_shard(
+                self.shard_path,
+                WORKING_DIR_PATH,
+                self.drive_label,
+                self.filters,
+                fmt=self.format,
+                progress_callback=self._on_progress,
+            )
+        except Exception as exc:
+            log(f"[Export] {self.drive_label} → {self.format.upper()} failed: {exc}")
+            self._put({"type": "export_error", "message": str(exc)})
+            return
+        log(
+            f"[Export] {self.drive_label} → {self.format.upper()} finished: {result.rows} rows -> {result.path}"
+        )
+        self._put({"type": "export_done", "path": str(result.path), "count": result.rows})
+
+
 # ---------------- GUI ----------------
 class App:
     def __init__(self, root: Tk):
@@ -685,6 +747,10 @@ class App:
         self.worker: Optional[ScannerWorker] = None
         self.worker_queue: "queue.Queue[dict]" = queue.Queue()
         self._closing = False
+        self._export_workers: dict[str, "CatalogExportWorker"] = {}
+        self._recent_export_paths: list[Path] = []
+        self._active_toasts: list[Toplevel] = []
+        self._banner_action_callback = None
 
         self._build_menu()
         self._build_form()
@@ -990,6 +1056,13 @@ class App:
         mtools.add_command(label="Diagnostics…", command=self.open_diagnostics_dialog)
         menubar.add_cascade(label="Tools", menu=mtools)
 
+        mexports = Menu(menubar, tearoff=0)
+        mexports.add_command(label="Export CSV…", command=lambda: self.request_export('csv'))
+        mexports.add_command(label="Export JSONL…", command=lambda: self.request_export('jsonl'))
+        mexports.add_separator()
+        mexports.add_command(label="Open exports folder", command=self.open_exports_folder)
+        menubar.add_cascade(label="Exports", menu=mexports)
+
     def _build_form(self):
         self.root.grid_rowconfigure(0, weight=0)
         self.root.grid_rowconfigure(1, weight=1)
@@ -1003,13 +1076,17 @@ class App:
         self.banner_frame = ttk.Frame(self.banner_container, style="BannerINFO.TFrame")
         self.banner_frame.grid(row=0, column=0, sticky="ew")
         self.banner_frame.columnconfigure(0, weight=1)
+        self.banner_frame.columnconfigure(1, weight=0)
         self.banner_label = ttk.Label(
             self.banner_frame,
             textvariable=self.banner_message,
-            anchor="center",
+            anchor="w",
             style="BannerINFO.TLabel",
         )
         self.banner_label.grid(row=0, column=0, sticky="ew", padx=4, pady=2)
+        self.banner_action = ttk.Button(self.banner_frame, text="", style="Accent.TButton", command=lambda: None)
+        self.banner_action.grid(row=0, column=1, sticky="e", padx=(8, 12))
+        self.banner_action.grid_remove()
         self.banner_frame.grid_remove()
 
         self.content = ttk.Frame(self.root, padding=(20, 18), style="Content.TFrame")
@@ -1069,12 +1146,22 @@ class App:
 
         actions = ttk.Frame(scan_frame, style="Card.TFrame")
         actions.grid(row=6, column=0, columnspan=4, sticky="ew")
-        for c in range(4):
+        for c in range(5):
             actions.columnconfigure(c, weight=1)
         ttk.Button(actions, text="Scan", command=self.start_scan, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
         ttk.Button(actions, text="Rescan (delete shard)", command=self.rescan).grid(row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Button(actions, text="Stop", command=self.stop_scan, style="Danger.TButton").grid(row=0, column=2, sticky="ew", padx=(8, 0))
         ttk.Button(actions, text="Export catalog", command=self.export_db).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+        exports_menu_btn = ttk.Menubutton(actions, text="Exports")
+        exports_menu = Menu(exports_menu_btn, tearoff=0)
+        exports_menu.add_command(label="Export CSV…", command=lambda: self.request_export('csv'))
+        exports_menu.add_command(label="Export JSONL…", command=lambda: self.request_export('jsonl'))
+        exports_menu.add_separator()
+        exports_menu.add_command(label="Open exports folder", command=self.open_exports_folder)
+        exports_menu_btn["menu"] = exports_menu
+        exports_menu_btn.grid(row=0, column=4, sticky="ew", padx=(8, 0))
+        self.exports_menu = exports_menu
+        self.exports_button = exports_menu_btn
 
         status_activity = ttk.Frame(scan_frame, style="Card.TFrame")
         status_activity.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(12, 0))
@@ -1207,6 +1294,7 @@ class App:
         self._set_status("Ready.")
         self._update_progress_styles(0, 0)
 
+
     def _set_status(self, message: str, level: str = "info"):
         if not hasattr(self, "status_var"):
             self.status_var = StringVar()
@@ -1215,7 +1303,58 @@ class App:
         if hasattr(self, "status_label"):
             self.status_label.configure(style=style)
 
-    def show_banner(self, message: str, level: str = "INFO"):
+    def _show_toast(self, message: str, level: str = "success", duration: int = 4000):
+        toast = Toplevel(self.root)
+        toast.withdraw()
+        toast.overrideredirect(True)
+        toast.transient(self.root)
+        toast.attributes("-topmost", True)
+        frame = ttk.Frame(toast, padding=(14, 10), style="Card.TFrame")
+        frame.grid(row=0, column=0, sticky="nsew")
+        toast.columnconfigure(0, weight=1)
+        toast.rowconfigure(0, weight=1)
+        color_map = {
+            "success": self.colors.get("success"),
+            "info": self.colors.get("info"),
+            "error": self.colors.get("danger"),
+        }
+        fg = color_map.get(level, self.colors.get("accent"))
+        label = ttk.Label(frame, text=message, style="TLabel")
+        if fg:
+            label.configure(foreground=fg)
+        label.grid(row=0, column=0, sticky="w")
+        toast.update_idletasks()
+        width = toast.winfo_width() or frame.winfo_reqwidth()
+        height = toast.winfo_height() or frame.winfo_reqheight()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        x = root_x + root_w - width - 40
+        y = root_y + root_h - height - 60
+        toast.geometry(f"{width}x{height}+{max(x, root_x + 20)}+{max(y, root_y + 20)}")
+        toast.deiconify()
+        self._active_toasts.append(toast)
+
+        def _close(event=None):
+            try:
+                self._active_toasts.remove(toast)
+            except ValueError:
+                pass
+            try:
+                toast.destroy()
+            except Exception:
+                pass
+
+        toast.after(duration, _close)
+        toast.bind("<Button-1>", _close)
+
+    def show_banner(
+        self,
+        message: str,
+        level: str = "INFO",
+        action: Optional[tuple[str, Callable[[], None]]] = None,
+    ):
         self._tool_banner_active = False
         level_key = (level or "INFO").upper()
         styles = self.banner_styles.get(level_key, self.banner_styles["INFO"])
@@ -1225,6 +1364,14 @@ class App:
         self.banner_message.set(message)
         self.banner_frame.configure(style=styles["frame"])
         self.banner_label.configure(style=styles["label"])
+        if action:
+            text, callback = action
+            self.banner_action.configure(text=text, command=callback)
+            self.banner_action.grid()
+            self._banner_action_callback = callback
+        else:
+            self.banner_action.grid_remove()
+            self._banner_action_callback = None
         if not self._banner_visible:
             self.banner_frame.grid()
             self._banner_visible = True
@@ -1239,6 +1386,8 @@ class App:
             self.banner_frame.grid_remove()
             self._banner_visible = False
         self.banner_message.set("")
+        self.banner_action.grid_remove()
+        self._banner_action_callback = None
         self._tool_banner_active = False
 
     def _start_activity_indicator(self):
@@ -1448,11 +1597,187 @@ class App:
         d = filedialog.askdirectory()
         if d: self.path_var.set(d)
 
+
     def export_db(self):
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         dst = Path(EXPORTS_DIR) / f"catalog_{ts}.db"
         shutil.copy2(self.db_path.get(), dst)
-        messagebox.showinfo("Export", f"Exported to:\n{dst}")
+        messagebox.showinfo("Export", f"Exported to\n{dst}")
+
+    def open_exports_folder(self):
+        exports_dir = EXPORTS_DIR_PATH
+        try:
+            exports_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror("Exports", f"Could not prepare exports folder\n{exc}")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(exports_dir))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(exports_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(exports_dir)])
+        except Exception as exc:
+            messagebox.showerror("Exports", f"Unable to open exports folder\n{exc}")
+
+    def _resolve_export_drive(self) -> Optional[str]:
+        drive_label: Optional[str] = None
+        if hasattr(self, "tree"):
+            selection = self.tree.selection()
+            if selection:
+                values = self.tree.item(selection[0]).get("values", [])
+                if isinstance(values, (list, tuple)) and len(values) > 1:
+                    drive_value = values[1]
+                    if drive_value:
+                        drive_label = str(drive_value)
+        if not drive_label:
+            candidate = self.label_var.get().strip() if hasattr(self, "label_var") else ""
+            if candidate:
+                drive_label = candidate
+        return drive_label
+
+    def request_export(self, fmt: str):
+        fmt_normalized = (fmt or "").strip().lower()
+        if fmt_normalized not in {"csv", "jsonl"}:
+            messagebox.showerror("Exports", "Unsupported export format.")
+            return
+        drive_label = self._resolve_export_drive()
+        if not drive_label:
+            messagebox.showinfo("Exports", "Select a drive row first.")
+            return
+        shard_path = shard_path_for(drive_label)
+        if not shard_path.exists():
+            messagebox.showwarning(
+                "Exports",
+                f"No shard database found for '{drive_label}'. Run a scan before exporting.",
+            )
+            return
+
+        dialog = Toplevel(self.root)
+        dialog.title(f"Export {drive_label} → {fmt_normalized.upper()}")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(padx=18, pady=16)
+        dialog.grab_set()
+
+        include_var = IntVar(value=0)
+        av_only_var = IntVar(value=0)
+
+        ttk.Label(
+            dialog,
+            text=f"Drive: {drive_label}\nFormat: {fmt_normalized.upper()}",
+            style="HeaderSubtitle.TLabel",
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Checkbutton(
+            dialog,
+            text="Include deleted",
+            variable=include_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        ttk.Checkbutton(
+            dialog,
+            text="AV only",
+            variable=av_only_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        ttk.Label(
+            dialog,
+            text=f"Exports are saved under:\n{EXPORTS_DIR_PATH}",
+            style="Subtle.TLabel",
+            justify="left",
+            wraplength=360,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        buttons = ttk.Frame(dialog, style="Card.TFrame")
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+
+        def _close(start: bool = False):
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+            if start:
+                self._start_export(
+                    drive_label,
+                    shard_path,
+                    fmt_normalized,
+                    include_deleted=bool(include_var.get()),
+                    av_only=bool(av_only_var.get()),
+                )
+
+        ttk.Button(buttons, text="Cancel", command=lambda: _close(False)).grid(
+            row=0, column=0, sticky="ew", padx=(0, 8)
+        )
+        ttk.Button(
+            buttons,
+            text="Start export",
+            style="Accent.TButton",
+            command=lambda: _close(True),
+        ).grid(row=0, column=1, sticky="ew")
+
+        def _on_close():
+            _close(False)
+
+        dialog.protocol("WM_DELETE_WINDOW", _on_close)
+        dialog.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        xpos = root_x + (root_w - width) // 2
+        ypos = root_y + (root_h - height) // 3
+        dialog.geometry(f"{width}x{height}+{max(xpos, root_x + 20)}+{max(ypos, root_y + 40)}")
+        dialog.wait_window()
+
+    def _start_export(
+        self,
+        drive_label: str,
+        shard_path: Path,
+        fmt: str,
+        include_deleted: bool,
+        av_only: bool,
+    ):
+        fmt_lower = fmt.lower()
+        fmt_upper = fmt_lower.upper()
+        if not shard_path.exists():
+            messagebox.showwarning(
+                "Exports",
+                f"Shard database missing for '{drive_label}'.",
+            )
+            return
+        for worker in list(self._export_workers.values()):
+            if worker.is_alive() and worker.drive_label == drive_label and worker.format == fmt_lower:
+                messagebox.showinfo(
+                    "Exports",
+                    f"An {fmt_upper} export is already running for '{drive_label}'.",
+                )
+                return
+        export_worker = CatalogExportWorker(
+            drive_label=drive_label,
+            shard_path=shard_path,
+            fmt=fmt_lower,
+            include_deleted=include_deleted,
+            av_only=av_only,
+            event_queue=self.worker_queue,
+        )
+        self._export_workers[export_worker.token] = export_worker
+        export_worker.start()
+        status_text = f"Exporting {drive_label} → {fmt_upper}…"
+        self._set_status(status_text, "accent")
+        if hasattr(self, "status_line_var"):
+            self.status_line_label.configure(style=self.status_line_active_style)
+            self.status_line_var.set(status_text)
+            self.status_line_idle_text = status_text
+            self._update_status_line(force=True)
+        self._show_toast(f"{fmt_upper} export started for {drive_label}", "info", duration=3500)
 
     def del_drive(self):
         sel = self.tree.selection()
@@ -1583,6 +1908,7 @@ class App:
             messagebox.showwarning("Busy", "A scan is already running."); return
         self.stop_evt = threading.Event()
         self._clear_worker_queue()
+        self._recent_export_paths = []
         try:
             threads = int(self.threads_var.get())
         except (TypeError, ValueError):
@@ -1747,6 +2073,46 @@ class App:
             messagebox.showerror(event.get("title", "Error"), event.get("message", ""))
         elif etype == "log":
             self._append_log(event.get("line", ""))
+        elif etype == "export_progress":
+            fmt = str(event.get("format", "")).upper()
+            rows = int(event.get("rows", 0) or 0)
+            drive_label = event.get("drive_label") or ""
+            self._set_status(f"Exporting {drive_label} → {fmt} ({rows:,} rows)", "accent")
+            self.status_line_var.set(f"Exporting {drive_label} → {fmt} ({rows:,} rows)")
+            self._update_status_line(force=True)
+        elif etype == "export_done":
+            fmt = str(event.get("format", "")).upper()
+            drive_label = event.get("drive_label") or ""
+            token = event.get("token")
+            if token:
+                self._export_workers.pop(token, None)
+            path_value = event.get("path")
+            export_path = Path(path_value) if path_value else None
+            if export_path:
+                self._recent_export_paths.append(export_path)
+                if len(self._recent_export_paths) > 5:
+                    self._recent_export_paths = self._recent_export_paths[-5:]
+            count = int(event.get("count", 0) or 0)
+            status_text = f"{fmt} export finished ({count:,} rows)"
+            self._set_status(status_text, "success")
+            self.status_line_var.set(status_text)
+            if not self.scan_in_progress:
+                self.status_line_idle_text = status_text
+            self._update_status_line(force=True)
+            message = f"{fmt} export saved:\n{export_path}" if export_path else f"{fmt} export finished"
+            self._show_toast(message, "success")
+        elif etype == "export_error":
+            fmt = str(event.get("format", "")).upper()
+            message = event.get("message") or "Export failed."
+            token = event.get("token")
+            if token:
+                self._export_workers.pop(token, None)
+            self._set_status(f"{fmt} export failed", "error")
+            self.show_banner(f"{fmt} export failed — {message}", "ERROR")
+            if not self.scan_in_progress:
+                self.status_line_idle_text = f"{fmt} export failed."
+            self.status_line_var.set(f"{fmt} export failed")
+            self._update_status_line(force=True)
         elif etype == "done":
             self._await_worker_completion()
             status = event.get("status", "Ready")
@@ -1772,7 +2138,10 @@ class App:
                     f"{(total_all or 0):,} — AV files: {(total_av or 0):,} — duration: {self._format_elapsed(duration)}"
                 )
                 self.status_line_idle_text = summary_text
-                self.show_banner("Scan completed successfully", "SUCCESS")
+                action = None
+                if self._recent_export_paths:
+                    action = ("Open exports folder", self.open_exports_folder)
+                self.show_banner(summary_text, "SUCCESS", action=action)
             elif status == "Stopped":
                 self._set_status("Scan stopped.", "warning")
                 self.status_line_idle_text = "Scan canceled."
@@ -1837,6 +2206,12 @@ class App:
         if self._closing:
             return
         self._closing = True
+        for toast in list(self._active_toasts):
+            try:
+                toast.destroy()
+            except Exception:
+                pass
+        self._active_toasts.clear()
         unregister_log_listener(self._log_enqueue)
         if self.worker and self.worker.is_alive():
             if self.stop_evt:
