@@ -6,6 +6,15 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
 `DiskScannerGUI.py` provides a Tk-based interface for launching scans and reviewing job history.
 
+## Rescan modes
+
+The scanner now supports two rescan strategies when revisiting a drive:
+
+- **Delta rescan (default).** Enumerates the drive, detects new, modified, and missing files, and only re-processes the items that changed. Files removed from the disk are soft-marked with a deleted flag so they can still be referenced in exports when requested.
+- **Full rescan.** Forces every file to be hashed and re-processed regardless of whether the metadata changed. Use this when you need to rebuild a shard from scratch or verify every asset end-to-end. Full rescans can take significantly longer than the delta mode.
+
+Both the CLI (`scan_drive.py`) and the GUI offer a toggle between these modes. A *Resume interrupted scan* option is also enabled by default; it writes lightweight checkpoints every few seconds so a cancelled scan can restart from the last completed file instead of redoing the entire drive.
+
 ### Recent updates
 
 - Optional multi-threaded metadata extraction to speed up large scans while keeping full detail.

@@ -1,10 +1,19 @@
 import argparse
-import logging
-import os, sys, sqlite3, json, time, shutil, subprocess, importlib
-import importlib.util
-from pathlib import Path
-from typing import Dict, Optional
 import hashlib
+import importlib
+import importlib.util
+import json
+import logging
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from paths import (
     ensure_working_dir_structure,
@@ -59,6 +68,67 @@ AUDIO_EXTS = {'.mp3','.flac','.aac','.m4a','.wav','.wma','.ogg','.opus','.alac',
 AV_EXTS = VIDEO_EXTS | AUDIO_EXTS
 
 
+@dataclass(slots=True)
+class FileInfo:
+    path: str
+    size_bytes: int
+    mtime_utc: str
+    is_av: bool
+
+
+class ScanStateStore:
+    def __init__(self, conn: sqlite3.Connection, drive_label: str, interval_seconds: int = 5):
+        self.conn = conn
+        self.drive_label = drive_label
+        self.interval_seconds = max(1, int(interval_seconds))
+        self._last_checkpoint = 0.0
+
+    def _key(self, name: str) -> str:
+        return f"{self.drive_label}::{name}"
+
+    def load(self) -> Dict[str, str]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT key, value FROM scan_state WHERE key LIKE ?",
+            (f"{self.drive_label}::%",),
+        )
+        rows = cur.fetchall()
+        state: Dict[str, str] = {}
+        for key, value in rows:
+            suffix = key.split("::", 1)[1] if "::" in key else key
+            state[suffix] = value
+        return state
+
+    def clear(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM scan_state WHERE key LIKE ?",
+            (f"{self.drive_label}::%",),
+        )
+        self.conn.commit()
+        self._last_checkpoint = 0.0
+
+    def checkpoint(self, phase: str, last_path: Optional[str], *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_checkpoint) < self.interval_seconds:
+            return
+        timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        cur = self.conn.cursor()
+        rows = [
+            (self._key("phase"), phase),
+            (self._key("timestamp"), timestamp),
+        ]
+        if last_path is not None:
+            rows.append((self._key("last_path_processed"), last_path))
+        cur.executemany(
+            "INSERT INTO scan_state(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rows,
+        )
+        self.conn.commit()
+        self._last_checkpoint = now
+
+
 def run(cmd:list[str]) -> tuple[int,str,str]:
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
@@ -103,6 +173,162 @@ def hash_blake3(file_path: str, chunk: int = 1024*1024) -> str:
             h.update(b)
     return h.hexdigest()
 
+
+def _iso_from_timestamp(ts: float) -> str:
+    return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_av(path: str) -> bool:
+    return Path(path).suffix.lower() in AV_EXTS
+
+
+def _enumerate_files(
+    base_path: Path,
+    *,
+    debug_slow: bool = False,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+) -> List[FileInfo]:
+    stack: List[Path] = [base_path]
+    results: List[FileInfo] = []
+    last_emit = time.monotonic()
+
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                    except (FileNotFoundError, PermissionError, OSError):
+                        continue
+                    info = FileInfo(
+                        path=entry.path,
+                        size_bytes=int(stat.st_size),
+                        mtime_utc=_iso_from_timestamp(stat.st_mtime),
+                        is_av=_is_av(entry.path),
+                    )
+                    results.append(info)
+                    if debug_slow:
+                        time.sleep(0.01)
+                    if progress_callback and (time.monotonic() - last_emit) >= 5:
+                        progress_callback("enumerating", len(results), 0)
+                        last_emit = time.monotonic()
+        except PermissionError:
+            LOGGER.warning("Permission denied while enumerating %s", current)
+        except FileNotFoundError:
+            continue
+    if progress_callback:
+        progress_callback("enumerating", len(results), 0)
+    results.sort(key=lambda item: item.path)
+    return results
+
+
+def _load_existing(conn: sqlite3.Connection, drive_label: str) -> Dict[str, dict]:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, path, size_bytes, mtime_utc, deleted FROM files WHERE drive_label=?",
+        (drive_label,),
+    )
+    existing: Dict[str, dict] = {}
+    for row in cur.fetchall():
+        file_id, path, size_bytes, mtime_utc, deleted = row
+        existing[path] = {
+            "id": file_id,
+            "size_bytes": size_bytes,
+            "mtime_utc": mtime_utc,
+            "deleted": int(deleted or 0),
+        }
+    return existing
+
+
+def _mark_deleted(
+    conn: sqlite3.Connection,
+    drive_label: str,
+    *,
+    deleted_paths: Iterable[str],
+) -> Tuple[int, List[str]]:
+    cur = conn.cursor()
+    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    deleted_paths = list(deleted_paths)
+    if not deleted_paths:
+        return 0, []
+    cur.executemany(
+        "UPDATE files SET deleted=1, deleted_ts=? WHERE drive_label=? AND path=? AND deleted=0",
+        [(timestamp, drive_label, path) for path in deleted_paths],
+    )
+    conn.commit()
+    return cur.rowcount, deleted_paths[:5]
+
+
+def _restore_active(conn: sqlite3.Connection, drive_label: str, paths: Iterable[str]) -> None:
+    batch = [(drive_label, path) for path in paths]
+    if not batch:
+        return
+    cur = conn.cursor()
+    cur.executemany(
+        "UPDATE files SET deleted=0, deleted_ts=NULL WHERE drive_label=? AND path=?",
+        batch,
+    )
+    conn.commit()
+
+
+def _upsert_file(
+    conn: sqlite3.Connection,
+    drive_label: str,
+    info: FileInfo,
+    *,
+    hash_value: Optional[str],
+    media_blob: Optional[str],
+    integrity_ok: Optional[int],
+) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM files WHERE drive_label=? AND path=?",
+        (drive_label, info.path),
+    )
+    row = cur.fetchone()
+    if row:
+        cur.execute(
+            """
+            UPDATE files
+            SET size_bytes=?, hash_blake3=?, media_json=?, integrity_ok=?, mtime_utc=?, deleted=0, deleted_ts=NULL
+            WHERE id=?
+            """,
+            (
+                int(info.size_bytes),
+                hash_value,
+                media_blob,
+                integrity_ok,
+                info.mtime_utc,
+                int(row[0]),
+            ),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO files(
+                drive_label, path, size_bytes, hash_blake3, media_json, integrity_ok, mtime_utc, deleted, deleted_ts
+            )
+            VALUES(?,?,?,?,?,?,?,?,NULL)
+            """,
+            (
+                drive_label,
+                info.path,
+                int(info.size_bytes),
+                hash_value,
+                media_blob,
+                integrity_ok,
+                info.mtime_utc,
+                0,
+            ),
+        )
+    conn.commit()
+
 def init_db(db_path: str):
     db_path_obj = Path(db_path)
     db_path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -127,11 +353,29 @@ def init_db(db_path: str):
         hash_blake3 TEXT,
         media_json TEXT,
         integrity_ok INTEGER,
-        mtime_utc TEXT
+        mtime_utc TEXT,
+        deleted INTEGER DEFAULT 0,
+        deleted_ts TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive_label);
     CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_blake3);
+    CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+    CREATE TABLE IF NOT EXISTS scan_state(
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_drives_label_unique ON drives(label);
     """)
+    conn.commit()
+    # Migrations for legacy shards
+    c.execute("PRAGMA table_info(files)")
+    existing_cols = {row[1] for row in c.fetchall()}
+    for name, ddl in (
+        ("deleted", "ALTER TABLE files ADD COLUMN deleted INTEGER DEFAULT 0"),
+        ("deleted_ts", "ALTER TABLE files ADD COLUMN deleted_ts TEXT"),
+    ):
+        if name not in existing_cols:
+            c.execute(ddl)
     conn.commit()
     return conn
 
@@ -149,11 +393,27 @@ def try_smart_overview(executable: Optional[str]) -> Optional[str]:
             acc["details"].append(json.loads(out))
     return json.dumps(acc, ensure_ascii=False)
 
-def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = False):
+def scan_drive(
+    label: str,
+    mount_path: str,
+    db_path: str,
+    *,
+    full_rescan: bool = False,
+    resume: bool = True,
+    checkpoint_seconds: int = 5,
+    debug_slow: bool = False,
+) -> dict:
     mount = Path(mount_path)
     if not mount.exists():
         print(f"[ERROR] Mount path not found: {mount_path}")
         sys.exit(2)
+
+    LOGGER.info(
+        "Delta rescan = %s, resume = %s, checkpoint = %ss",
+        "false" if full_rescan else "true",
+        "true" if resume else "false",
+        int(checkpoint_seconds),
+    )
 
     start_time = time.perf_counter()
 
@@ -169,53 +429,155 @@ def scan_drive(label: str, mount_path: str, db_path: str, debug_slow: bool = Fal
         sys.exit(3)
 
     if not statuses.get("smartctl", {}).get("present"):
-        print("[WARN] smartctl not found. SMART data will be skipped.", file=sys.stderr)
+        LOGGER.warning("smartctl not found. SMART data will be skipped.")
 
     total, used, free = shutil.disk_usage(mount)
     conn = init_db(db_path)
-    c = conn.cursor()
-
-    smart_blob = try_smart_overview(TOOL_PATHS.get("smartctl"))
-
-    c.execute("""INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
-                 VALUES(?,?,?,?,?,datetime('now'))""",
-              (label, str(mount.resolve()), int(total), int(free), smart_blob, ))
+    conn.execute(
+        """
+        INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
+        VALUES(?,?,?,?,?,datetime('now'))
+        ON CONFLICT(label) DO UPDATE SET
+            mount_path=excluded.mount_path,
+            total_bytes=excluded.total_bytes,
+            free_bytes=excluded.free_bytes,
+            smart_scan=excluded.smart_scan,
+            scanned_at=excluded.scanned_at
+        """,
+        (
+            label,
+            str(mount.resolve()),
+            int(total),
+            int(free),
+            try_smart_overview(TOOL_PATHS.get("smartctl")),
+        ),
+    )
     conn.commit()
 
-    file_paths: list[str] = []
-    av_files = 0
-    for root, dirs, files in os.walk(mount):
-        for fname in files:
-            full_path = os.path.join(root, fname)
-            file_paths.append(full_path)
-            ext = os.path.splitext(fname)[1].lower()
-            if ext in AV_EXTS:
-                av_files += 1
-            if debug_slow:
-                time.sleep(0.01)
+    state_store = ScanStateStore(conn, label, interval_seconds=int(checkpoint_seconds))
+    if not resume:
+        state_store.clear()
+        resume_state: Dict[str, str] = {}
+    else:
+        resume_state = state_store.load()
 
-    for fp in tqdm(file_paths, desc=f"Scanning {label}"):
+    def _progress_event(phase: str, count: int, _unused: int) -> None:
+        LOGGER.debug("%s — files enumerated: %s", phase, count)
+        if resume:
+            state_store.checkpoint(phase, None)
+
+    file_infos = _enumerate_files(mount, debug_slow=debug_slow, progress_callback=_progress_event)
+    existing_rows = _load_existing(conn, label)
+
+    enumerated_paths = {info.path for info in file_infos}
+    stale_paths = [path for path in existing_rows.keys() if path not in enumerated_paths]
+    deleted_count, deleted_examples = _mark_deleted(conn, label, deleted_paths=stale_paths)
+    if deleted_count:
+        LOGGER.info(
+            "Marked %s files as deleted (examples: %s)",
+            deleted_count,
+            ", ".join(deleted_examples) if deleted_examples else "—",
+        )
+
+    pending: List[FileInfo] = []
+    unchanged: List[FileInfo] = []
+    for info in file_infos:
+        prev = existing_rows.get(info.path)
+        if full_rescan:
+            pending.append(info)
+        elif prev is None or prev.get("deleted"):
+            pending.append(info)
+        else:
+            prev_size = prev.get("size_bytes")
+            prev_mtime = prev.get("mtime_utc")
+            if prev_size != info.size_bytes or prev_mtime != info.mtime_utc:
+                pending.append(info)
+            else:
+                unchanged.append(info)
+
+    _restore_active(conn, label, [info.path for info in unchanged])
+
+    resume_index = -1
+    if resume and resume_state:
+        last_path = resume_state.get("last_path_processed")
+        if last_path:
+            for idx, info in enumerate(pending):
+                if info.path == last_path:
+                    resume_index = idx
+                    break
+
+    work_list = pending if resume_index < 0 else pending[resume_index + 1 :]
+    processed_files = 0 if resume_index < 0 else resume_index + 1
+    processed_av = sum(1 for info in pending[: processed_files] if info.is_av)
+
+    LOGGER.info(
+        "Enumerated %s files (%s AV). Pending work: %s (unchanged: %s).",
+        len(file_infos),
+        sum(1 for info in file_infos if info.is_av),
+        len(work_list),
+        len(unchanged),
+    )
+
+    if resume and work_list:
+        last_path = pending[processed_files - 1].path if processed_files > 0 else None
+        state_store.checkpoint("hashing", last_path, force=True)
+
+    for info in work_list:
+        hash_value = None
+        media_blob = None
+        integrity_ok: Optional[int] = 1
         try:
-            size = os.path.getsize(fp)
-            hb3 = hash_blake3(fp)
-            mi = mediainfo_json(fp, TOOL_PATHS.get("mediainfo"))
-            ok = ffmpeg_verify(fp, TOOL_PATHS.get("ffmpeg"))
-            mtime = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(fp)))
-            c.execute("""INSERT INTO files(drive_label, path, size_bytes, hash_blake3, media_json, integrity_ok, mtime_utc)
-                         VALUES(?,?,?,?,?,?,?)""",
-                      (label, fp, int(size), hb3, json.dumps(mi, ensure_ascii=False) if mi else None, int(ok), mtime))
-        except Exception as e:
-            c.execute("""INSERT INTO files(drive_label, path, size_bytes, hash_blake3, media_json, integrity_ok, mtime_utc)
-                         VALUES(?,?,?,?,?,?,?)""",
-                      (label, fp, None, None, json.dumps({"error": str(e)}, ensure_ascii=False), 0, None))
-    conn.commit()
-    conn.close()
+            hash_value = hash_blake3(info.path)
+            metadata = mediainfo_json(info.path, TOOL_PATHS.get("mediainfo")) if info.is_av else None
+            if metadata is not None:
+                media_blob = json.dumps(metadata, ensure_ascii=False)
+                integrity_ok = 0 if metadata.get("error") else 1
+            else:
+                media_blob = None
+                integrity_ok = None if info.is_av else 1
+            if info.is_av:
+                ok = ffmpeg_verify(info.path, TOOL_PATHS.get("ffmpeg"))
+                if ok is False:
+                    integrity_ok = 0
+        except Exception as exc:
+            LOGGER.exception("Failed to process %s", info.path)
+            media_blob = json.dumps({"error": str(exc)}, ensure_ascii=False)
+            integrity_ok = 0
+        _upsert_file(
+            conn,
+            label,
+            info,
+            hash_value=hash_value,
+            media_blob=media_blob,
+            integrity_ok=integrity_ok,
+        )
+        processed_files += 1
+        if info.is_av:
+            processed_av += 1
+        if resume:
+            state_store.checkpoint("hashing", info.path)
+
+    if resume:
+        if work_list:
+            state_store.checkpoint("hashing", work_list[-1].path, force=True)
+        state_store.checkpoint("finalizing", None, force=True)
+        state_store.clear()
 
     duration = time.perf_counter() - start_time
-    LOGGER.info("Scan complete for %s. DB: %s", label, db_path)
+    LOGGER.info(
+        "Scan complete for %s. Processed %s files (%s AV) in %.2fs.",
+        label,
+        processed_files,
+        processed_av,
+        duration,
+    )
+    conn.close()
     return {
-        "total_files": len(file_paths),
-        "av_files": av_files,
+        "total_files": len(file_infos),
+        "av_files": sum(1 for info in file_infos if info.is_av),
+        "pending": len(work_list),
+        "unchanged": len(unchanged),
+        "deleted": deleted_count,
         "duration_seconds": duration,
     }
 
@@ -254,6 +616,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--debug-slow-enumeration",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--full-rescan",
+        action="store_true",
+        help="Force a full rescan of all files, ignoring the delta optimizer.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start a new scan even if a checkpoint is present.",
+    )
+    parser.add_argument(
+        "--checkpoint-seconds",
+        type=int,
+        default=5,
+        help="Seconds between resume checkpoints (default: 5).",
     )
     parser.add_argument(
         "--export-csv",
@@ -369,7 +747,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     debug_flag = bool(args.debug or args.debug_slow_enumeration)
-    result = scan_drive(args.label, args.mount_path, str(catalog_db_path), debug_slow=debug_flag)
+    checkpoint_seconds = max(1, int(getattr(args, "checkpoint_seconds", 5)))
+    result = scan_drive(
+        args.label,
+        args.mount_path,
+        str(catalog_db_path),
+        full_rescan=bool(getattr(args, "full_rescan", False)),
+        resume=not bool(getattr(args, "no_resume", False)),
+        checkpoint_seconds=checkpoint_seconds,
+        debug_slow=debug_flag,
+    )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
     av_files = int(result.get("av_files", 0)) if isinstance(result, dict) else 0
