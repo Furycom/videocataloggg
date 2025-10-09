@@ -12,7 +12,8 @@ import uvicorn
 from api import __version__ as API_VERSION
 from api.db import DataAccess
 from api.server import APIServerConfig, create_app
-from paths import load_settings, resolve_working_dir
+from core.paths import resolve_working_dir
+from core.settings import load_settings
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8756

@@ -5,7 +5,9 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
+
+from core.paths import to_long_path
 
 from .tools import TMKToolchain, resolve_tmk_toolchain
 
@@ -14,8 +16,22 @@ from .tools import TMKToolchain, resolve_tmk_toolchain
 class TMKSignature:
     path: Path
     duration_seconds: Optional[float]
-    signature: bytes
+    signature_path: Path
     tool_version: Optional[str]
+
+    def iter_chunks(self, chunk_size: int = 256 * 1024) -> Iterator[bytes]:
+        with open(self.signature_path, "rb") as handle:
+            while True:
+                chunk = handle.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
+    def cleanup(self) -> None:
+        try:
+            self.signature_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class TMKVideoError(RuntimeError):
@@ -39,36 +55,41 @@ class TMKVideoFingerprinter:
     ) -> Optional[TMKSignature]:
         if not self._toolchain:
             return None
-        with tempfile.TemporaryDirectory(prefix="tmk_sig_") as tmpdir:
-            sig_path = Path(tmpdir) / "signature.tmk"
-            json_path = Path(tmpdir) / "signature.json"
-            base_cmd = [
-                self._toolchain.hash_tool,
-                "-i",
-                str(source),
-                "-o",
-                str(sig_path),
-            ]
-            if self._toolchain.extractor_tool:
-                base_cmd.extend(["--pdq-path", self._toolchain.extractor_tool])
+        sig_tmp = tempfile.NamedTemporaryFile(prefix="tmk_sig_", suffix=".tmk", delete=False)
+        json_tmp = tempfile.NamedTemporaryFile(prefix="tmk_sig_", suffix=".json", delete=False)
+        sig_tmp.close()
+        json_tmp.close()
+        sig_path = Path(sig_tmp.name)
+        json_path = Path(json_tmp.name)
+        base_cmd = [
+            self._toolchain.hash_tool,
+            "-i",
+            to_long_path(source),
+            "-o",
+            to_long_path(sig_path),
+        ]
+        if self._toolchain.extractor_tool:
+            base_cmd.extend(["--pdq-path", self._toolchain.extractor_tool])
 
-            def _invoke(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-                try:
-                    return subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        check=False,
-                        text=True,
-                        timeout=timeout,
-                    )
-                except FileNotFoundError as exc:
-                    raise TMKVideoError(str(exc)) from exc
-                except subprocess.TimeoutExpired as exc:
-                    raise TMKVideoError(
-                        f"tmk-hash-video timed out after {timeout}s"
-                    ) from exc
+        def _invoke(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=timeout,
+                )
+            except FileNotFoundError as exc:
+                raise TMKVideoError(str(exc)) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise TMKVideoError(
+                    f"tmk-hash-video timed out after {timeout}s"
+                ) from exc
 
-            cmd = base_cmd + ["--json", str(json_path)]
+        success = False
+        try:
+            cmd = base_cmd + ["--json", to_long_path(json_path)]
             completed = _invoke(cmd)
             if completed.returncode != 0:
                 stderr = (completed.stderr or "").strip()
@@ -83,7 +104,6 @@ class TMKVideoFingerprinter:
                 raise TMKVideoError(stderr or stdout or "tmk-hash-video failed")
             if not sig_path.exists():
                 raise TMKVideoError("tmk-hash-video did not create a signature")
-            signature_bytes = sig_path.read_bytes()
             duration_value = duration_hint
             if json_path.exists():
                 try:
@@ -91,12 +111,17 @@ class TMKVideoFingerprinter:
                     duration_value = float(payload.get("duration"))
                 except Exception:
                     pass
+            success = True
             return TMKSignature(
                 path=source,
                 duration_seconds=duration_value,
-                signature=signature_bytes,
+                signature_path=sig_path,
                 tool_version=self._toolchain.version,
             )
+        finally:
+            json_path.unlink(missing_ok=True)
+            if not success:
+                sig_path.unlink(missing_ok=True)
 
     def similarity(self, sig_a: bytes, sig_b: bytes, timeout: int = 600) -> float:
         if not self._toolchain:
@@ -108,8 +133,8 @@ class TMKVideoFingerprinter:
             file_b.write_bytes(sig_b)
             cmd = [
                 self._toolchain.compare_tool,
-                str(file_a),
-                str(file_b),
+                to_long_path(file_a),
+                to_long_path(file_b),
             ]
             try:
                 completed = subprocess.run(

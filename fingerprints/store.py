@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
+
+from core.db import connect, transaction
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS video_fp_tmk (
@@ -48,12 +52,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 class FingerprintStore:
     def __init__(self, db_path: Path | str, *, timeout: float = 30.0) -> None:
         self._path = Path(db_path)
-        self._conn = sqlite3.connect(
-            str(self._path), timeout=timeout, check_same_thread=False
+        self._conn = connect(
+            self._path,
+            timeout=timeout,
+            check_same_thread=False,
         )
-        ensure_schema(self._conn)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.commit()
+        with transaction(self._conn):
+            ensure_schema(self._conn)
 
     @property
     def path(self) -> Path:
@@ -66,6 +71,11 @@ class FingerprintStore:
     def close(self) -> None:
         self._conn.close()
 
+    @contextmanager
+    def batch(self) -> Iterator[sqlite3.Connection]:
+        with transaction(self._conn) as conn:
+            yield conn
+
     def upsert_video_signature(
         self,
         *,
@@ -74,20 +84,59 @@ class FingerprintStore:
         signature: bytes,
         version: Optional[str],
     ) -> None:
+        temp_path = _write_temp_blob(signature)
+        try:
+            self.upsert_video_signature_from_file(
+                path=path,
+                duration=duration,
+                source_path=temp_path,
+                version=version,
+            )
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def upsert_video_signature_from_file(
+        self,
+        *,
+        path: str,
+        duration: Optional[float],
+        source_path: Path,
+        version: Optional[str],
+        chunk_size: int = 256 * 1024,
+    ) -> None:
+        size = source_path.stat().st_size if source_path.exists() else 0
         now = _utc_now()
         self._conn.execute(
             """
             INSERT INTO video_fp_tmk(path, tmk_version, duration_seconds, sig_bytes, updated_utc)
-            VALUES(?,?,?,?,?)
+            VALUES(?,?,?,zeroblob(?),?)
             ON CONFLICT(path) DO UPDATE SET
                 tmk_version=excluded.tmk_version,
                 duration_seconds=excluded.duration_seconds,
-                sig_bytes=excluded.sig_bytes,
+                sig_bytes=zeroblob(?),
                 updated_utc=excluded.updated_utc
             """,
-            (path, version, duration, sqlite3.Binary(signature), now),
+            (path, version, duration, size, now, size),
         )
-        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT rowid FROM video_fp_tmk WHERE path=?",
+            (path,),
+        ).fetchone()
+        if row is None:
+            return
+        rowid = int(row[0])
+        if size <= 0:
+            return
+        with self._conn.blobopen("video_fp_tmk", "sig_bytes", rowid, False) as blob:
+            with open(source_path, "rb") as handle:
+                while True:
+                    chunk = handle.read(chunk_size)
+                    if not chunk:
+                        break
+                    blob.write(chunk)
 
     def upsert_audio_signature(
         self,
@@ -110,7 +159,6 @@ class FingerprintStore:
             """,
             (path, version, duration, fingerprint, now),
         )
-        self._conn.commit()
 
     def upsert_video_vhash(self, *, path: str, vhash: str) -> None:
         now = _utc_now()
@@ -124,7 +172,6 @@ class FingerprintStore:
             """,
             (path, vhash, now),
         )
-        self._conn.commit()
 
     def has_video_signature(self, path: str) -> bool:
         cur = self._conn.execute(
@@ -158,7 +205,6 @@ class FingerprintStore:
             """,
             (path_a, path_b, float(score), reason, now),
         )
-        self._conn.commit()
 
     def iter_video_signatures(self) -> Iterator[Tuple[str, bytes, Optional[float]]]:
         cur = self._conn.execute(
@@ -181,3 +227,12 @@ class FingerprintStore:
 
 def _utc_now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_temp_blob(data: bytes) -> Path:
+    handle = tempfile.NamedTemporaryFile(prefix="fp_sig_", suffix=".bin", delete=False)
+    try:
+        handle.write(data)
+    finally:
+        handle.close()
+    return Path(handle.name)

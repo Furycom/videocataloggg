@@ -6,7 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Literal, Optional, Tuple
 
-from paths import load_settings, resolve_working_dir, update_settings
+from core.paths import resolve_working_dir
+from core.settings import load_settings, update_settings
 
 ToolName = Literal["mediainfo", "ffmpeg", "smartctl"]
 

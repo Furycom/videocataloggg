@@ -6,18 +6,21 @@
     "max_video_frames": 2,
     "prefer_ffmpeg": true
   },
-  "fingerprints": {
-    "enable_video_tmk": false,
-    "enable_audio_chroma": false,
-    "enable_video_vhash_prefilter": true,
-    "max_concurrency": 2,
-    "io_gentle_ms": 2,
-    "phase_mode": "off",
-    "tmk_bin_path": null,
-    "fpcalc_path": null,
-    "tmk_similarity_threshold": 0.75,
-    "chroma_match_threshold": 0.15
-  },
+    "fingerprints": {
+      "enable_video_tmk": false,
+      "enable_audio_chroma": false,
+      "enable_video_vhash_prefilter": true,
+      "batch_size": 50,
+      "max_concurrency": 2,
+      "io_gentle_ms": 120,
+      "phase_mode": "post-scan",
+      "tmk_bin_path": null,
+      "fpcalc_path": null,
+      "tmk_similarity_threshold": 0.75,
+      "chroma_match_threshold": 0.15,
+      "consensus_enabled": true,
+      "consensus_video_weight": 0.7
+    },
   "api": {
     "enabled_default": false,
     "host": "127.0.0.1",

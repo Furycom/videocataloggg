@@ -11,13 +11,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import reports_util
 
-from paths import (
-    get_catalog_db_path,
-    get_shard_db_path,
-    get_shards_dir,
-    load_settings,
-    resolve_working_dir,
-)
+from core.db import connect
+from core.paths import get_catalog_db_path, get_shard_db_path, get_shards_dir, resolve_working_dir
+from core.settings import load_settings
 
 _DEFAULT_LIMIT = 100
 _MAX_PAGE_SIZE = 500
@@ -121,19 +117,11 @@ class DataAccess:
         return shard_path
 
     def _connect(self, path: Path) -> sqlite3.Connection:
-        uri_path = path.resolve()
+        conn = connect(path, read_only=True, check_same_thread=False)
         try:
-            conn = sqlite3.connect(
-                f"file:{uri_path.as_posix()}?mode=ro&cache=shared",
-                uri=True,
-                check_same_thread=False,
-            )
-        except sqlite3.OperationalError:
-            conn = sqlite3.connect(str(uri_path), check_same_thread=False)
-            try:
-                conn.execute("PRAGMA query_only = 1")
-            except sqlite3.DatabaseError:
-                pass
+            conn.execute("PRAGMA query_only = 1")
+        except sqlite3.DatabaseError:
+            pass
         conn.row_factory = sqlite3.Row
         return conn
 

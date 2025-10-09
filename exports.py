@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, Optional
 
-from paths import get_exports_dir, safe_label
+from core.paths import get_exports_dir, safe_label
 
 CSV_COLUMNS = [
     "drive_label",

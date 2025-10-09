@@ -11,13 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from paths import (
-    get_shards_dir,
-    load_settings,
-    resolve_working_dir,
-    safe_label,
-    save_settings,
-)
+from core.db import backup_sqlite, connect, pragma_optimize
+from core.paths import get_shards_dir, resolve_working_dir, safe_label
+from core.settings import load_settings, save_settings
 
 
 LOGGER = logging.getLogger("videocatalog.dbmaint")
@@ -133,7 +129,7 @@ def check_integrity(
     issues: List[str] = []
     total_issues = 0
     try:
-        with sqlite3.connect(str(path)) as conn:
+        with connect(path, read_only=True, timeout=busy_timeout_ms / 1000.0) as conn:
             _busy_timeout(conn, busy_timeout_ms)
             rows = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
             if rows and not all(row.lower() == "ok" for row in rows):
@@ -172,7 +168,7 @@ def quick_optimize(
 ) -> Dict[str, object]:
     path = _normalize_path(db_path)
     start = time.perf_counter()
-    with sqlite3.connect(str(path)) as conn:
+    with connect(path, timeout=busy_timeout_ms / 1000.0) as conn:
         _busy_timeout(conn, busy_timeout_ms)
         try:
             conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -193,7 +189,7 @@ def reindex_and_analyze(
     start = time.perf_counter()
     indexes_before = 0
     indexes_after = 0
-    with sqlite3.connect(str(path)) as conn:
+    with connect(path, timeout=busy_timeout_ms / 1000.0) as conn:
         _busy_timeout(conn, busy_timeout_ms)
         try:
             cur = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='index'")
@@ -246,7 +242,7 @@ def vacuum_if_needed(
                 threshold_bytes = DEFAULT_VACUUM_THRESHOLD
     before_bytes = _total_db_size(path)
     start = time.perf_counter()
-    with sqlite3.connect(str(path)) as conn:
+    with connect(path, timeout=busy_timeout_ms / 1000.0) as conn:
         _busy_timeout(conn, busy_timeout_ms)
         journal_mode = ""
         try:
@@ -317,14 +313,16 @@ def light_backup(
     target_dir.mkdir(parents=True, exist_ok=True)
     normalized_label = safe_label(label) or "database"
     backup_path = target_dir / f"{_timestamp()}_{normalized_label}.db.bak"
-    with sqlite3.connect(str(path)) as source:
+    source = connect(path, read_only=True, timeout=busy_timeout_ms / 1000.0)
+    try:
         _busy_timeout(source, busy_timeout_ms)
         try:
             source.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:
             pass
-        with sqlite3.connect(str(backup_path)) as dest:
-            source.backup(dest)
+        backup_sqlite(source, backup_path)
+    finally:
+        source.close()
     LOGGER.info("Backup %s → %s", path.name, backup_path)
     return backup_path
 

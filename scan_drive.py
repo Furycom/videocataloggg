@@ -28,15 +28,15 @@ from analyzers import (
     VideoThumbnailAnalyzer,
     ensure_features_table,
 )
-from paths import (
+from core.paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
     get_shard_db_path,
     get_shards_dir,
-    load_settings,
     resolve_working_dir,
     safe_label,
 )
+from core.settings import load_settings
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
 from tools import bootstrap_local_bin, probe_tool
@@ -170,6 +170,7 @@ class FingerprintSettings:
     phase_mode: str
     max_concurrency: int
     io_gentle_ms: int
+    batch_size: int
     tmk_similarity_threshold: float
     chroma_match_threshold: float
     tmk_bin_path: Optional[Path]
@@ -350,6 +351,8 @@ class FingerprintPipeline:
         shard_path: Path,
         progress_callback: Optional[Callable[[dict], None]],
         start_time: float,
+        perf_profile: str,
+        cancel_token: CancellationToken,
     ) -> None:
         self._settings = settings
         self._shard_path = shard_path
@@ -370,6 +373,15 @@ class FingerprintPipeline:
         self._stats = {"video": 0, "audio": 0, "vhash": 0}
         self._lock = threading.Lock()
         self._errors: List[str] = []
+        self._cancel = cancel_token
+        profile = str(perf_profile or "").upper()
+        base_sleep = max(0, int(settings.io_gentle_ms)) / 1000.0
+        if profile == "NETWORK":
+            base_sleep *= 2.0
+        elif profile == "USB":
+            base_sleep *= 1.5
+        self._sleep_seconds = base_sleep
+        self._batch_size = max(1, int(settings.batch_size))
 
     def prepare(self, connection: sqlite3.Connection) -> None:
         if self._prepared:
@@ -385,16 +397,24 @@ class FingerprintPipeline:
             override = str(self._settings.tmk_bin_path) if self._settings.tmk_bin_path else None
             self._tmk_toolchain = fp_tools.resolve_tmk_toolchain(override)
             if not self._tmk_toolchain:
-                self._errors.append("TMK+PDQF tools not available; video hashing disabled.")
+                message = "Tool missing: TMK+PDQF (install facebookresearch TMK binaries)"
+                self._errors.append(message)
+                LOGGER.error(message)
             else:
                 self._video_enabled = True
+                if self._tmk_toolchain.version:
+                    LOGGER.info("TMK+PDQF ready (%s)", self._tmk_toolchain.version)
         if self._settings.enable_audio_chroma:
             override = str(self._settings.fpcalc_path) if self._settings.fpcalc_path else None
             self._chromaprint_tool = fp_tools.resolve_chromaprint(override)
             if not self._chromaprint_tool:
-                self._errors.append("Chromaprint fpcalc not found; audio hashing disabled.")
+                message = "Tool missing: Chromaprint fpcalc (install chromaprint or set path)"
+                self._errors.append(message)
+                LOGGER.error(message)
             else:
                 self._audio_enabled = True
+                if self._chromaprint_tool.version:
+                    LOGGER.info("Chromaprint ready (%s)", self._chromaprint_tool.version)
 
         self._prefilter_enabled = bool(
             self._settings.enable_video_vhash_prefilter and fp_tools.have_videohash()
@@ -405,6 +425,13 @@ class FingerprintPipeline:
         self._enabled = any([self._video_enabled, self._audio_enabled, self._prefilter_enabled])
         if not self._enabled:
             return
+        LOGGER.info(
+            "Fingerprint pipeline active: workers=%d, batch=%d, sleep=%.0fms, phase=%s",
+            self._settings.max_concurrency,
+            self._batch_size,
+            self._sleep_seconds * 1000.0,
+            self._settings.phase_mode,
+        )
 
     def submit(self, result: WorkerResult) -> None:
         if not self._enabled:
@@ -471,22 +498,71 @@ class FingerprintPipeline:
         store = fp_store.FingerprintStore(self._shard_path)
         fingerprinter = fp_video.TMKVideoFingerprinter(self._tmk_toolchain)
         chroma = fp_audio.ChromaprintGenerator(self._chromaprint_tool)
-        sleep_seconds = max(0.0, float(self._settings.io_gentle_ms) / 1000.0)
-        while True:
-            try:
-                item = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                if item is self._sentinel:
+        pending: List[_FingerprintTask] = []
+        try:
+            while True:
+                if self._cancel.is_set() and not pending:
                     break
-                assert isinstance(item, _FingerprintTask)
-                self._process_task(item, store, fingerprinter, chroma)
-                if sleep_seconds:
-                    time.sleep(sleep_seconds)
-            finally:
-                self._queue.task_done()
-        store.close()
+                try:
+                    item = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    if pending:
+                        self._process_batch(pending, store, fingerprinter, chroma)
+                        for _ in pending:
+                            self._queue.task_done()
+                        pending.clear()
+                        if self._sleep_seconds:
+                            time.sleep(self._sleep_seconds)
+                    if self._cancel.is_set():
+                        break
+                    continue
+                if item is self._sentinel:
+                    self._queue.task_done()
+                    if pending:
+                        self._process_batch(pending, store, fingerprinter, chroma)
+                        for _ in pending:
+                            self._queue.task_done()
+                        pending.clear()
+                    break
+                if not isinstance(item, _FingerprintTask):
+                    self._queue.task_done()
+                    continue
+                pending.append(item)
+                if len(pending) >= self._batch_size:
+                    self._process_batch(pending, store, fingerprinter, chroma)
+                    for _ in pending:
+                        self._queue.task_done()
+                    pending.clear()
+                    if self._sleep_seconds:
+                        time.sleep(self._sleep_seconds)
+                if self._cancel.is_set() and not pending:
+                    break
+        finally:
+            if pending:
+                self._process_batch(pending, store, fingerprinter, chroma)
+                for _ in pending:
+                    self._queue.task_done()
+                pending.clear()
+            store.close()
+
+    def _process_batch(
+        self,
+        tasks: List[_FingerprintTask],
+        store: fp_store.FingerprintStore,
+        fingerprinter: fp_video.TMKVideoFingerprinter,
+        chroma: fp_audio.ChromaprintGenerator,
+    ) -> None:
+        if not tasks:
+            return
+        try:
+            with store.batch():
+                for task in tasks:
+                    if self._cancel.is_set():
+                        break
+                    self._process_task(task, store, fingerprinter, chroma)
+        except Exception as exc:
+            with self._lock:
+                self._errors.append(str(exc))
 
     def _process_task(
         self,
@@ -500,28 +576,31 @@ class FingerprintPipeline:
         suffix = Path(info.path).suffix.lower()
         errors: List[str] = []
         try:
-            if self._prefilter_enabled and suffix in VIDEO_EXTS:
+            if self._prefilter_enabled and suffix in VIDEO_EXTS and not self._cancel.is_set():
                 if not store.has_vhash(info.path):
                     vhash = fp_vhash.compute_vhash(Path(info.fs_path))
                     if vhash:
                         store.upsert_video_vhash(path=info.path, vhash=vhash.hash64)
                         with self._lock:
                             self._stats["vhash"] += 1
-            if self._video_enabled and suffix in VIDEO_EXTS:
+            if self._video_enabled and suffix in VIDEO_EXTS and not self._cancel.is_set():
                 if not store.has_video_signature(info.path):
                     signature = fingerprinter.compute(
                         Path(info.fs_path), duration_hint=duration_hint
                     )
                     if signature:
-                        store.upsert_video_signature(
-                            path=info.path,
-                            duration=signature.duration_seconds,
-                            signature=signature.signature,
-                            version=signature.tool_version,
-                        )
+                        try:
+                            store.upsert_video_signature_from_file(
+                                path=info.path,
+                                duration=signature.duration_seconds,
+                                source_path=signature.signature_path,
+                                version=signature.tool_version,
+                            )
+                        finally:
+                            signature.cleanup()
                         with self._lock:
                             self._stats["video"] += 1
-            if self._audio_enabled and suffix in AUDIO_EXTS:
+            if self._audio_enabled and suffix in AUDIO_EXTS and not self._cancel.is_set():
                 if not store.has_audio_signature(info.path):
                     fingerprint = chroma.compute(Path(info.fs_path))
                     if fingerprint:
@@ -682,7 +761,8 @@ def _resolve_fingerprint_settings(
         enable_video_vhash_prefilter=_bool("enable_video_vhash_prefilter", True),
         phase_mode=phase,
         max_concurrency=_int("max_concurrency", 2, minimum=1),
-        io_gentle_ms=_int("io_gentle_ms", 2, minimum=0),
+        io_gentle_ms=_int("io_gentle_ms", 120, minimum=0),
+        batch_size=_int("batch_size", 50, minimum=1),
         tmk_similarity_threshold=_float("tmk_similarity_threshold", 0.75),
         chroma_match_threshold=_float("chroma_match_threshold", 0.15),
         tmk_bin_path=_path("tmk_bin_path"),
@@ -1389,6 +1469,8 @@ def scan_drive(
             shard_path=shard_path,
             progress_callback=progress_callback,
             start_time=start_time,
+            perf_profile=str(perf_config.profile),
+            cancel_token=cancel_token,
         )
         fingerprint_pipeline.prepare(conn)
     conn.execute(
@@ -2241,6 +2323,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override fingerprint I/O pacing in milliseconds between files.",
     )
     parser.add_argument(
+        "--fingerprint-batch-size",
+        type=int,
+        help="Override fingerprint batch size per commit.",
+    )
+    parser.add_argument(
         "--tmk-bin",
         dest="fingerprint_tmk_bin",
         help="Path to TMK binaries if not on PATH.",
@@ -2599,6 +2686,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         fingerprint_cli_overrides["max_concurrency"] = args.fingerprint_workers
     if getattr(args, "fingerprint_io_ms", None) is not None:
         fingerprint_cli_overrides["io_gentle_ms"] = args.fingerprint_io_ms
+    if getattr(args, "fingerprint_batch_size", None) is not None:
+        fingerprint_cli_overrides["batch_size"] = args.fingerprint_batch_size
     if getattr(args, "fingerprint_tmk_bin", None):
         fingerprint_cli_overrides["tmk_bin_path"] = args.fingerprint_tmk_bin
     if getattr(args, "fingerprint_fpcalc", None):
@@ -2664,6 +2753,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"{int(fp_info.get('video', 0)):,}, audio: {int(fp_info.get('audio', 0)):,}, "
                     f"prefilter: {int(fp_info.get('vhash', 0)):,}"
                 )
+                if fp_info.get("errors"):
+                    fingerprint_line += " (warnings: " + ", ".join(
+                        str(err) for err in fp_info.get("errors", [])
+                    ) + ")"
             elif fp_info.get("errors"):
                 fingerprint_line = "Fingerprints skipped — " + "; ".join(
                     str(err) for err in fp_info.get("errors", [])

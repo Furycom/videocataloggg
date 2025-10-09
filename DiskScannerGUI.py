@@ -25,7 +25,7 @@ from db_maint import (
     vacuum_if_needed,
 )
 
-from paths import (
+from core.paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
     get_drive_types_path,
@@ -34,11 +34,10 @@ from paths import (
     get_scans_dir,
     get_shard_db_path,
     get_shards_dir,
-    load_settings,
-    safe_label,
     resolve_working_dir,
-    update_settings,
+    safe_label,
 )
+from core.settings import load_settings, update_settings
 from exports import ExportFilters, export_shard
 from perf import resolve_performance_config
 from tools import (
@@ -4401,6 +4400,29 @@ class App:
             if status == "Done":
                 self._set_status("Ready.", "success")
                 inventory_totals = event.get("inventory_totals")
+                fp_info = event.get("fingerprints")
+                fp_line = None
+                fp_level: Optional[str] = None
+                if isinstance(fp_info, dict):
+                    fp_status = str(fp_info.get("status") or "").lower()
+                    if fp_status == "ok":
+                        fp_line = (
+                            "Fingerprints — video: "
+                            f"{int(fp_info.get('video', 0)):,}, audio: {int(fp_info.get('audio', 0)):,}, "
+                            f"prefilter: {int(fp_info.get('vhash', 0)):,}"
+                        )
+                        if fp_info.get("errors"):
+                            fp_line += " (warnings: " + ", ".join(
+                                str(err) for err in fp_info.get("errors", [])
+                            ) + ")"
+                            fp_level = "WARNING"
+                    elif fp_info.get("errors"):
+                        fp_line = "Fingerprints skipped — " + "; ".join(
+                            str(err) for err in fp_info.get("errors", [])
+                        )
+                        fp_level = "ERROR"
+                    elif fp_status == "skipped":
+                        fp_line = "Fingerprints skipped — disabled"
                 if isinstance(inventory_totals, dict):
                     summary_text = event.get("message") or (
                         "Inventory done — total files: "
@@ -4416,12 +4438,19 @@ class App:
                                 f"{int(light_info.get('images', 0)):,}, videos: {int(light_info.get('videos', 0)):,}, "
                                 f"avg dim: {int(light_info.get('avg_dim', 0))}"
                             )
-                            if light_info.get("warning"):
-                                light_line += f" (warning: {light_info.get('warning')})"
-                        elif la_status in {"error", "skipped"} and light_info.get("message"):
-                            light_line = f"Light analysis skipped — {light_info.get('message')}"
+                        if light_info.get("warning"):
+                            light_line += f" (warning: {light_info.get('warning')})"
+                    elif la_status in {"error", "skipped"} and light_info.get("message"):
+                        light_line = f"Light analysis skipped — {light_info.get('message')}"
                     if light_line:
                         summary_text = f"{summary_text} • {light_line}"
+                    if fp_line:
+                        summary_text = f"{summary_text} • {fp_line}"
+                    banner_level = "SUCCESS"
+                    if fp_level == "ERROR":
+                        banner_level = "ERROR"
+                    elif fp_level == "WARNING":
+                        banner_level = "WARNING"
                     self.status_line_idle_text = summary_text
                     action = (
                         "View summary",
@@ -4431,7 +4460,7 @@ class App:
                             snapshot,
                         ),
                     )
-                    self.show_banner(summary_text, "SUCCESS", action=action)
+                    self.show_banner(summary_text, banner_level, action=action)
                 else:
                     summary_text = (
                         "Done — total files: "
@@ -4447,17 +4476,24 @@ class App:
                                 f"{int(light_info.get('images', 0)):,}, videos: {int(light_info.get('videos', 0)):,}, "
                                 f"avg dim: {int(light_info.get('avg_dim', 0))}"
                             )
-                            if light_info.get("warning"):
-                                light_line += f" (warning: {light_info.get('warning')})"
-                        elif la_status in {"error", "skipped"} and light_info.get("message"):
-                            light_line = f"Light analysis skipped — {light_info.get('message')}"
+                        if light_info.get("warning"):
+                            light_line += f" (warning: {light_info.get('warning')})"
+                    elif la_status in {"error", "skipped"} and light_info.get("message"):
+                        light_line = f"Light analysis skipped — {light_info.get('message')}"
                     if light_line:
                         summary_text = f"{summary_text} • {light_line}"
+                    if fp_line:
+                        summary_text = f"{summary_text} • {fp_line}"
+                    banner_level = "SUCCESS"
+                    if fp_level == "ERROR":
+                        banner_level = "ERROR"
+                    elif fp_level == "WARNING":
+                        banner_level = "WARNING"
                     self.status_line_idle_text = summary_text
                     action = None
                     if self._recent_export_paths:
                         action = ("Open exports folder", self.open_exports_folder)
-                    self.show_banner(summary_text, "SUCCESS", action=action)
+                    self.show_banner(summary_text, banner_level, action=action)
                     self._trigger_auto_maintenance(self._last_scan_label or self.label_var.get().strip())
             elif status == "Stopped":
                 self._set_status("Scan stopped.", "warning")
