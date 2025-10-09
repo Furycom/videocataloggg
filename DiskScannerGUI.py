@@ -50,6 +50,13 @@ from tools import (
     setup_portable_tool,
     winget_available,
 )
+from search_util import (
+    sanitize_query,
+    ensure_inventory_name,
+    build_search_query,
+    format_results,
+    export_results,
+)
 from tkinter import (
     Tk, Toplevel, StringVar, IntVar, END, N, S, E, W,
     filedialog, messagebox, ttk, Menu, Spinbox
@@ -1761,6 +1768,17 @@ class App:
         self._active_toasts: list[Toplevel] = []
         self._banner_action_callback = None
 
+        self._search_placeholder = "Type part of a file name…"
+        self.search_query_var = StringVar(value=self._search_placeholder)
+        self.search_drive_var = StringVar()
+        self.search_status_var = StringVar(value="Results: 0 (showing first 1,000) — idle")
+        self._search_queue: "queue.Queue[dict]" = queue.Queue()
+        self._search_thread: Optional[threading.Thread] = None
+        self._search_cancel: Optional[threading.Event] = None
+        self._search_rows: Dict[str, dict] = {}
+        self._search_results: list[dict] = []
+        self._search_drive_options: list[str] = []
+
         self._build_menu()
         self._build_form()
         self._build_tables()
@@ -1772,6 +1790,7 @@ class App:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self._poll_worker_queue)
+        self.root.after(200, self._poll_search_queue)
 
         for d in (SCANS_DIR, LOGS_DIR, EXPORTS_DIR, SHARDS_DIR):
             os.makedirs(d, exist_ok=True)
@@ -2115,15 +2134,41 @@ class App:
         self.content = ttk.Frame(self.root, padding=(20, 18), style="Content.TFrame")
         self.content.grid(row=1, column=0, sticky=(N, S, E, W))
         self.content.columnconfigure(0, weight=1)
+        self.content.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self.content, style="Header.TFrame", padding=(0, 0, 0, 16))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
         ttk.Label(header, text="Disk Scanner Catalog", style="HeaderTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="Manage your drives and follow scans at a glance.", style="HeaderSubtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(
+            header,
+            text="Manage your drives and follow scans at a glance.",
+            style="HeaderSubtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        db_frame = ttk.LabelFrame(self.content, text="Database", padding=(16, 12), style="Card.TLabelframe")
-        db_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        toolbar = ttk.Frame(header, style="Header.TFrame")
+        toolbar.grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Button(toolbar, text="Search", command=self.focus_search_tab).grid(row=0, column=0, padx=(12, 0))
+
+        self.main_notebook = ttk.Notebook(self.content)
+        self.main_notebook.grid(row=1, column=0, sticky="nsew")
+        self.dashboard_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.dashboard_tab.columnconfigure(0, weight=1)
+        self.main_notebook.add(self.dashboard_tab, text="Dashboard")
+        self.search_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.search_tab.columnconfigure(0, weight=1)
+        self.search_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.search_tab, text="Search")
+
+        self._build_dashboard_controls(self.dashboard_tab)
+        self._build_search_tab(self.search_tab)
+
+    def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        db_frame = ttk.LabelFrame(parent, text="Database", padding=(16, 12), style="Card.TLabelframe")
+        db_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         for c in range(4):
             db_frame.columnconfigure(c, weight=0)
         db_frame.columnconfigure(1, weight=1)
@@ -2132,8 +2177,8 @@ class App:
         ttk.Button(db_frame, text="Browse…", command=self.db_open, style="Accent.TButton").grid(row=0, column=2, sticky="e", padx=(12, 0))
         ttk.Button(db_frame, text="New DB…", command=self.db_new).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
-        scan_frame = ttk.LabelFrame(self.content, text="Scan parameters", padding=(16, 16), style="Card.TLabelframe")
-        scan_frame.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+        scan_frame = ttk.LabelFrame(parent, text="Scan parameters", padding=(16, 16), style="Card.TLabelframe")
+        scan_frame.grid(row=1, column=0, sticky="ew", pady=(0, 16))
         for c in range(4):
             scan_frame.columnconfigure(c, weight=1 if c in (1, 2) else 0)
 
@@ -2239,14 +2284,102 @@ class App:
         )
         self.status_line_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
+        for idx in (2, 3, 4, 5):
+            parent.rowconfigure(idx, weight=1)
+
+    def _build_search_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        controls = ttk.LabelFrame(parent, text="Quick Search", padding=(16, 16), style="Card.TLabelframe")
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Drive:").grid(row=0, column=0, sticky="w")
+        self.search_drive_combo = ttk.Combobox(controls, textvariable=self.search_drive_var, state="readonly", values=())
+        self.search_drive_combo.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+
+        ttk.Label(controls, text="Query:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        self.search_entry = ttk.Entry(controls, textvariable=self.search_query_var, width=48)
+        self.search_entry.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(12, 0))
+        self.search_entry.bind("<FocusIn>", self._on_search_focus_in)
+        self.search_entry.bind("<FocusOut>", self._on_search_focus_out)
+        self.search_entry.bind("<Return>", lambda _evt: self.perform_search())
+        self.search_entry.configure(foreground=self.colors.get("muted_text", "#94a3b8"))
+
+        self.search_button = ttk.Button(controls, text="Search", command=self.perform_search, style="Accent.TButton")
+        self.search_button.grid(row=1, column=2, sticky="ew", padx=(12, 0), pady=(12, 0))
+
+        ttk.Label(controls, text="Type at least 3 characters.", style="Subtle.TLabel").grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=(8, 0),
+        )
+
+        results_frame = ttk.LabelFrame(parent, text="Results", padding=(16, 12), style="Card.TLabelframe")
+        results_frame.grid(row=1, column=0, sticky=(N, S, E, W))
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+
+        columns = ("name", "category", "size", "modified", "drive", "path")
+        self.search_tree = ttk.Treeview(results_frame, columns=columns, show="headings", height=12, style="Card.Treeview")
+        headings = {
+            "name": "Name",
+            "category": "Category",
+            "size": "Size",
+            "modified": "Modified",
+            "drive": "Drive",
+            "path": "Path",
+        }
+        widths = {
+            "name": 260,
+            "category": 120,
+            "size": 90,
+            "modified": 150,
+            "drive": 110,
+            "path": 420,
+        }
+        for key in columns:
+            self.search_tree.heading(key, text=headings[key])
+            anchor = W if key in {"name", "category", "drive", "path"} else E
+            self.search_tree.column(key, anchor=anchor, stretch=True, width=widths[key])
+        search_scroll = ttk.Scrollbar(results_frame, orient="vertical", command=self.search_tree.yview)
+        self.search_tree.configure(yscrollcommand=search_scroll.set)
+        self.search_tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        search_scroll.grid(row=0, column=1, sticky=(N, S))
+
+        self.search_tree.bind("<Double-1>", self._on_search_item_open)
+        self.search_tree.bind("<Return>", self._on_search_item_open)
+        self.search_tree.bind("<Button-3>", self._show_search_menu)
+        self.search_tree.bind("<Control-Button-1>", self._show_search_menu)
+
+        ttk.Label(results_frame, textvariable=self.search_status_var, style="Subtle.TLabel").grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(8, 0),
+        )
+
+        self.search_menu = Menu(self.search_tree, tearoff=0)
+        self.search_menu.add_command(label="Open folder", command=self._open_selected_search_path)
+        self.search_menu.add_command(label="Copy full path", command=self._copy_search_path)
+        self.search_menu.add_command(label="Export results…", command=self._export_search_results)
+
+        self._on_search_focus_out()
+
     def _build_tables(self):
-        self.content.rowconfigure(3, weight=1)
-        self.content.rowconfigure(4, weight=1)
-        self.content.rowconfigure(6, weight=1)
+        parent = getattr(self, "dashboard_tab", self.content)
+        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(3, weight=1)
+        parent.rowconfigure(4, weight=1)
+        parent.rowconfigure(5, weight=1)
 
         cols = ("id","label","mount","type","notes","serial","model","totalGB")
-        drives_frame = ttk.LabelFrame(self.content, text="Drives in catalog", padding=(16, 12), style="Card.TLabelframe")
-        drives_frame.grid(row=3, column=0, sticky=(N, S, E, W), pady=(0, 12))
+        drives_frame = ttk.LabelFrame(parent, text="Drives in catalog", padding=(16, 12), style="Card.TLabelframe")
+        drives_frame.grid(row=2, column=0, sticky=(N, S, E, W), pady=(0, 12))
         drives_frame.columnconfigure(0, weight=1)
         drives_frame.rowconfigure(0, weight=1)
 
@@ -2273,8 +2406,8 @@ class App:
         ttk.Button(drives_actions, text="Open shard", command=self.open_shard_selected).grid(row=0, column=2, sticky="ew", padx=(8, 0))
 
         jcols=("id","drive_label","status","done_av","total_av","total_all","started_at","finished_at","duration","message")
-        jobs_frame = ttk.LabelFrame(self.content, text="Scan jobs", padding=(16, 12), style="Card.TLabelframe")
-        jobs_frame.grid(row=4, column=0, sticky=(N, S, E, W), pady=(0, 12))
+        jobs_frame = ttk.LabelFrame(parent, text="Scan jobs", padding=(16, 12), style="Card.TLabelframe")
+        jobs_frame.grid(row=3, column=0, sticky=(N, S, E, W), pady=(0, 12))
         jobs_frame.columnconfigure(0, weight=1)
         jobs_frame.rowconfigure(0, weight=1)
 
@@ -2301,8 +2434,8 @@ class App:
         ttk.Button(job_actions, text="Delete selected job", command=self.del_job, style="Danger.TButton").grid(row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Button(job_actions, text="Refresh jobs", command=self.refresh_jobs).grid(row=0, column=2, sticky="ew", padx=(8, 0))
 
-        progress_frame = ttk.LabelFrame(self.content, text="Progress", padding=(16, 16), style="Card.TLabelframe")
-        progress_frame.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        progress_frame = ttk.LabelFrame(parent, text="Progress", padding=(16, 16), style="Card.TLabelframe")
+        progress_frame.grid(row=4, column=0, sticky="ew", pady=(0, 12))
         progress_frame.columnconfigure(0, weight=1)
 
         header = ttk.Frame(progress_frame, style="Card.TFrame")
@@ -2345,8 +2478,8 @@ class App:
         self.skipped_detail_var = StringVar(value="Skipped: perm=0, long=0, ignored=0")
         ttk.Label(progress_frame, textvariable=self.skipped_detail_var, style="Subtle.TLabel").grid(row=3, column=0, sticky="w", pady=(4, 0))
 
-        log_frame = ttk.LabelFrame(self.content, text="Live log", padding=(16, 12), style="Card.TLabelframe")
-        log_frame.grid(row=6, column=0, sticky=(N, S, E, W))
+        log_frame = ttk.LabelFrame(parent, text="Live log", padding=(16, 12), style="Card.TLabelframe")
+        log_frame.grid(row=5, column=0, sticky=(N, S, E, W))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
 
@@ -2356,6 +2489,305 @@ class App:
         self.log_widget.grid(row=0, column=0, sticky=(N, S, E, W))
         self._set_status("Ready.")
         self._update_progress_styles(0, 0)
+
+
+    def _on_search_focus_in(self, _event=None):
+        if not hasattr(self, "search_entry"):
+            return
+        if self.search_query_var.get() == self._search_placeholder:
+            self.search_entry.delete(0, END)
+            self.search_entry.configure(foreground=self.colors.get("text", "#e2e8f0"))
+            self.search_query_var.set("")
+
+    def _on_search_focus_out(self, _event=None):
+        if not hasattr(self, "search_entry"):
+            return
+        current = self.search_query_var.get()
+        if not current:
+            self.search_query_var.set(self._search_placeholder)
+            self.search_entry.configure(foreground=self.colors.get("muted_text", "#94a3b8"))
+
+    def focus_search_tab(self) -> None:
+        try:
+            self.main_notebook.select(self.search_tab)
+        except Exception:
+            return
+        self.root.after(10, lambda: (self.search_entry.focus_set(), self._on_search_focus_in()))
+
+    def perform_search(self) -> None:
+        raw_query = self.search_query_var.get()
+        if raw_query == self._search_placeholder:
+            raw_query = ""
+        try:
+            query_parts = sanitize_query(raw_query)
+        except ValueError as exc:
+            message = str(exc)
+            self.search_status_var.set(message)
+            self.show_banner(message, "INFO")
+            return
+
+        drive_label = self.search_drive_var.get().strip()
+        if not drive_label:
+            message = "Select a drive to search."
+            self.search_status_var.set(message)
+            self.show_banner(message, "INFO")
+            return
+
+        shard = shard_path_for(drive_label)
+        if not shard.exists():
+            message = "No inventory found. Run Inventory first."
+            self.search_status_var.set(message)
+            self.show_banner(message, "ERROR")
+            return
+
+        if self._search_thread and self._search_thread.is_alive():
+            if self._search_cancel:
+                self._search_cancel.set()
+
+        self._search_cancel = threading.Event()
+        self._search_thread = threading.Thread(
+            target=self._search_worker,
+            args=(shard, drive_label, query_parts, self._search_cancel),
+            daemon=True,
+        )
+        self._search_thread.start()
+        self._search_results = []
+        self._search_rows.clear()
+        if hasattr(self, "search_tree"):
+            self.search_tree.delete(*self.search_tree.get_children())
+        self.search_status_var.set(f"Searching {drive_label}…")
+        try:
+            self.main_notebook.select(self.search_tab)
+        except Exception:
+            pass
+
+    def _search_worker(
+        self,
+        shard_path: Path,
+        drive_label: str,
+        query_parts: Dict[str, str],
+        cancel_event: threading.Event,
+    ) -> None:
+        migration_error: Optional[str] = None
+        use_name = True
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = sqlite3.connect(str(shard_path))
+            connection.row_factory = sqlite3.Row
+            try:
+                ensure_inventory_name(connection)
+            except sqlite3.OperationalError as exc:
+                message = str(exc)
+                if "no such table" in message.lower():
+                    self._search_queue.put({"type": "no_inventory", "drive": drive_label})
+                    return
+                migration_error = message
+                use_name = False
+            except Exception as exc:
+                migration_error = str(exc)
+                use_name = False
+            if cancel_event.is_set():
+                return
+            sql, params = build_search_query(query_parts["like"], use_name=use_name)
+            cursor = connection.cursor()
+            start = time.perf_counter()
+            rows = cursor.execute(sql, params).fetchall()
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            formatted = format_results(rows)
+            if cancel_event.is_set():
+                return
+            self._search_queue.put(
+                {
+                    "type": "results",
+                    "results": formatted,
+                    "elapsed_ms": elapsed_ms,
+                    "query": query_parts["text"],
+                    "drive": drive_label,
+                    "fallback": not use_name,
+                    "migration_error": migration_error,
+                }
+            )
+        except sqlite3.OperationalError as exc:
+            message = str(exc)
+            if "no such table" in message.lower():
+                self._search_queue.put({"type": "no_inventory", "drive": drive_label})
+            else:
+                self._search_queue.put({"type": "error", "message": message, "drive": drive_label})
+        except Exception as exc:
+            self._search_queue.put({"type": "error", "message": str(exc), "drive": drive_label})
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _poll_search_queue(self):
+        try:
+            while True:
+                payload = self._search_queue.get_nowait()
+                kind = payload.get("type")
+                if kind == "results":
+                    self._apply_search_results(payload)
+                elif kind == "error":
+                    self._handle_search_error(payload.get("message") or "Unknown error")
+                elif kind == "no_inventory":
+                    self._handle_search_no_inventory()
+        except queue.Empty:
+            pass
+        finally:
+            if not self._closing:
+                self.root.after(200, self._poll_search_queue)
+
+    def _apply_search_results(self, payload: dict) -> None:
+        self._search_thread = None
+        self._search_cancel = None
+        self._search_results = list(payload.get("results") or [])
+        if hasattr(self, "search_tree"):
+            self.search_tree.delete(*self.search_tree.get_children())
+        self._search_rows.clear()
+        for result in self._search_results:
+            values = (
+                result.get("name", ""),
+                result.get("category", ""),
+                result.get("size_display", ""),
+                result.get("modified_display", ""),
+                result.get("drive", ""),
+                result.get("path", ""),
+            )
+            item = self.search_tree.insert("", END, values=values)
+            self._search_rows[item] = result
+        elapsed_ms = payload.get("elapsed_ms")
+        total = len(self._search_results)
+        if elapsed_ms is not None:
+            status = f"Results: {total:,} (showing first 1,000) — elapsed {elapsed_ms} ms"
+        else:
+            status = f"Results: {total:,} (showing first 1,000)"
+        if payload.get("fallback"):
+            status += " — path-only search"
+        self.search_status_var.set(status)
+        migration_error = payload.get("migration_error")
+        if migration_error:
+            self.show_banner(
+                f"Search index migration failed: {migration_error}. Using path-only search.",
+                "ERROR",
+            )
+
+    def _handle_search_error(self, message: str) -> None:
+        self._search_thread = None
+        self._search_cancel = None
+        self.search_status_var.set(f"Error: {message}")
+        self.show_banner(f"Quick Search error: {message}", "ERROR")
+
+    def _handle_search_no_inventory(self) -> None:
+        self._search_thread = None
+        self._search_cancel = None
+        if hasattr(self, "search_tree"):
+            self.search_tree.delete(*self.search_tree.get_children())
+        self._search_rows.clear()
+        self._search_results = []
+        message = "No inventory found. Run Inventory first."
+        self.search_status_var.set(message)
+        self.show_banner(message, "ERROR")
+
+    def _get_selected_search_result(self) -> Optional[dict]:
+        if not hasattr(self, "search_tree"):
+            return None
+        selection = self.search_tree.selection()
+        if not selection:
+            return None
+        return self._search_rows.get(selection[0])
+
+    def _on_search_item_open(self, _event=None) -> None:
+        self._open_selected_search_path()
+
+    def _open_selected_search_path(self) -> None:
+        result = self._get_selected_search_result()
+        if not result:
+            return
+        path = result.get("path") or ""
+        if path:
+            self._open_path_in_explorer(path)
+
+    def _show_search_menu(self, event) -> None:
+        if not hasattr(self, "search_menu"):
+            return
+        try:
+            row = self.search_tree.identify_row(event.y)
+            if row:
+                self.search_tree.selection_set(row)
+            self.search_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.search_menu.grab_release()
+            except Exception:
+                pass
+
+    def _copy_search_path(self) -> None:
+        result = self._get_selected_search_result()
+        if not result:
+            return
+        path = result.get("path") or ""
+        if not path:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+            self.search_status_var.set("Copied path to clipboard.")
+        except Exception as exc:
+            messagebox.showerror("Quick Search", f"Unable to copy path: {exc}")
+
+    def _export_search_results(self) -> None:
+        if not self._search_results:
+            messagebox.showinfo("Quick Search", "No results to export.")
+            return
+        try:
+            exported = export_results(self._search_results, EXPORTS_DIR_PATH)
+        except Exception as exc:
+            messagebox.showerror("Quick Search", f"Export failed: {exc}")
+            return
+        names = ", ".join(path.name for path in exported)
+        summary = f"Exported {len(self._search_results):,} results to {names}"
+        self.search_status_var.set(summary)
+        self.show_banner(summary, "SUCCESS", action=("Open exports folder", self.open_exports_folder))
+        self._recent_export_paths.extend(exported)
+
+    def _open_path_in_explorer(self, path: str) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                normalized = os.path.normpath(path)
+                if os.path.exists(normalized):
+                    subprocess.Popen(["explorer", "/select,", normalized])
+                else:
+                    parent = os.path.dirname(normalized) or normalized
+                    subprocess.Popen(["explorer", parent])
+            elif sys.platform == "darwin":
+                folder = os.path.dirname(path) or path
+                subprocess.Popen(["open", folder])
+            else:
+                folder = os.path.dirname(path) or path
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as exc:
+            messagebox.showerror("Quick Search", f"Unable to open folder: {exc}")
+
+    def _update_search_drive_options(self, labels: List[str]) -> None:
+        unique = sorted({label for label in labels if label})
+        self._search_drive_options = unique
+        if not hasattr(self, "search_drive_combo"):
+            return
+        self.search_drive_combo["values"] = unique
+        current = self.search_drive_var.get()
+        if current in unique:
+            return
+        candidate = self._last_scan_label or self.label_var.get().strip()
+        selected = None
+        if current and current in unique:
+            selected = current
+        elif candidate and candidate in unique:
+            selected = candidate
+        elif unique:
+            selected = unique[0]
+        if selected:
+            self.search_drive_var.set(selected)
+        else:
+            self.search_drive_var.set("")
 
 
     def _set_status(self, message: str, level: str = "info"):
@@ -3490,13 +3922,18 @@ class App:
     def refresh_drives(self):
         self.tree.delete(*self.tree.get_children())
         con = sqlite3.connect(self.db_path.get()); cur = con.cursor()
+        drive_labels: list[str] = []
         for row in cur.execute("""
             SELECT id,label,mount_path,COALESCE(drive_type,''),COALESCE(notes,''),COALESCE(serial,''),COALESCE(model,''),
                    ROUND(COALESCE(total_bytes,0)/1024.0/1024/1024,2)
             FROM drives ORDER BY id ASC
         """):
             self.tree.insert("", END, values=row)
+            label_value = row[1] if len(row) > 1 else None
+            if isinstance(label_value, str) and label_value:
+                drive_labels.append(label_value)
         con.close()
+        self._update_search_drive_options(drive_labels)
 
     def refresh_jobs(self):
         self.jobs.delete(*self.jobs.get_children())
