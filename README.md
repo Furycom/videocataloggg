@@ -86,6 +86,18 @@ Vectors are serialized as float32 arrays so downstream tools can read them direc
 }
 ```
 
+### Semantic enrichment (experimental)
+
+VideoCatalog now reserves space in `settings.json` for semantic search and transcription workflows. The feature is disabled by default (`"semantic.enabled_default": false`) but the defaults make it easy to wire in local or hosted models later:
+
+- `semantic.phase_mode` mirrors the fingerprint pipeline (`off`, `during-scan`, `post-scan`). The default `post-scan` queues work after hashing so ingest stays responsive.
+- `semantic.models` lists pluggable assets: text/vision/video/audio embedders, a Whisper-compatible transcriber, and an optional reranker. Leave entries `null` to auto-discover from `<working_dir>/models` or set absolute/remote identifiers explicitly.
+- `semantic.index` captures vector index preferences (provider backend, on-disk path, metric, normalization, batch sizing) so background jobs can hydrate a FAISS/SQLite hybrid without extra flags.
+- `semantic.video` controls how many frames to sample, the stride in seconds, thumbnail resolution, and whether to prefer FFmpeg for decoding.
+- `semantic.transcribe` documents the speech pipeline (engine, default model size, optional language override, sampling temperature, timestamp hints, batching window).
+
+Saving settings through the GUI/CLI backfills missing keys so older `settings.json` files automatically pick up the semantic block without manual edits.
+
 If the ONNX model or runtime cannot be loaded the scanner posts a red banner, skips feature extraction, and continues hashing/metadata work as usual.
 
 ## GPU acceleration
