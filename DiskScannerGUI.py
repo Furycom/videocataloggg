@@ -2,12 +2,12 @@
 # Requiert: Python 3.10+, mediainfo (CLI), sqlite3 (intégré), smartctl/ffmpeg optionnels, blake3 (pip)
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
-import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser
+import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser, base64
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from functools import lru_cache
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Literal, Optional
 from types import SimpleNamespace
 
@@ -56,10 +56,11 @@ from search_util import (
     format_results,
     export_results,
 )
+from core.search_plus_client import SearchPlusClient
 import reports_util
 from tkinter import (
     Tk, Toplevel, StringVar, IntVar, END, N, S, E, W,
-    filedialog, messagebox, ttk, Menu, Spinbox
+    filedialog, messagebox, ttk, Menu, Spinbox, PhotoImage
 )
 from tkinter.scrolledtext import ScrolledText
 
@@ -90,11 +91,13 @@ if isinstance(_api_settings, dict):
     except (TypeError, ValueError):
         API_PORT_DEFAULT = 8756
     API_KEY_PRESENT_DEFAULT = bool(str(_api_settings.get("api_key") or "").strip())
+    API_KEY_VALUE_DEFAULT = str(_api_settings.get("api_key") or "").strip()
 else:
     API_ENABLED_DEFAULT = False
     API_HOST_DEFAULT = "127.0.0.1"
     API_PORT_DEFAULT = 8756
     API_KEY_PRESENT_DEFAULT = False
+    API_KEY_VALUE_DEFAULT = ""
 
 API_SCRIPT_PATH = Path(__file__).resolve().with_name("videocatalog_api.py")
 
@@ -1836,6 +1839,21 @@ class App:
         self._search_results: list[dict] = []
         self._search_drive_options: list[str] = []
 
+        self.search_plus_mode_var = StringVar(value="semantic")
+        self.search_plus_type_var = StringVar(value="Any")
+        self.search_plus_date_var = StringVar(value="Any time")
+        self.search_plus_status_var = StringVar(value="Search+ idle.")
+        self._search_plus_queue: "queue.Queue[dict]" = queue.Queue()
+        self._search_plus_thread: Optional[threading.Thread] = None
+        self._search_plus_cancel: Optional[threading.Event] = None
+        self._search_plus_rows: Dict[str, dict] = {}
+        self._search_plus_results: list[dict] = []
+        self._search_plus_images: list[Any] = []
+        self._search_plus_service_vars: Dict[str, StringVar] = {}
+        self._search_plus_token = 0
+        self._search_plus_progress_running = False
+        self._search_plus_placeholder_image: Optional[PhotoImage] = None
+
         self.reports_drive_var = StringVar()
         self.reports_topn_var = IntVar(value=20)
         self.reports_depth_var = IntVar(value=2)
@@ -1855,6 +1873,7 @@ class App:
         self.api_default_host = API_HOST_DEFAULT
         self.api_default_port = API_PORT_DEFAULT
         self.api_key_present = API_KEY_PRESENT_DEFAULT
+        self.api_key_value = API_KEY_VALUE_DEFAULT
         self.api_process: Optional[subprocess.Popen] = None
         self.api_monitor_thread: Optional[threading.Thread] = None
         self.api_running = False
@@ -1875,6 +1894,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self._poll_worker_queue)
         self.root.after(200, self._poll_search_queue)
+        self.root.after(200, self._poll_search_plus_queue)
         self.root.after(200, self._poll_reports_queue)
 
         for d in (SCANS_DIR, LOGS_DIR, EXPORTS_DIR, SHARDS_DIR):
@@ -2403,6 +2423,10 @@ class App:
         self.search_tab.columnconfigure(0, weight=1)
         self.search_tab.rowconfigure(1, weight=1)
         self.main_notebook.add(self.search_tab, text="Search")
+        self.search_plus_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.search_plus_tab.columnconfigure(0, weight=1)
+        self.search_plus_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.search_plus_tab, text="Search+")
         self.reports_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
         self.reports_tab.columnconfigure(0, weight=1)
         for idx in range(1, 6):
@@ -2411,6 +2435,7 @@ class App:
 
         self._build_dashboard_controls(self.dashboard_tab)
         self._build_search_tab(self.search_tab)
+        self._build_search_plus_tab(self.search_plus_tab)
         self._build_reports_tab(self.reports_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
@@ -2682,6 +2707,235 @@ class App:
         self.search_menu.add_command(label="Export results…", command=self._export_search_results)
 
         self._on_search_focus_out()
+
+    def _build_search_plus_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        controls = ttk.LabelFrame(parent, text="Search+", padding=(16, 16), style="Card.TLabelframe")
+        controls.grid(row=0, column=0, sticky="ew")
+        for col in range(3):
+            controls.columnconfigure(col, weight=1)
+        controls.columnconfigure(3, weight=0)
+
+        ttk.Label(controls, text="Query:").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.search_plus_query_widget = ScrolledText(controls, height=3, width=70, wrap="word")
+        self.search_plus_query_widget.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.search_plus_query_widget.bind("<Control-Return>", lambda _evt: self.start_search_plus())
+        self.search_plus_query_widget.bind("<Shift-Return>", lambda _evt: self.start_search_plus())
+        self.search_plus_button = ttk.Button(
+            controls,
+            text="Run Search+",
+            command=self.start_search_plus,
+            style="Accent.TButton",
+        )
+        self.search_plus_button.grid(row=1, column=3, sticky="nsw", padx=(12, 0))
+
+        ttk.Label(
+            controls,
+            text=(
+                "Combines semantic index, transcript snippets, and inventory keyword results."
+            ),
+            style="Subtle.TLabel",
+            wraplength=560,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        mode_frame = ttk.Frame(controls, style="Card.TFrame")
+        mode_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        ttk.Label(mode_frame, text="Mode:").grid(row=0, column=0, sticky="w")
+        mode_options = [
+            ("Semantic", "semantic"),
+            ("Keyword", "keyword"),
+            ("Hybrid", "hybrid"),
+        ]
+        for idx, (label, value) in enumerate(mode_options, start=1):
+            ttk.Radiobutton(
+                mode_frame,
+                text=label,
+                value=value,
+                variable=self.search_plus_mode_var,
+            ).grid(row=0, column=idx, sticky="w", padx=(12 if idx > 1 else 8, 0))
+
+        filters_frame = ttk.Frame(controls, style="Card.TFrame")
+        filters_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        filters_frame.columnconfigure(1, weight=1)
+        filters_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(filters_frame, text="Type:").grid(row=0, column=0, sticky="w")
+        type_values = ["Any", "Video", "Audio", "Image", "Document", "Archive", "Other"]
+        self.search_plus_type_combo = ttk.Combobox(
+            filters_frame,
+            textvariable=self.search_plus_type_var,
+            state="readonly",
+            values=type_values,
+            width=16,
+        )
+        if self.search_plus_type_var.get() not in type_values:
+            self.search_plus_type_var.set("Any")
+        self.search_plus_type_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        ttk.Label(filters_frame, text="Date:").grid(row=0, column=2, sticky="w", padx=(16, 0))
+        date_values = [
+            "Any time",
+            "Last 7 days",
+            "Last 30 days",
+            "Last 180 days",
+            "Last 365 days",
+        ]
+        self.search_plus_date_combo = ttk.Combobox(
+            filters_frame,
+            textvariable=self.search_plus_date_var,
+            state="readonly",
+            values=date_values,
+            width=18,
+        )
+        if self.search_plus_date_var.get() not in date_values:
+            self.search_plus_date_var.set("Any time")
+        self.search_plus_date_combo.grid(row=0, column=3, sticky="w", padx=(8, 0))
+
+        statuses_frame = ttk.Frame(controls, style="Card.TFrame")
+        statuses_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        statuses_frame.columnconfigure(0, weight=1)
+        self._search_plus_service_vars.clear()
+        for idx, (key, label_text) in enumerate(
+            (
+                ("semantic", "Semantic index"),
+                ("transcripts", "Transcripts"),
+                ("inventory", "Inventory"),
+            )
+        ):
+            var = StringVar(value=f"{label_text} — idle.")
+            self._search_plus_service_vars[key] = var
+            ttk.Label(statuses_frame, textvariable=var, style="Subtle.TLabel").grid(
+                row=idx,
+                column=0,
+                sticky="w",
+                pady=(0 if idx == 0 else 2, 0),
+            )
+
+        self.search_plus_progress = ttk.Progressbar(controls, mode="indeterminate")
+        self.search_plus_progress.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+
+        if self._search_plus_placeholder_image is None:
+            try:
+                placeholder = PhotoImage(width=96, height=54)
+                placeholder.put("#1f2937", to=(0, 0, 95, 53))
+                self._search_plus_placeholder_image = placeholder
+            except Exception:
+                self._search_plus_placeholder_image = None
+
+        results_frame = ttk.LabelFrame(
+            parent,
+            text="Results",
+            padding=(16, 12),
+            style="Card.TLabelframe",
+        )
+        results_frame.grid(row=1, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+
+        columns = ("title", "score", "drive", "sources", "snippet", "path")
+        self.search_plus_tree = ttk.Treeview(
+            results_frame,
+            columns=columns,
+            show="tree headings",
+            height=12,
+            style="Card.Treeview",
+        )
+        self.search_plus_tree.heading("#0", text="Preview")
+        self.search_plus_tree.column("#0", anchor="center", width=96, stretch=False)
+        headings = {
+            "title": "Title",
+            "score": "Score",
+            "drive": "Drive",
+            "sources": "Sources",
+            "snippet": "Snippet",
+            "path": "Path",
+        }
+        widths = {
+            "title": 260,
+            "score": 80,
+            "drive": 110,
+            "sources": 140,
+            "snippet": 360,
+            "path": 320,
+        }
+        for key in columns:
+            self.search_plus_tree.heading(key, text=headings[key])
+            anchor = W if key in {"title", "drive", "sources", "snippet", "path"} else E
+            self.search_plus_tree.column(key, anchor=anchor, width=widths[key], stretch=True)
+        search_plus_scroll = ttk.Scrollbar(results_frame, orient="vertical", command=self.search_plus_tree.yview)
+        self.search_plus_tree.configure(yscrollcommand=search_plus_scroll.set)
+        self.search_plus_tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        search_plus_scroll.grid(row=0, column=1, sticky=(N, S))
+
+        self.search_plus_tree.bind("<Double-1>", self._on_search_plus_item_open)
+        self.search_plus_tree.bind("<Return>", self._on_search_plus_item_open)
+        self.search_plus_tree.bind("<<TreeviewSelect>>", self._on_search_plus_selection)
+        self.search_plus_tree.bind("<Button-3>", self._show_search_plus_menu)
+        self.search_plus_tree.bind("<Control-Button-1>", self._show_search_plus_menu)
+
+        ttk.Label(
+            results_frame,
+            textvariable=self.search_plus_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        action_frame = ttk.Frame(results_frame, style="Card.TFrame")
+        action_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for col in range(4):
+            action_frame.columnconfigure(col, weight=0)
+        action_frame.columnconfigure(4, weight=1)
+
+        self.search_plus_open_button = ttk.Button(
+            action_frame,
+            text="Open folder",
+            command=self._open_selected_search_plus_path,
+            state="disabled",
+        )
+        self.search_plus_open_button.grid(row=0, column=0, sticky="w")
+        self.search_plus_copy_button = ttk.Button(
+            action_frame,
+            text="Copy path",
+            command=self._copy_search_plus_path,
+            state="disabled",
+        )
+        self.search_plus_copy_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.search_plus_transcript_button = ttk.Button(
+            action_frame,
+            text="Open transcript",
+            command=self._open_selected_search_plus_transcript,
+            state="disabled",
+        )
+        self.search_plus_transcript_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.search_plus_inventory_button = ttk.Button(
+            action_frame,
+            text="Open inventory detail",
+            command=self._open_selected_search_plus_inventory,
+            state="disabled",
+        )
+        self.search_plus_inventory_button.grid(row=0, column=3, sticky="w", padx=(8, 0))
+
+        self.search_plus_menu = Menu(self.search_plus_tree, tearoff=0)
+        self.search_plus_menu.add_command(
+            label="Open folder",
+            command=self._open_selected_search_plus_path,
+        )
+        self.search_plus_menu.add_command(
+            label="Copy path",
+            command=self._copy_search_plus_path,
+        )
+        self.search_plus_menu.add_command(
+            label="Open transcript",
+            command=self._open_selected_search_plus_transcript,
+        )
+        self.search_plus_menu.add_command(
+            label="Open inventory detail",
+            command=self._open_selected_search_plus_inventory,
+        )
+
+        self._on_search_plus_selection()
 
     def _build_reports_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3172,6 +3426,440 @@ class App:
                 subprocess.Popen(["xdg-open", folder])
         except Exception as exc:
             messagebox.showerror("Quick Search", f"Unable to open folder: {exc}")
+
+    # ----- Search+ helpers -------------------------------------------------
+    def start_search_plus(self) -> None:
+        if not hasattr(self, "search_plus_query_widget"):
+            return
+        query = self.search_plus_query_widget.get("1.0", "end").strip()
+        if len(query) < 3:
+            message = "Type at least 3 characters."
+            self.search_plus_status_var.set(message)
+            self.show_banner(message, "INFO")
+            return
+
+        if self._search_plus_thread and self._search_plus_thread.is_alive():
+            if self._search_plus_cancel:
+                self._search_plus_cancel.set()
+
+        self._search_plus_token += 1
+        token = self._search_plus_token
+        self._search_plus_cancel = threading.Event()
+        mode = (self.search_plus_mode_var.get() or "semantic").strip().lower()
+        type_filter = self.search_plus_type_var.get() or "Any"
+        date_filter = self.search_plus_date_var.get() or "Any time"
+
+        self._clear_search_plus_results()
+        self._start_search_plus_progress()
+        status_labels = {
+            "semantic": "Semantic index",
+            "transcripts": "Transcripts",
+            "inventory": "Inventory",
+        }
+        for key, var in self._search_plus_service_vars.items():
+            label = status_labels.get(key, key.title())
+            var.set(f"{label} — queued…")
+
+        self.search_plus_status_var.set("Searching…")
+        try:
+            self.search_plus_button.configure(state="disabled")
+        except Exception:
+            pass
+
+        self._search_plus_thread = threading.Thread(
+            target=self._search_plus_worker,
+            args=(token, query, mode, type_filter, date_filter, self._search_plus_cancel),
+            daemon=True,
+        )
+        self._search_plus_thread.start()
+
+    def _clear_search_plus_results(self) -> None:
+        self._search_plus_results = []
+        self._search_plus_rows.clear()
+        self._search_plus_images.clear()
+        if hasattr(self, "search_plus_tree"):
+            try:
+                self.search_plus_tree.delete(*self.search_plus_tree.get_children())
+            except Exception:
+                pass
+        self._on_search_plus_selection()
+
+    def _search_plus_worker(
+        self,
+        token: int,
+        query: str,
+        mode: str,
+        type_filter: str,
+        date_filter: str,
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        base_url, api_key = self._resolve_search_plus_endpoint()
+        if not base_url:
+            self._search_plus_queue.put(
+                {
+                    "type": "search_plus_error",
+                    "token": token,
+                    "message": "Configure the API host before using Search+.",
+                }
+            )
+            return
+        normalized_type = (type_filter or "").strip().lower()
+        if normalized_type in {"", "any"}:
+            normalized_type = ""
+        since_iso = self._resolve_search_plus_since(date_filter)
+        drives = list(self._search_drive_options)
+
+        def _status_callback(service: str, state: str, meta: Dict[str, Any]) -> None:
+            self._search_plus_queue.put(
+                {
+                    "type": "search_plus_status",
+                    "token": token,
+                    "service": service,
+                    "state": state,
+                    "meta": dict(meta or {}),
+                }
+            )
+
+        client = SearchPlusClient(
+            base_url,
+            api_key=api_key,
+            timeout=12.0,
+        )
+        try:
+            response = client.search(
+                query,
+                mode=mode,
+                type_filter=normalized_type or None,
+                since=since_iso,
+                drives=drives,
+                limit=60,
+                cancel_event=cancel_event,
+                status_callback=_status_callback,
+            )
+        except Exception as exc:
+            self._search_plus_queue.put(
+                {
+                    "type": "search_plus_error",
+                    "token": token,
+                    "message": str(exc) or exc.__class__.__name__,
+                }
+            )
+            return
+
+        if cancel_event and cancel_event.is_set():
+            self._search_plus_queue.put({"type": "search_plus_cancelled", "token": token})
+            return
+
+        self._search_plus_queue.put(
+            {
+                "type": "search_plus_results",
+                "token": token,
+                "results": [asdict(result) for result in response.results],
+                "durations": response.durations_ms,
+                "errors": response.errors,
+                "source_counts": response.source_counts,
+            }
+        )
+
+    def _poll_search_plus_queue(self):
+        try:
+            while True:
+                payload = self._search_plus_queue.get_nowait()
+                token = payload.get("token")
+                if token is not None and token != self._search_plus_token:
+                    continue
+                kind = payload.get("type")
+                if kind == "search_plus_status":
+                    self._update_search_plus_service_status(
+                        payload.get("service"),
+                        payload.get("state"),
+                        payload.get("meta") or {},
+                    )
+                elif kind == "search_plus_results":
+                    self._apply_search_plus_results(payload)
+                elif kind == "search_plus_error":
+                    self._handle_search_plus_error(payload.get("message") or "Unknown error")
+                elif kind == "search_plus_cancelled":
+                    self._finalize_search_plus(cancelled=True)
+        except queue.Empty:
+            pass
+        finally:
+            if not self._closing:
+                self.root.after(200, self._poll_search_plus_queue)
+
+    def _finalize_search_plus(self, *, cancelled: bool = False) -> None:
+        self._stop_search_plus_progress()
+        self._search_plus_thread = None
+        self._search_plus_cancel = None
+        try:
+            self.search_plus_button.configure(state="normal")
+        except Exception:
+            pass
+        if cancelled:
+            self.search_plus_status_var.set("Search cancelled.")
+
+    def _update_search_plus_service_status(
+        self,
+        service: Optional[str],
+        state: Optional[str],
+        meta: Dict[str, Any],
+    ) -> None:
+        if not service:
+            return
+        var = self._search_plus_service_vars.get(service)
+        if not var:
+            return
+        label_map = {
+            "semantic": "Semantic index",
+            "transcripts": "Transcripts",
+            "inventory": "Inventory",
+        }
+        label = label_map.get(service, service.title())
+        normalized = (state or "").lower()
+        if normalized == "running":
+            text = f"{label} — running…"
+        elif normalized == "done":
+            count = meta.get("count")
+            elapsed = meta.get("elapsed_ms")
+            if elapsed is not None:
+                text = f"{label} — {int(count or 0):,} hits ({int(elapsed)} ms)"
+            else:
+                text = f"{label} — {int(count or 0):,} hits"
+        elif normalized == "error":
+            message = str(meta.get("message") or "error")
+            text = f"{label} — error: {message}"
+        elif normalized == "cancelled":
+            text = f"{label} — cancelled"
+        elif normalized == "queued":
+            text = f"{label} — queued…"
+        else:
+            text = f"{label} — {state or 'idle'}"
+        var.set(text)
+
+    def _apply_search_plus_results(self, payload: Dict[str, Any]) -> None:
+        self._finalize_search_plus(cancelled=False)
+        self._search_plus_results = list(payload.get("results") or [])
+        durations = payload.get("durations") or {}
+        errors = payload.get("errors") or {}
+        counts = payload.get("source_counts") or {}
+
+        if hasattr(self, "search_plus_tree"):
+            try:
+                self.search_plus_tree.delete(*self.search_plus_tree.get_children())
+            except Exception:
+                pass
+        self._search_plus_rows.clear()
+        self._search_plus_images.clear()
+
+        for result in self._search_plus_results:
+            thumbnail = self._decode_search_plus_thumbnail(result.get("thumbnail"))
+            if thumbnail is not None:
+                self._search_plus_images.append(thumbnail)
+            elif self._search_plus_placeholder_image is not None:
+                thumbnail = self._search_plus_placeholder_image
+            sources = result.get("extras", {}).get("sources") or [result.get("source")]
+            source_label = ", ".join(
+                sorted({str(source).title() for source in sources if source})
+            ) or "—"
+            try:
+                score_value = float(result.get("score", 0.0))
+            except (TypeError, ValueError):
+                score_value = 0.0
+            score_text = f"{score_value:.3f}"
+            title = result.get("title") or os.path.basename(result.get("path") or "")
+            snippet = self._trim_snippet(result.get("snippet") or "")
+            values = (
+                title,
+                score_text,
+                result.get("drive") or "",
+                source_label,
+                snippet,
+                result.get("path") or "",
+            )
+            image_param = thumbnail if thumbnail is not None else ""
+            try:
+                item = self.search_plus_tree.insert(
+                    "",
+                    END,
+                    text="",
+                    image=image_param,
+                    values=values,
+                )
+            except Exception:
+                item = self.search_plus_tree.insert("", END, text="", values=values)
+            self._search_plus_rows[item] = result
+
+        summary_parts = [f"Results: {len(self._search_plus_results):,}"]
+        if durations:
+            timings = ", ".join(f"{key} {int(value)} ms" for key, value in durations.items())
+            summary_parts.append(f"timings: {timings}")
+        if counts:
+            breakdown = ", ".join(f"{key} {value}" for key, value in counts.items())
+            summary_parts.append(f"sources: {breakdown}")
+        if errors:
+            issues = "; ".join(f"{key}: {msg}" for key, msg in errors.items())
+            summary_parts.append(f"errors: {issues}")
+            self.show_banner(f"Search+ warnings: {issues}", "WARNING")
+        self.search_plus_status_var.set(" — ".join(summary_parts))
+        self._on_search_plus_selection()
+
+    def _handle_search_plus_error(self, message: str) -> None:
+        self._finalize_search_plus(cancelled=False)
+        self.search_plus_status_var.set(f"Error: {message}")
+        self.show_banner(f"Search+ error: {message}", "ERROR")
+
+    def _get_selected_search_plus_result(self) -> Optional[dict]:
+        if not hasattr(self, "search_plus_tree"):
+            return None
+        selection = self.search_plus_tree.selection()
+        if not selection:
+            return None
+        return self._search_plus_rows.get(selection[0])
+
+    def _on_search_plus_item_open(self, _event=None) -> None:
+        self._open_selected_search_plus_path()
+
+    def _on_search_plus_selection(self, _event=None) -> None:
+        result = self._get_selected_search_plus_result()
+        has_path = bool(result and result.get("path"))
+        has_transcript = bool(result and result.get("transcript_url"))
+        has_inventory = bool(result and result.get("inventory_url"))
+        state = "normal" if has_path else "disabled"
+        try:
+            self.search_plus_open_button.configure(state=state)
+            self.search_plus_copy_button.configure(state=state)
+            self.search_plus_transcript_button.configure(
+                state="normal" if has_transcript else "disabled"
+            )
+            self.search_plus_inventory_button.configure(
+                state="normal" if has_inventory else "disabled"
+            )
+        except Exception:
+            pass
+
+    def _open_selected_search_plus_path(self) -> None:
+        result = self._get_selected_search_plus_result()
+        if not result:
+            return
+        path = result.get("path") or ""
+        if path:
+            self._open_path_in_explorer(path)
+
+    def _copy_search_plus_path(self) -> None:
+        result = self._get_selected_search_plus_result()
+        if not result:
+            return
+        path = result.get("path") or ""
+        if not path:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+            self.search_plus_status_var.set("Copied path to clipboard.")
+        except Exception as exc:
+            messagebox.showerror("Search+", f"Unable to copy path: {exc}")
+
+    def _open_selected_search_plus_transcript(self) -> None:
+        result = self._get_selected_search_plus_result()
+        if not result:
+            return
+        url = result.get("transcript_url")
+        if url:
+            try:
+                webbrowser.open(url)
+            except Exception as exc:
+                messagebox.showerror("Search+", f"Unable to open transcript: {exc}")
+
+    def _open_selected_search_plus_inventory(self) -> None:
+        result = self._get_selected_search_plus_result()
+        if not result:
+            return
+        url = result.get("inventory_url")
+        if url:
+            try:
+                webbrowser.open(url)
+            except Exception as exc:
+                messagebox.showerror("Search+", f"Unable to open inventory detail: {exc}")
+
+    def _show_search_plus_menu(self, event) -> None:
+        if not hasattr(self, "search_plus_menu"):
+            return
+        try:
+            row = self.search_plus_tree.identify_row(event.y)
+            if row:
+                self.search_plus_tree.selection_set(row)
+            self.search_plus_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.search_plus_menu.grab_release()
+            except Exception:
+                pass
+
+    def _resolve_search_plus_endpoint(self) -> tuple[Optional[str], Optional[str]]:
+        endpoint = self.api_endpoint
+        if endpoint:
+            return endpoint, self.api_key_value or None
+        base = f"http://{self.api_default_host}:{self.api_default_port}"
+        return base, self.api_key_value or None
+
+    def _resolve_search_plus_since(self, value: str) -> Optional[str]:
+        text = (value or "").strip().lower()
+        if text.startswith("last 7"):
+            days = 7
+        elif text.startswith("last 30"):
+            days = 30
+        elif text.startswith("last 180"):
+            days = 180
+        elif text.startswith("last 365"):
+            days = 365
+        else:
+            return None
+        try:
+            threshold = datetime.now().astimezone() - timedelta(days=days)
+        except Exception:
+            threshold = datetime.now() - timedelta(days=days)
+        return threshold.isoformat(timespec="seconds")
+
+    def _start_search_plus_progress(self) -> None:
+        if not hasattr(self, "search_plus_progress"):
+            return
+        try:
+            if not self._search_plus_progress_running:
+                self.search_plus_progress.start(12)
+                self._search_plus_progress_running = True
+        except Exception:
+            self._search_plus_progress_running = False
+
+    def _stop_search_plus_progress(self) -> None:
+        if not hasattr(self, "search_plus_progress"):
+            return
+        if not self._search_plus_progress_running:
+            return
+        try:
+            self.search_plus_progress.stop()
+        except Exception:
+            pass
+        self._search_plus_progress_running = False
+
+    def _decode_search_plus_thumbnail(self, data: Optional[str]) -> Optional[PhotoImage]:
+        if not data:
+            return None
+        try:
+            text = str(data)
+            if text.startswith("data:") and "," in text:
+                text = text.split(",", 1)[1]
+            binary = base64.b64decode(text)
+            encoded = base64.b64encode(binary).decode("ascii")
+            return PhotoImage(data=encoded)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _trim_snippet(snippet: str, limit: int = 220) -> str:
+        text = str(snippet or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1].rstrip() + "…"
 
     def _update_search_drive_options(self, labels: List[str]) -> None:
         unique = sorted({label for label in labels if label})
@@ -4834,6 +5522,9 @@ class App:
                 pass
         self._active_toasts.clear()
         unregister_log_listener(self._log_enqueue)
+        if self._search_plus_thread and self._search_plus_thread.is_alive():
+            if self._search_plus_cancel:
+                self._search_plus_cancel.set()
         if self.worker and self.worker.is_alive():
             if self.stop_evt:
                 self.stop_evt.set()
