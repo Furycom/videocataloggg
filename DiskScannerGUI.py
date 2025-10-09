@@ -2,7 +2,7 @@
 # Requiert: Python 3.10+, mediainfo (CLI), sqlite3 (intégré), smartctl/ffmpeg optionnels, blake3 (pip)
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
-import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser, base64
+import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser, base64, csv
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, asdict
 from functools import lru_cache
@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import scan_drive
 from structure import load_structure_settings as load_structure_config
+from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
+from robust import CancellationToken
 
 from db_maint import (
     MaintenanceOptions,
@@ -1777,6 +1779,29 @@ class App:
         self.structure_status_var = StringVar(value="Structure profiling idle.")
         self.structure_summary_var = StringVar(value="No structure data available yet.")
         self._structure_action = "idle"
+        doc_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_doc = _SETTINGS.get("docpreview")
+            if isinstance(maybe_doc, dict):
+                doc_cfg = maybe_doc
+        self.docpreview_config = DocPreviewSettings.from_mapping(doc_cfg)
+        self.docpreview_enable_var = IntVar(value=1 if self.docpreview_config.enable else 0)
+        self.docpreview_max_pages_var = IntVar(value=self.docpreview_config.max_pages)
+        self.docpreview_max_chars_var = IntVar(value=self.docpreview_config.max_chars)
+        self.docpreview_ocr_var = IntVar(value=1 if self.docpreview_config.ocr_enable else 0)
+        if self.docpreview_config.summary_target_tokens <= 80:
+            summary_mode = "short"
+        elif self.docpreview_config.summary_target_tokens >= 180:
+            summary_mode = "long"
+        else:
+            summary_mode = "medium"
+        self.docpreview_summary_mode = StringVar(value=summary_mode)
+        self.docpreview_status_var = StringVar(value="Doc preview idle.")
+        self.docpreview_progress_total = IntVar(value=0)
+        self.docpreview_progress_done = IntVar(value=0)
+        self.docpreview_worker: Optional[threading.Thread] = None
+        self.docpreview_cancel: Optional[CancellationToken] = None
+        self.docpreview_rows: Dict[str, dict] = {}
 
         # inputs
         self.path_var  = StringVar()
@@ -2442,12 +2467,17 @@ class App:
         self.structure_tab.columnconfigure(0, weight=1)
         self.structure_tab.rowconfigure(1, weight=1)
         self.main_notebook.add(self.structure_tab, text="Structure")
+        self.docpreview_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.docpreview_tab.columnconfigure(0, weight=1)
+        self.docpreview_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.docpreview_tab, text="Docs")
 
         self._build_dashboard_controls(self.dashboard_tab)
         self._build_search_tab(self.search_tab)
         self._build_search_plus_tab(self.search_plus_tab)
         self._build_reports_tab(self.reports_tab)
         self._build_structure_tab(self.structure_tab)
+        self._build_docpreview_tab(self.docpreview_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3136,6 +3166,450 @@ class App:
             textvariable=self.structure_summary_var,
             style="Subtle.TLabel",
         ).grid(row=0, column=0, sticky="w")
+
+    def _build_docpreview_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        controls = ttk.LabelFrame(
+            parent,
+            text="Doc Preview (PDF/EPUB)",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        controls.grid(row=0, column=0, sticky="ew")
+        for col in range(4):
+            controls.columnconfigure(col, weight=1 if col in (1, 3) else 0)
+
+        ttk.Checkbutton(
+            controls,
+            text="Doc Preview (PDF/EPUB)",
+            variable=self.docpreview_enable_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(controls, text="Max pages:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        pages_spin = Spinbox(
+            controls,
+            from_=1,
+            to=24,
+            textvariable=self.docpreview_max_pages_var,
+            width=6,
+            justify="center",
+        )
+        pages_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        pages_spin.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+
+        ttk.Label(controls, text="Max chars:").grid(row=1, column=2, sticky="e", pady=(12, 0))
+        chars_spin = Spinbox(
+            controls,
+            from_=2000,
+            to=60000,
+            increment=1000,
+            textvariable=self.docpreview_max_chars_var,
+            width=8,
+            justify="center",
+        )
+        chars_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        chars_spin.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(12, 0))
+
+        ttk.Checkbutton(
+            controls,
+            text="Enable OCR for scanned PDFs",
+            variable=self.docpreview_ocr_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        summary_box = ttk.LabelFrame(
+            controls,
+            text="Summary length",
+            padding=(8, 4),
+            style="Card.TLabelframe",
+        )
+        summary_box.grid(row=2, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(12, 0))
+        for idx, (mode, label) in enumerate(("short", "Short"), ("medium", "Medium"), ("long", "Long")):
+            ttk.Radiobutton(
+                summary_box,
+                text=label,
+                value=mode,
+                variable=self.docpreview_summary_mode,
+            ).grid(row=0, column=idx, sticky="w", padx=(4 if idx else 0, 4))
+
+        actions = ttk.Frame(controls, style="Card.TFrame")
+        actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        actions.columnconfigure(3, weight=1)
+        ttk.Button(actions, text="Run preview", command=self.start_docpreview_job, style="Accent.TButton").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(actions, text="Cancel", command=self.cancel_docpreview_job).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(actions, text="Refresh results", command=self.refresh_docpreview_results).grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
+        )
+
+        progress_frame = ttk.Frame(parent, style="Card.TFrame", padding=(16, 12))
+        progress_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        progress_frame.columnconfigure(0, weight=1)
+        self.docpreview_progress_bar = ttk.Progressbar(
+            progress_frame,
+            mode="determinate",
+            maximum=1,
+            value=0,
+        )
+        self.docpreview_progress_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            progress_frame,
+            textvariable=self.docpreview_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.docpreview_log = ScrolledText(progress_frame, height=6, wrap="word")
+        self.docpreview_log.configure(
+            state="disabled",
+            background=self.colors["content"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+        )
+        self.docpreview_log.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        results = ttk.LabelFrame(
+            parent,
+            text="Latest previews",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        results.grid(row=2, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(0, weight=1)
+        columns = ("path", "doc_type", "lang", "pages", "keywords", "summary", "updated")
+        self.docpreview_tree = ttk.Treeview(
+            results,
+            columns=columns,
+            show="headings",
+            height=12,
+            style="Card.Treeview",
+        )
+        headings = {
+            "path": "Path",
+            "doc_type": "Type",
+            "lang": "Lang",
+            "pages": "Pages",
+            "keywords": "Keywords",
+            "summary": "Summary",
+            "updated": "Updated",
+        }
+        widths = {
+            "path": 320,
+            "doc_type": 80,
+            "lang": 60,
+            "pages": 70,
+            "keywords": 200,
+            "summary": 320,
+            "updated": 150,
+        }
+        for key in columns:
+            self.docpreview_tree.heading(key, text=headings[key])
+            anchor = W if key in {"path", "keywords", "summary"} else E
+            self.docpreview_tree.column(key, width=widths[key], anchor=anchor, stretch=True)
+        self.docpreview_tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        preview_scroll = ttk.Scrollbar(results, orient="vertical", command=self.docpreview_tree.yview)
+        self.docpreview_tree.configure(yscrollcommand=preview_scroll.set)
+        preview_scroll.grid(row=0, column=1, sticky=(N, S))
+        self.docpreview_tree.bind("<Double-1>", lambda _event: self.open_docpreview_folder())
+
+        actions_row = ttk.Frame(parent, style="Card.TFrame")
+        actions_row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(actions_row, text="Open folder", command=self.open_docpreview_folder).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(actions_row, text="Copy path", command=self.copy_docpreview_path).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(actions_row, text="Export results…", command=self.export_docpreview_results).grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
+        )
+
+        self.refresh_docpreview_results()
+
+    def _docpreview_summary_tokens(self) -> int:
+        mode = (self.docpreview_summary_mode.get() or "medium").strip().lower()
+        mapping = {"short": 80, "medium": 120, "long": 200}
+        return mapping.get(mode, 120)
+
+    def _docpreview_payload(self) -> Dict[str, object]:
+        payload = {
+            "enable": bool(self.docpreview_enable_var.get()),
+            "max_pages": int(self.docpreview_max_pages_var.get()),
+            "max_chars": int(self.docpreview_max_chars_var.get()),
+            "sample_strategy": self.docpreview_config.sample_strategy,
+            "ocr_enable": bool(self.docpreview_ocr_var.get()),
+            "ocr_max_pages": self.docpreview_config.ocr_max_pages,
+            "ocr_timeout_s": self.docpreview_config.ocr_timeout_s,
+            "summary_target_tokens": self._docpreview_summary_tokens(),
+            "keywords_topk": self.docpreview_config.keywords_topk,
+            "gpu_allowed": self.docpreview_config.gpu_allowed,
+        }
+        return payload
+
+    def _docpreview_gentle_sleep(self) -> float:
+        mount = self.path_var.get().strip() or "."
+        settings_dict = _SETTINGS if isinstance(_SETTINGS, dict) else {}
+        try:
+            perf_cfg = resolve_performance_config(mount, settings=settings_dict)
+            return 0.05 if perf_cfg.gentle_io else 0.0
+        except Exception:
+            return 0.0
+
+    def _reset_docpreview_progress(self) -> None:
+        self.docpreview_progress_total.set(0)
+        self.docpreview_progress_done.set(0)
+        if hasattr(self, "docpreview_progress_bar"):
+            self.docpreview_progress_bar.configure(maximum=1, value=0)
+        if hasattr(self, "docpreview_log"):
+            self.docpreview_log.configure(state="normal")
+            self.docpreview_log.delete("1.0", "end")
+            self.docpreview_log.configure(state="disabled")
+
+    def _append_docpreview_log(self, line: str) -> None:
+        if not hasattr(self, "docpreview_log"):
+            return
+        self.docpreview_log.configure(state="normal")
+        self.docpreview_log.insert("end", line + "\n")
+        self.docpreview_log.see("end")
+        self.docpreview_log.configure(state="disabled")
+
+    def start_docpreview_job(self) -> None:
+        if self.docpreview_worker and self.docpreview_worker.is_alive():
+            messagebox.showwarning("Doc Preview", "A doc preview job is already running.")
+            return
+        if not bool(self.docpreview_enable_var.get()):
+            messagebox.showinfo("Doc Preview", "Enable the Doc Preview toggle before running.")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showerror("Doc Preview", "Fill the Disk Label field first.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror("Doc Preview", f"Shard database not found for '{label}'.")
+            return
+        payload = self._docpreview_payload()
+        overrides = dict(payload)
+        overrides["enable"] = True
+        settings = self.docpreview_config.with_overrides(**overrides)
+        self.docpreview_config = settings
+        try:
+            update_settings(WORKING_DIR_PATH, docpreview=payload)
+        except Exception:
+            pass
+        if isinstance(_SETTINGS, dict):
+            _SETTINGS["docpreview"] = dict(payload)
+        self._reset_docpreview_progress()
+        self.docpreview_status_var.set("Doc preview running…")
+        gentle_sleep = self._docpreview_gentle_sleep()
+        cancel_token = CancellationToken()
+        self.docpreview_cancel = cancel_token
+
+        def progress(payload: Dict[str, object]) -> None:
+            self.worker_queue.put({"type": "docpreview-progress", "payload": payload})
+
+        def worker() -> None:
+            try:
+                self.worker_queue.put({"type": "docpreview-log", "line": f"Starting doc preview for {label}…"})
+                gpu_settings = _SETTINGS.get("gpu") if isinstance(_SETTINGS, dict) else {}
+                summary = run_docpreview_for_shard(
+                    shard,
+                    settings=settings,
+                    gpu_settings=gpu_settings,
+                    progress_callback=progress,
+                    cancellation=cancel_token,
+                    gentle_sleep=gentle_sleep,
+                )
+                self.worker_queue.put(
+                    {
+                        "type": "docpreview-complete",
+                        "summary": {
+                            "processed": summary.processed,
+                            "skipped": summary.skipped,
+                            "errors": summary.errors,
+                            "updated": summary.updated,
+                            "elapsed_s": summary.elapsed_s,
+                        },
+                    }
+                )
+            except Exception as exc:
+                self.worker_queue.put({"type": "docpreview-complete", "error": str(exc)})
+
+        self.docpreview_worker = threading.Thread(target=worker, daemon=True)
+        self.docpreview_worker.start()
+
+    def cancel_docpreview_job(self) -> None:
+        if self.docpreview_cancel:
+            self.docpreview_cancel.set()
+            self.docpreview_status_var.set("Cancelling doc preview…")
+
+    def _get_selected_docpreview_row(self) -> Optional[dict]:
+        if not hasattr(self, "docpreview_tree"):
+            return None
+        selection = self.docpreview_tree.selection()
+        if not selection:
+            return None
+        return self.docpreview_rows.get(selection[0])
+
+    def refresh_docpreview_results(self) -> None:
+        if not hasattr(self, "docpreview_tree"):
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            self.docpreview_rows.clear()
+            self.docpreview_tree.delete(*self.docpreview_tree.get_children())
+            self.docpreview_status_var.set("Doc preview idle. Select a drive to view results.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            self.docpreview_rows.clear()
+            self.docpreview_tree.delete(*self.docpreview_tree.get_children())
+            self.docpreview_status_var.set("Doc preview tables not found for this drive.")
+            return
+        conn = sqlite3.connect(str(shard))
+        conn.row_factory = sqlite3.Row
+        rows: list[sqlite3.Row]
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='docs_preview'"
+            )
+            if cur.fetchone() is None:
+                self.docpreview_tree.delete(*self.docpreview_tree.get_children())
+                self.docpreview_rows.clear()
+                self.docpreview_status_var.set("Doc preview has not been run yet for this drive.")
+                return
+            cur.execute(
+                """
+                SELECT path, doc_type, lang, pages_sampled, chars_used, keywords, summary, updated_utc
+                FROM docs_preview
+                ORDER BY updated_utc DESC
+                LIMIT 200
+                """
+            )
+            rows = cur.fetchall()
+        except sqlite3.DatabaseError as exc:
+            self.docpreview_tree.delete(*self.docpreview_tree.get_children())
+            self.docpreview_rows.clear()
+            self.docpreview_status_var.set(f"Doc preview query failed: {exc}")
+            return
+        finally:
+            conn.close()
+        self.docpreview_tree.delete(*self.docpreview_tree.get_children())
+        self.docpreview_rows.clear()
+        for row in rows:
+            path = row["path"]
+            summary = row["summary"] or ""
+            if len(summary) > 200:
+                summary_display = summary[:197] + "…"
+            else:
+                summary_display = summary
+            keywords_text = row["keywords"] or ""
+            if isinstance(keywords_text, str):
+                keywords_display = ", ".join(
+                    [kw.strip() for kw in keywords_text.split(",") if kw.strip()]
+                )
+            else:
+                keywords_display = str(keywords_text)
+            values = (
+                path,
+                row["doc_type"] or "",
+                row["lang"] or "",
+                row["pages_sampled"] or 0,
+                keywords_display,
+                summary_display,
+                row["updated_utc"] or "",
+            )
+            item = self.docpreview_tree.insert("", "end", values=values)
+            self.docpreview_rows[item] = {
+                "path": path,
+                "doc_type": row["doc_type"],
+                "lang": row["lang"],
+                "pages_sampled": row["pages_sampled"],
+                "chars_used": row["chars_used"],
+                "keywords": keywords_display,
+                "summary": summary,
+                "updated_utc": row["updated_utc"],
+            }
+        count = len(rows)
+        self.docpreview_status_var.set(f"Doc preview entries: {count}")
+
+    def open_docpreview_folder(self) -> None:
+        row = self._get_selected_docpreview_row()
+        if not row:
+            return
+        path = row.get("path")
+        if path:
+            self._open_path_in_explorer(path)
+
+    def copy_docpreview_path(self) -> None:
+        row = self._get_selected_docpreview_row()
+        if not row:
+            return
+        path = row.get("path") or ""
+        if not path:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+            self._show_toast("Doc path copied to clipboard", "info")
+        except Exception as exc:
+            messagebox.showerror("Doc Preview", f"Unable to copy path: {exc}")
+
+    def export_docpreview_results(self) -> None:
+        if not self.docpreview_rows:
+            messagebox.showinfo("Doc Preview", "No doc preview results to export.")
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Export Doc Preview",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not destination:
+            return
+        rows = list(self.docpreview_rows.values())
+        try:
+            if destination.lower().endswith(".json"):
+                with open(destination, "w", encoding="utf-8") as handle:
+                    json.dump(rows, handle, ensure_ascii=False, indent=2)
+            else:
+                with open(destination, "w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=[
+                            "path",
+                            "doc_type",
+                            "lang",
+                            "pages_sampled",
+                            "chars_used",
+                            "keywords",
+                            "summary",
+                            "updated_utc",
+                        ],
+                    )
+                    writer.writeheader()
+                    writer.writerows(rows)
+        except Exception as exc:
+            messagebox.showerror("Doc Preview", f"Failed to export results: {exc}")
+            return
+        messagebox.showinfo("Doc Preview", f"Exported {len(rows)} rows to {destination}")
 
     def _build_tables(self):
         parent = getattr(self, "dashboard_tab", self.content)
@@ -5603,6 +6077,51 @@ class App:
                 self.status_line_idle_text = f"{fmt} export failed."
             self.status_line_var.set(f"{fmt} export failed")
             self._update_status_line(force=True)
+        elif etype == "docpreview-progress":
+            payload = event.get("payload") or {}
+            total = int(payload.get("total") or 0)
+            processed = int(payload.get("processed") or 0)
+            skipped = int(payload.get("skipped") or 0)
+            errors = int(payload.get("errors") or 0)
+            self.docpreview_progress_total.set(total)
+            self.docpreview_progress_done.set(processed)
+            if total <= 0:
+                self.docpreview_progress_bar.configure(maximum=1, value=0)
+            else:
+                self.docpreview_progress_bar.configure(maximum=total, value=processed)
+            snippet = payload.get("path") or ""
+            status = f"Doc preview • {processed}/{total} processed (skipped={skipped}, errors={errors})"
+            self.docpreview_status_var.set(status)
+            if snippet:
+                self._append_docpreview_log(str(snippet))
+        elif etype == "docpreview-log":
+            line = event.get("line")
+            if line:
+                self._append_docpreview_log(str(line))
+        elif etype == "docpreview-complete":
+            self.docpreview_worker = None
+            self.docpreview_cancel = None
+            summary = event.get("summary") or {}
+            error = event.get("error")
+            if error:
+                message = f"Doc preview failed: {error}"
+                self.docpreview_status_var.set(message)
+                messagebox.showerror("Doc Preview", message)
+            else:
+                processed = int(summary.get("processed", 0) or 0)
+                skipped = int(summary.get("skipped", 0) or 0)
+                errors = int(summary.get("errors", 0) or 0)
+                elapsed = float(summary.get("elapsed_s", 0.0) or 0.0)
+                status = (
+                    f"Doc preview complete — processed={processed} skipped={skipped} "
+                    f"errors={errors} elapsed={elapsed:.1f}s"
+                )
+                self.docpreview_status_var.set(status)
+                self._append_docpreview_log(status)
+                self.refresh_docpreview_results()
+            if hasattr(self, "docpreview_progress_bar"):
+                current_max = float(self.docpreview_progress_bar["maximum"] or 1)
+                self.docpreview_progress_bar.configure(value=current_max)
         elif etype == "done":
             self._await_worker_completion()
             status = event.get("status", "Ready")

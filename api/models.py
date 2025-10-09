@@ -184,6 +184,25 @@ class FeatureVectorResponse(BaseModel):
     vector: List[float] = Field(..., description="Float32 vector serialised as JSON array.")
 
 
+class DocPreviewRow(BaseModel):
+    """Row describing a lightweight document preview."""
+
+    path: str = Field(..., description="Inventory path processed for preview.")
+    doc_type: Optional[str] = Field(None, description="Detected document type (pdf/epub).")
+    lang: Optional[str] = Field(None, description="Detected language code when available.")
+    pages_sampled: int = Field(..., description="Number of pages sampled for the preview.")
+    chars_used: int = Field(..., description="Characters analysed for the summary.")
+    summary: Optional[str] = Field(None, description="Short summary generated for the document.")
+    keywords: Optional[str] = Field(None, description="Top keywords extracted for the document.")
+    updated_utc: Optional[str] = Field(None, description="Timestamp of the preview generation.")
+
+
+class DocPreviewResponse(PaginatedResponse):
+    """Paginated response for document previews."""
+
+    results: List[DocPreviewRow] = Field(..., description="Preview rows for this page.")
+
+
 class DrivesResponse(BaseModel):
     """Wrapper around drive list payload."""
 

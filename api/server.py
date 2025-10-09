@@ -35,6 +35,7 @@ from .models import (
     StructureReviewResponse,
     StructureSummaryResponse,
     TopExtensionsReport,
+    DocPreviewResponse,
 )
 from semantic import SemanticPhaseError
 
@@ -177,6 +178,29 @@ def create_app(config: APIServerConfig) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="file not found")
         return FileResponse(**row)
+
+    @app.get("/v1/docs/preview", response_model=DocPreviewResponse)
+    def doc_previews(
+        drive_label: str = Query(..., description="Drive label to query."),
+        q: Optional[str] = Query(None, description="Optional FTS query across summary and keywords."),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        _: str = Depends(auth_dependency),
+    ) -> DocPreviewResponse:
+        ensure_drive(drive_label)
+        results, pagination, next_offset, total = data.doc_preview_page(
+            drive_label,
+            q=q,
+            limit=limit,
+            offset=offset,
+        )
+        return DocPreviewResponse(
+            results=results,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
 
     @app.get("/v1/stats", response_model=DriveStatsResponse)
     def stats(

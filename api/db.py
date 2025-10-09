@@ -146,6 +146,15 @@ class DataAccess:
         except sqlite3.DatabaseError:
             return False
 
+    def _doc_preview_tables_present(self, conn: sqlite3.Connection) -> bool:
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='docs_preview'"
+            )
+            return cursor.fetchone() is not None
+        except sqlite3.DatabaseError:
+            return False
+
     def resolve_pagination(self, limit: Optional[int], offset: Optional[int]) -> Pagination:
         try:
             lim = int(limit) if limit is not None else self.default_limit
@@ -181,6 +190,55 @@ class DataAccess:
                     }
                 )
         return rows
+
+    def doc_preview_page(
+        self,
+        drive_label: str,
+        *,
+        q: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], Pagination, Optional[int], Optional[int]]:
+        pagination = self.resolve_pagination(limit, offset)
+        with self._shard(drive_label) as conn:
+            if not self._doc_preview_tables_present(conn):
+                return [], pagination, None, 0
+            params: List[object]
+            if q:
+                query = (
+                    """
+                    SELECT dp.path, dp.doc_type, dp.lang, dp.pages_sampled, dp.chars_used,
+                           dp.summary, dp.keywords, dp.updated_utc
+                    FROM docs_fts AS ft
+                    JOIN docs_preview AS dp ON dp.path = ft.path
+                    WHERE docs_fts MATCH ?
+                    ORDER BY bm25(docs_fts)
+                    LIMIT ? OFFSET ?
+                    """
+                )
+                params = [q, pagination.limit, pagination.offset]
+                rows = conn.execute(query, params).fetchall()
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM docs_fts WHERE docs_fts MATCH ?", (q,)
+                ).fetchone()[0]
+            else:
+                query = (
+                    """
+                    SELECT path, doc_type, lang, pages_sampled, chars_used, summary, keywords, updated_utc
+                    FROM docs_preview
+                    ORDER BY updated_utc DESC
+                    LIMIT ? OFFSET ?
+                    """
+                )
+                params = [pagination.limit, pagination.offset]
+                rows = conn.execute(query, params).fetchall()
+                total = conn.execute("SELECT COUNT(*) FROM docs_preview").fetchone()[0]
+        results = [dict(row) for row in rows]
+        next_offset: Optional[int] = None
+        consumed = pagination.offset + len(results)
+        if total is not None and consumed < total:
+            next_offset = consumed
+        return results, pagination, next_offset, int(total)
 
     def structure_summary(self, drive_label: str) -> Dict[str, Any]:
         with self._shard(drive_label) as conn:
