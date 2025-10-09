@@ -5,6 +5,7 @@ sqlite-utils
 numpy
 Pillow
 onnxruntime
+nvidia-ml-py
 opencv-python-headless
 fastapi
 uvicorn

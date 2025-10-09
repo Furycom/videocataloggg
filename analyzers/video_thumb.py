@@ -36,6 +36,7 @@ class VideoThumbnailAnalyzer:
         prefer_ffmpeg: bool = True,
         max_frames: int = 2,
         rate_limit_profile: Optional[str] = None,
+        hwaccel_args: Optional[Sequence[str]] = None,
     ) -> None:
         self._embedder = embedder
         self._ffmpeg_path = Path(ffmpeg_path) if ffmpeg_path else None
@@ -44,6 +45,7 @@ class VideoThumbnailAnalyzer:
         self._profile = (rate_limit_profile or "").upper()
         if self._profile in {"NETWORK", "USB"}:
             self._max_frames = min(self._max_frames, 1)
+        self._hwaccel_args = list(hwaccel_args or [])
 
     def extract_features(self, video_path: Path) -> Tuple[Optional[np.ndarray], int]:
         vectors: List[np.ndarray] = []
@@ -140,6 +142,8 @@ class VideoThumbnailAnalyzer:
         if not self._ffmpeg_path:
             return None
         args = [str(self._ffmpeg_path), "-hide_banner", "-loglevel", "error"]
+        if self._hwaccel_args:
+            args.extend(self._hwaccel_args)
         if timestamp > 0:
             args.extend(["-ss", f"{timestamp:.3f}"])
         args.extend(["-i", str(video_path), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"])

@@ -63,6 +63,8 @@ from tkinter import (
 )
 from tkinter.scrolledtext import ScrolledText
 
+from gpu.capabilities import probe_gpu
+
 # ---------------- Config & constantes ----------------
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
@@ -481,6 +483,8 @@ class ScannerWorker(threading.Thread):
         blake_for_av: bool,
         light_analysis: bool,
         inventory_only: bool,
+        gpu_policy: Optional[str],
+        gpu_hwaccel: Optional[bool],
         max_workers: int,
         full_rescan: bool,
         resume_enabled: bool,
@@ -498,6 +502,8 @@ class ScannerWorker(threading.Thread):
         self.blake_for_av = blake_for_av
         self.light_analysis = bool(light_analysis)
         self.inventory_only = bool(inventory_only)
+        self.gpu_policy = (gpu_policy or "").upper() if gpu_policy else None
+        self.gpu_hwaccel = gpu_hwaccel
         self.max_workers = max(1, int(max_workers))
         self.full_rescan = bool(full_rescan)
         self.resume_enabled = bool(resume_enabled)
@@ -517,6 +523,11 @@ class ScannerWorker(threading.Thread):
             path = info.get("path") if isinstance(info, dict) else None
             present = bool(info.get("present")) if isinstance(info, dict) else False
             self.tool_paths[tool_name] = str(path) if (present and path) else None
+        self._gpu_overrides: Dict[str, object] = {}
+        if self.gpu_policy:
+            self._gpu_overrides["policy"] = self.gpu_policy
+        if self.gpu_hwaccel is not None:
+            self._gpu_overrides["allow_hwaccel_video"] = bool(self.gpu_hwaccel)
 
     def _put(self, payload: dict):
         try:
@@ -553,6 +564,7 @@ class ScannerWorker(threading.Thread):
                 perf_overrides=perf_overrides,
                 robust_overrides=robust_overrides,
                 light_analysis=False,
+                gpu_overrides=self._gpu_overrides,
                 progress_callback=self._inventory_progress_callback,
             )
         except SystemExit as exc:
@@ -772,6 +784,7 @@ class ScannerWorker(threading.Thread):
         total_bytes, free_bytes = disk_usage_bytes(mount)
 
         light_cfg = scan_drive._resolve_light_analysis(settings_data, self.light_analysis)
+        gpu_cfg = scan_drive._resolve_gpu_settings(settings_data, self._gpu_overrides)
         light_pipeline: Optional[scan_drive.LightAnalysisPipeline] = None
         light_summary: Optional[Dict[str, object]] = None
 
@@ -782,6 +795,7 @@ class ScannerWorker(threading.Thread):
                 perf_profile = str(perf_cfg.profile) if perf_cfg else "AUTO"
                 light_pipeline = scan_drive.LightAnalysisPipeline(
                     settings=light_cfg,
+                    gpu_settings=gpu_cfg,
                     connection=shard,
                     ffmpeg_path=self.tool_paths.get("ffmpeg"),
                     perf_profile=perf_profile,
@@ -1765,8 +1779,30 @@ class App:
             if isinstance(maybe_light, dict):
                 light_settings = maybe_light
         light_default = bool(light_settings.get("enabled_default", False))
+        gpu_settings: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_gpu = _SETTINGS.get("gpu")
+            if isinstance(maybe_gpu, dict):
+                gpu_settings = maybe_gpu
+        policy_default = str(gpu_settings.get("policy", "AUTO") or "AUTO").upper()
+        if policy_default not in {"AUTO", "FORCE_GPU", "CPU_ONLY"}:
+            policy_default = "AUTO"
+        allow_hwaccel_default = bool(gpu_settings.get("allow_hwaccel_video", True))
+        try:
+            self.gpu_min_vram = max(0, int(gpu_settings.get("min_free_vram_mb", 512) or 0))
+        except Exception:
+            self.gpu_min_vram = 512
+        try:
+            self.gpu_max_gpu_workers = max(
+                1, int(gpu_settings.get("max_gpu_workers", 2) or 1)
+            )
+        except Exception:
+            self.gpu_max_gpu_workers = 2
         self.blake_var = IntVar(value=0)
         self.light_analysis_var = IntVar(value=1 if light_default else 0)
+        self.gpu_policy_var = StringVar(value=policy_default)
+        self.gpu_hwaccel_var = IntVar(value=1 if allow_hwaccel_default else 0)
+        self.gpu_status_var = StringVar(value="Probing GPU…")
         self.inventory_var = IntVar(value=0)
         self.rescan_mode_var = StringVar(value="delta")
         self.resume_var = IntVar(value=1)
@@ -1827,6 +1863,7 @@ class App:
         self._build_tables()
 
         self.refresh_tool_statuses(initial=True)
+        self._refresh_gpu_status()
 
         register_log_listener(self._log_enqueue)
         self._load_existing_logs()
@@ -1910,6 +1947,55 @@ class App:
     def refresh_tool_statuses(self, initial: bool = False):
         statuses = self._probe_all_tools()
         self._update_tool_statuses(statuses, log_line=initial)
+
+    def _format_gpu_status(self) -> str:
+        try:
+            caps = probe_gpu()
+        except Exception:
+            return "Detected: unknown, VRAM: n/a, ORT: CPU"
+        if caps.get("has_nvidia"):
+            name = str(caps.get("nv_name") or "NVIDIA GPU")
+            total_bytes = caps.get("nv_vram_bytes") or 0
+            try:
+                total_gib = float(total_bytes) / (1024 ** 3)
+            except Exception:
+                total_gib = 0.0
+            vram_text = f"{total_gib:.1f} GiB" if total_gib > 0 else "n/a"
+        else:
+            name = "None"
+            vram_text = "0 GiB"
+        if caps.get("onnx_cuda_ok"):
+            ort_mode = "CUDA"
+        elif caps.get("onnx_directml_ok"):
+            ort_mode = "DML"
+        else:
+            ort_mode = "CPU"
+        return f"Detected: {name}, VRAM: {vram_text}, ORT: {ort_mode}"
+
+    def _refresh_gpu_status(self) -> None:
+        try:
+            self.gpu_status_var.set(self._format_gpu_status())
+        except Exception:
+            self.gpu_status_var.set("Detected: unknown, VRAM: n/a, ORT: CPU")
+
+    def _save_gpu_settings(self) -> None:
+        payload = {
+            "policy": (self.gpu_policy_var.get() or "AUTO").upper(),
+            "allow_hwaccel_video": bool(self.gpu_hwaccel_var.get()),
+            "min_free_vram_mb": int(self.gpu_min_vram),
+            "max_gpu_workers": int(self.gpu_max_gpu_workers),
+        }
+        update_settings(WORKING_DIR_PATH, gpu=payload)
+
+    def _on_gpu_policy_changed(self) -> None:
+        value = (self.gpu_policy_var.get() or "AUTO").upper()
+        if value not in {"AUTO", "FORCE_GPU", "CPU_ONLY"}:
+            value = "AUTO"
+        self.gpu_policy_var.set(value)
+        self._save_gpu_settings()
+
+    def _on_gpu_hwaccel_toggle(self) -> None:
+        self._save_gpu_settings()
 
     def recheck_tool(self, tool: ToolName) -> dict:
         statuses = self._probe_all_tools()
@@ -2290,8 +2376,52 @@ class App:
             variable=self.inventory_var,
         ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(0, 12))
 
+        gpu_frame = ttk.LabelFrame(
+            scan_frame, text="GPU", padding=(12, 10), style="Card.TLabelframe"
+        )
+        gpu_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        for col in range(3):
+            gpu_frame.columnconfigure(col, weight=1 if col == 1 else 0)
+        ttk.Label(
+            gpu_frame,
+            textvariable=self.gpu_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Button(
+            gpu_frame,
+            text="Refresh",
+            command=self._refresh_gpu_status,
+        ).grid(row=0, column=2, sticky="e")
+        ttk.Radiobutton(
+            gpu_frame,
+            text="Auto",
+            value="AUTO",
+            variable=self.gpu_policy_var,
+            command=self._on_gpu_policy_changed,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(
+            gpu_frame,
+            text="Force GPU",
+            value="FORCE_GPU",
+            variable=self.gpu_policy_var,
+            command=self._on_gpu_policy_changed,
+        ).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(
+            gpu_frame,
+            text="CPU Only",
+            value="CPU_ONLY",
+            variable=self.gpu_policy_var,
+            command=self._on_gpu_policy_changed,
+        ).grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            gpu_frame,
+            text="Use FFmpeg hwaccel when available",
+            variable=self.gpu_hwaccel_var,
+            command=self._on_gpu_hwaccel_toggle,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         rescan_options = ttk.Frame(scan_frame, style="Card.TFrame")
-        rescan_options.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        rescan_options.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(0, 12))
         rescan_options.columnconfigure(0, weight=1)
         ttk.Radiobutton(
             rescan_options,
@@ -2312,7 +2442,7 @@ class App:
         ).grid(row=0, column=1, rowspan=2, sticky="w", padx=(24, 0))
 
         actions = ttk.Frame(scan_frame, style="Card.TFrame")
-        actions.grid(row=9, column=0, columnspan=4, sticky="ew")
+        actions.grid(row=10, column=0, columnspan=4, sticky="ew")
         for c in range(5):
             actions.columnconfigure(c, weight=1)
         ttk.Button(actions, text="Scan", command=self.start_scan, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
@@ -4143,6 +4273,8 @@ class App:
             blake_for_av=bool(self.blake_var.get()),
             light_analysis=bool(self.light_analysis_var.get()),
             inventory_only=bool(self.inventory_var.get()),
+            gpu_policy=self.gpu_policy_var.get(),
+            gpu_hwaccel=bool(self.gpu_hwaccel_var.get()),
             max_workers=threads,
             full_rescan=self.rescan_mode_var.get().lower() == "full",
             resume_enabled=bool(self.resume_var.get()),

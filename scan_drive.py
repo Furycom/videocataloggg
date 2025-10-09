@@ -28,6 +28,13 @@ from analyzers import (
     VideoThumbnailAnalyzer,
     ensure_features_table,
 )
+from gpu.capabilities import probe_gpu
+from gpu.runtime import (
+    get_video_hwaccel,
+    providers_for_session,
+    report_provider_failure,
+    select_onnx_provider,
+)
 from core.paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
@@ -163,6 +170,14 @@ class LightAnalysisSettings:
 
 
 @dataclass
+class GPUSettings:
+    policy: str
+    allow_hwaccel_video: bool
+    min_free_vram_mb: int
+    max_gpu_workers: int
+
+
+@dataclass
 class FingerprintSettings:
     enable_video_tmk: bool
     enable_audio_chroma: bool
@@ -182,6 +197,7 @@ class LightAnalysisPipeline:
         self,
         *,
         settings: LightAnalysisSettings,
+        gpu_settings: GPUSettings,
         connection: sqlite3.Connection,
         ffmpeg_path: Optional[str],
         perf_profile: str,
@@ -190,6 +206,7 @@ class LightAnalysisPipeline:
     ) -> None:
         self._requested = bool(settings.enabled)
         self._settings = settings
+        self._gpu = gpu_settings
         self._conn = connection
         self._ffmpeg_path = ffmpeg_path
         self._profile = perf_profile
@@ -202,22 +219,68 @@ class LightAnalysisPipeline:
         self._active = False
         self._error: Optional[str] = None
         self._warning: Optional[str] = None
+        self._gpu_provider: str = "CPU"
+        self._gpu_hwaccel = False
+        self._ffmpeg_hwaccel_args: list[str] = []
 
     def prepare(self) -> None:
         if not self._requested:
             return
         ensure_features_table(self._conn)
+        caps = probe_gpu()
+        provider = select_onnx_provider(
+            self._gpu.policy,
+            min_free_vram_mb=self._gpu.min_free_vram_mb,
+            caps=caps,
+        )
+        hwaccel_args = get_video_hwaccel(
+            self._gpu.policy,
+            allow_hwaccel=self._gpu.allow_hwaccel_video,
+            caps=caps,
+        )
+        providers = providers_for_session(provider)
+        self._gpu_provider = provider
+        self._ffmpeg_hwaccel_args = list(hwaccel_args)
+        self._gpu_hwaccel = bool(self._ffmpeg_hwaccel_args)
         try:
             self._embedder = ImageEmbedder(
-                ImageEmbedderConfig(model_path=self._settings.model_path)
+                ImageEmbedderConfig(
+                    model_path=self._settings.model_path,
+                    providers=providers,
+                    primary_provider=providers[0] if providers else "CPUExecutionProvider",
+                )
             )
         except LightAnalysisModelError as exc:
-            self._error = str(exc)
-            self._emit_status("error", self._error)
-            return
+            if provider != "CPU":
+                report_provider_failure(provider, exc)
+                fallback_providers = providers_for_session("CPU")
+                self._gpu_provider = "CPU"
+                self._ffmpeg_hwaccel_args = []
+                self._gpu_hwaccel = False
+                if not self._warning:
+                    self._warning = "GPU acceleration unavailable — using CPU."
+                try:
+                    self._embedder = ImageEmbedder(
+                        ImageEmbedderConfig(
+                            model_path=self._settings.model_path,
+                            providers=fallback_providers,
+                            primary_provider="CPUExecutionProvider",
+                        )
+                    )
+                except LightAnalysisModelError as cpu_exc:
+                    self._error = str(cpu_exc)
+                    self._emit_status("error", self._error)
+                    self._log_gpu_status()
+                    return
+            else:
+                self._error = str(exc)
+                self._emit_status("error", self._error)
+                self._log_gpu_status()
+                return
         except Exception as exc:  # pragma: no cover - defensive guard
             self._error = f"Light analysis unavailable: {exc}"
             self._emit_status("error", self._error)
+            self._log_gpu_status()
             return
         self._writer = FeatureWriter(self._conn, batch_size=48)
         if self._ffmpeg_path:
@@ -227,11 +290,29 @@ class LightAnalysisPipeline:
                 prefer_ffmpeg=self._settings.prefer_ffmpeg,
                 max_frames=self._settings.max_video_frames,
                 rate_limit_profile=self._profile,
+                hwaccel_args=self._ffmpeg_hwaccel_args,
             )
         else:
             self._warning = "FFmpeg not available — video thumbnails skipped."
             self._emit_status("warning", self._warning)
+            self._ffmpeg_hwaccel_args = []
+            self._gpu_hwaccel = False
+        self._log_gpu_status()
         self._active = True
+
+    def _log_gpu_status(self) -> None:
+        label_map = {
+            "CUDAExecutionProvider": "CUDA",
+            "DmlExecutionProvider": "DML",
+            "CPU": "CPU",
+        }
+        label = label_map.get(self._gpu_provider, self._gpu_provider)
+        LOGGER.info(
+            "GPU: policy=%s provider=%s hwaccel=%s",
+            self._gpu.policy,
+            label,
+            "on" if self._gpu_hwaccel else "off",
+        )
 
     def process(self, info: FileInfo) -> None:
         if not self._active or not self._embedder or not self._writer:
@@ -273,6 +354,9 @@ class LightAnalysisPipeline:
             "images": 0,
             "videos": 0,
             "avg_dim": 0,
+            "provider": self._gpu_provider,
+            "gpu_policy": self._gpu.policy,
+            "hwaccel": self._gpu_hwaccel,
         }
         if not self._active or not self._writer:
             if self._error:
@@ -706,6 +790,47 @@ def _resolve_light_analysis(
         model_path=model_path,
         max_video_frames=max_frames,
         prefer_ffmpeg=prefer_ffmpeg,
+    )
+
+
+def _resolve_gpu_settings(
+    settings: Optional[Dict[str, object]], overrides: Optional[Dict[str, object]]
+) -> GPUSettings:
+    config: Dict[str, object] = {}
+    if isinstance(settings, dict):
+        maybe = settings.get("gpu")
+        if isinstance(maybe, dict):
+            config = maybe
+    overrides = overrides or {}
+
+    policy_value = overrides.get("policy", config.get("policy", "AUTO"))
+    policy = str(policy_value or "AUTO").upper()
+    if policy not in {"AUTO", "FORCE_GPU", "CPU_ONLY"}:
+        policy = "AUTO"
+
+    allow_value = overrides.get("allow_hwaccel_video")
+    if allow_value is None:
+        allow_hwaccel = bool(config.get("allow_hwaccel_video", True))
+    else:
+        allow_hwaccel = bool(allow_value)
+
+    min_vram_value = overrides.get("min_free_vram_mb", config.get("min_free_vram_mb", 512))
+    try:
+        min_vram_mb = max(0, int(min_vram_value))
+    except (TypeError, ValueError):
+        min_vram_mb = 0
+
+    max_workers_value = overrides.get("max_gpu_workers", config.get("max_gpu_workers", 2))
+    try:
+        max_gpu_workers = max(1, int(max_workers_value))
+    except (TypeError, ValueError):
+        max_gpu_workers = 1
+
+    return GPUSettings(
+        policy=policy,
+        allow_hwaccel_video=allow_hwaccel,
+        min_free_vram_mb=min_vram_mb,
+        max_gpu_workers=max_gpu_workers,
     )
 
 
@@ -1382,6 +1507,7 @@ def scan_drive(
     fingerprint_overrides: Optional[Dict[str, object]] = None,
     robust_overrides: Optional[Dict[str, object]] = None,
     light_analysis: Optional[bool] = None,
+    gpu_overrides: Optional[Dict[str, object]] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     mount = Path(mount_path)
@@ -1395,6 +1521,7 @@ def scan_drive(
     perf_overrides = perf_overrides or {}
     light_cfg = _resolve_light_analysis(effective_settings, light_analysis)
     fingerprint_cfg = _resolve_fingerprint_settings(effective_settings, fingerprint_overrides)
+    gpu_cfg = _resolve_gpu_settings(effective_settings, gpu_overrides)
     perf_config = resolve_performance_config(
         str(mount),
         settings=effective_settings,
@@ -1457,6 +1584,7 @@ def scan_drive(
     if not inventory_only:
         light_pipeline = LightAnalysisPipeline(
             settings=light_cfg,
+            gpu_settings=gpu_cfg,
             connection=conn,
             ffmpeg_path=TOOL_PATHS.get("ffmpeg"),
             perf_profile=str(perf_config.profile),
@@ -2220,6 +2348,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override worker thread count.",
     )
     parser.add_argument(
+        "--gpu-policy",
+        choices=["AUTO", "FORCE_GPU", "CPU_ONLY"],
+        help="Select GPU inference policy for ONNX models.",
+    )
+    parser.add_argument(
+        "--gpu-hwaccel",
+        dest="gpu_hwaccel",
+        action="store_true",
+        help="Enable FFmpeg CUDA/NVDEC acceleration when available.",
+    )
+    parser.add_argument(
+        "--no-gpu-hwaccel",
+        dest="gpu_hwaccel",
+        action="store_false",
+        help="Disable FFmpeg hardware acceleration.",
+    )
+    parser.set_defaults(gpu_hwaccel=None)
+    parser.add_argument(
         "--perf-chunk",
         type=int,
         help="Override hash chunk size in bytes.",
@@ -2694,6 +2840,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         fingerprint_cli_overrides["fpcalc_path"] = args.fingerprint_fpcalc
 
     settings_data = load_settings(WORKING_DIR_PATH)
+    gpu_cli_overrides: Dict[str, object] = {}
+    if getattr(args, "gpu_policy", None):
+        gpu_cli_overrides["policy"] = args.gpu_policy
+    if getattr(args, "gpu_hwaccel", None) is not None:
+        gpu_cli_overrides["allow_hwaccel_video"] = bool(args.gpu_hwaccel)
 
     result = scan_drive(
         args.label,
@@ -2710,6 +2861,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         fingerprint_overrides=fingerprint_cli_overrides,
         robust_overrides=robust_cli_overrides,
         light_analysis=getattr(args, "light_analysis", None),
+        gpu_overrides=gpu_cli_overrides,
     )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
@@ -2740,6 +2892,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"{int(light_info.get('images', 0)):,}, videos: {int(light_info.get('videos', 0)):,}, "
                     f"avg dim: {int(light_info.get('avg_dim', 0))}"
                 )
+                provider = str(light_info.get("provider") or "CPU")
+                label_map = {
+                    "CUDAExecutionProvider": "CUDA",
+                    "DmlExecutionProvider": "DML",
+                    "CPU": "CPU",
+                }
+                light_line += f", provider: {label_map.get(provider, provider)}"
+                hwaccel = "on" if light_info.get("hwaccel") else "off"
+                light_line += f", hwaccel: {hwaccel}"
                 if light_info.get("warning"):
                     light_line += f" (warning: {light_info.get('warning')})"
             elif status in {"error", "skipped"} and light_info.get("message"):
