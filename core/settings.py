@@ -110,6 +110,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         },
         "max_candidates": 5,
     },
+    "docpreview": {
+        "enable": False,
+        "max_pages": 6,
+        "max_chars": 20000,
+        "sample_strategy": "smart",
+        "ocr_enable": True,
+        "ocr_max_pages": 2,
+        "ocr_timeout_s": 20,
+        "summary_target_tokens": 120,
+        "keywords_topk": 10,
+        "gpu_allowed": True,
+    },
 }
 
 

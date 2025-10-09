@@ -109,6 +109,7 @@ from db_maint import (
     vacuum_if_needed,
 )
 from structure import StructureProfiler, load_structure_settings as load_structure_config
+from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
 
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
@@ -2498,6 +2499,54 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Export low-confidence review queue to the given JSON path.",
     )
     parser.add_argument(
+        "--docpreview",
+        action="store_true",
+        help="Run the lightweight document preview pipeline for PDFs and EPUBs.",
+    )
+    parser.add_argument(
+        "--docpreview-max-pages",
+        type=int,
+        help="Override maximum PDF pages sampled per file.",
+    )
+    parser.add_argument(
+        "--docpreview-max-chars",
+        type=int,
+        help="Override maximum characters fed into the summariser.",
+    )
+    parser.add_argument(
+        "--docpreview-sample",
+        choices=["smart", "first"],
+        help="Override page sampling strategy (smart or first).",
+    )
+    parser.add_argument(
+        "--docpreview-ocr",
+        dest="docpreview_ocr",
+        action="store_true",
+        help="Force-enable OCR for scanned PDFs even if disabled in settings.",
+    )
+    parser.add_argument(
+        "--no-docpreview-ocr",
+        dest="docpreview_ocr",
+        action="store_false",
+        help="Disable OCR for this doc preview run.",
+    )
+    parser.set_defaults(docpreview_ocr=None)
+    parser.add_argument(
+        "--docpreview-summary-tokens",
+        type=int,
+        help="Override target token budget for generated summaries.",
+    )
+    parser.add_argument(
+        "--docpreview-keywords",
+        type=int,
+        help="Override number of keywords to extract per document.",
+    )
+    parser.add_argument(
+        "--docpreview-limit",
+        type=int,
+        help="Process at most this many candidate documents.",
+    )
+    parser.add_argument(
         "--maint-target",
         dest="maint_target",
         help="Maintenance target: catalog, shard:<label>, or all-shards.",
@@ -3126,6 +3175,83 @@ def _run_structure_cli(
         conn.close()
 
 
+def _run_docpreview_cli(
+    args: argparse.Namespace,
+    settings_data: Dict[str, object],
+    shard_db_path: Path,
+) -> int:
+    if not args.label:
+        LOGGER.error("Doc preview requires --label to resolve shard database.")
+        print("[ERROR] --label is required for doc preview runs.", file=sys.stderr)
+        return 2
+    base_settings = settings_data.get("docpreview") if isinstance(settings_data.get("docpreview"), dict) else {}
+    preview_settings = DocPreviewSettings.from_mapping(base_settings)
+    enabled = bool(preview_settings.enable or getattr(args, "docpreview", False))
+    overrides: Dict[str, object] = {}
+    if getattr(args, "docpreview_max_pages", None) is not None:
+        overrides["max_pages"] = max(1, int(args.docpreview_max_pages))
+    if getattr(args, "docpreview_max_chars", None) is not None:
+        overrides["max_chars"] = max(1000, int(args.docpreview_max_chars))
+    if getattr(args, "docpreview_sample", None):
+        overrides["sample_strategy"] = args.docpreview_sample
+    if getattr(args, "docpreview_ocr", None) is not None:
+        overrides["ocr_enable"] = bool(args.docpreview_ocr)
+    if getattr(args, "docpreview_summary_tokens", None) is not None:
+        overrides["summary_target_tokens"] = max(40, int(args.docpreview_summary_tokens))
+    if getattr(args, "docpreview_keywords", None) is not None:
+        overrides["keywords_topk"] = max(0, int(args.docpreview_keywords))
+    if overrides:
+        preview_settings = preview_settings.with_overrides(**overrides)
+    if getattr(args, "docpreview", False):
+        enabled = True
+    if not enabled:
+        LOGGER.info("Doc preview disabled via settings.json (docpreview.enable=false)")
+        print("Doc preview disabled in settings; nothing to do.")
+        return 0
+    preview_settings = preview_settings.with_overrides(enable=True)
+    limit: Optional[int] = None
+    if getattr(args, "docpreview_limit", None) is not None:
+        try:
+            limit_val = int(args.docpreview_limit)
+        except (TypeError, ValueError):
+            LOGGER.error("Invalid value for --docpreview-limit: %s", args.docpreview_limit)
+            print("[ERROR] --docpreview-limit must be an integer.", file=sys.stderr)
+            return 2
+        if limit_val > 0:
+            limit = limit_val
+    mount_hint = args.mount_path or str(Path(shard_db_path).parent)
+    try:
+        perf_config = resolve_performance_config(mount_hint, settings=settings_data)
+        gentle_sleep = 0.05 if perf_config.gentle_io else 0.0
+    except Exception:
+        gentle_sleep = 0.0
+
+    def progress_callback(payload: Dict[str, object]) -> None:
+        try:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+    LOGGER.info("Running doc preview pipeline for %s", shard_db_path)
+    summary = run_docpreview_for_shard(
+        shard_db_path,
+        settings=preview_settings,
+        gpu_settings=settings_data.get("gpu") if isinstance(settings_data.get("gpu"), dict) else {},
+        progress_callback=progress_callback,
+        gentle_sleep=gentle_sleep,
+        limit=limit,
+    )
+    print(
+        "Doc preview complete — processed={processed} skipped={skipped} errors={errors} elapsed={elapsed:.1f}s".format(
+            processed=summary.processed,
+            skipped=summary.skipped,
+            errors=summary.errors,
+            elapsed=summary.elapsed_s,
+        )
+    )
+    return 0
+
+
 def _auto_optimize_after_scan(shard_path: Path, label: str, options: MaintenanceOptions) -> None:
     if not shard_path.exists():
         return
@@ -3201,6 +3327,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     structure_requested = bool(
         args.structure_scan or args.structure_verify or args.structure_export_review
     )
+    if getattr(args, "docpreview", False):
+        return _run_docpreview_cli(args, settings_data, Path(shard_db_path))
     if structure_requested:
         mount_path = _expand_user_path(args.mount_path) if args.mount_path else None
         return _run_structure_cli(

@@ -14,3 +14,10 @@ rapidfuzz
 tmdbsimple
 IMDbPY
 requests
+PyMuPDF
+pdfminer.six
+EbookLib
+pytesseract
+transformers
+yake
+langdetect
