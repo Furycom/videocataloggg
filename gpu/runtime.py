@@ -13,6 +13,8 @@ _LOGGER = logging.getLogger("videocatalog.gpu")
 _GPU_DISABLED = False
 _GPU_FAILURE_REPORTED = False
 _LOGGED_NO_GPU = False
+_LAST_CAPS: Dict[str, object] = {}
+_LAST_PROVIDER: ProviderName = "CPU"
 
 
 def report_provider_failure(provider: ProviderName, error: Exception) -> None:
@@ -56,7 +58,14 @@ def _log_no_gpu_once() -> None:
         _LOGGED_NO_GPU = True
 
 
-def select_onnx_provider(
+def _log_cuda_error(caps: Dict[str, object]) -> None:
+    error = caps.get("onnx_cuda_error")
+    if not error:
+        return
+    _LOGGER.debug("GPU: CUDA provider error: %s", error)
+
+
+def select_provider(
     policy: str = "AUTO",
     *,
     min_free_vram_mb: int = 0,
@@ -64,13 +73,15 @@ def select_onnx_provider(
 ) -> ProviderName:
     """Pick the best ONNX Runtime provider based on policy and capabilities."""
 
-    global _GPU_DISABLED
+    global _GPU_DISABLED, _LAST_CAPS, _LAST_PROVIDER
     normalized = (policy or "AUTO").upper()
     capabilities = probe_gpu() if caps is None else caps
+    _LAST_CAPS = dict(capabilities)
 
     if normalized == "CPU_ONLY" or _GPU_DISABLED:
         if not capabilities.get("has_nvidia"):
             _log_no_gpu_once()
+        _LAST_PROVIDER = "CPU"
         return "CPU"
 
     provider: ProviderName = "CPU"
@@ -94,13 +105,35 @@ def select_onnx_provider(
             )
         if not capabilities.get("has_nvidia"):
             _log_no_gpu_once()
+        _LAST_PROVIDER = provider
         return provider
 
     if provider == "CUDAExecutionProvider" and not capabilities.get("cuda_available"):
         _LOGGER.info("GPU: CUDA runtime missing — using CPU instead")
-        return "CPU"
+        provider = "CPU"
+    if provider == "CPU" and has_dml:
+        _LOGGER.info("GPU: falling back to DirectML due to CUDA runtime issues")
+        provider = "DmlExecutionProvider"
 
+    if not has_cuda:
+        _log_cuda_error(capabilities)
+
+    if provider == "DmlExecutionProvider" and not has_dml:
+        provider = "CPU"
+
+    _LAST_PROVIDER = provider
     return provider
+
+
+def select_onnx_provider(
+    policy: str = "AUTO",
+    *,
+    min_free_vram_mb: int = 0,
+    caps: Optional[Dict[str, object]] = None,
+) -> ProviderName:
+    """Backward-compatible alias for :func:`select_provider`."""
+
+    return select_provider(policy, min_free_vram_mb=min_free_vram_mb, caps=caps)
 
 
 def providers_for_session(provider: ProviderName) -> List[str]:
@@ -111,7 +144,7 @@ def providers_for_session(provider: ProviderName) -> List[str]:
     return ["CPUExecutionProvider"]
 
 
-def get_video_hwaccel(
+def get_hwaccel_args(
     policy: str = "AUTO",
     *,
     allow_hwaccel: bool = True,
@@ -128,3 +161,26 @@ def get_video_hwaccel(
     if not capabilities.get("ffmpeg_hwaccel_cuda"):
         return []
     return ["-hwaccel", "cuda"]
+
+
+def get_video_hwaccel(
+    policy: str = "AUTO",
+    *,
+    allow_hwaccel: bool = True,
+    caps: Optional[Dict[str, object]] = None,
+) -> List[str]:
+    """Backward-compatible alias for :func:`get_hwaccel_args`."""
+
+    return get_hwaccel_args(policy, allow_hwaccel=allow_hwaccel, caps=caps)
+
+
+def last_probe_details() -> Dict[str, object]:
+    """Return the most recent capabilities snapshot used for selection."""
+
+    return dict(_LAST_CAPS)
+
+
+def last_provider() -> ProviderName:
+    """Return the most recently selected provider."""
+
+    return _LAST_PROVIDER
