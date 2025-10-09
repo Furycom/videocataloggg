@@ -17,6 +17,14 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - Results return the latest 1,000 matches with name, category, size, modified time, drive label, and full path. Double-click opens the file's folder in Explorer, the context menu can copy the full path, and exports land as CSV/JSONL under `<working_dir>/exports`.
 - The first search against an older shard performs a lightweight migration that backfills the lowercase `inventory.name` column and index; if migration fails the UI falls back to path-only matching and surfaces the error.
 
+## Semantic indexing & search
+
+- The CLI can now drive the semantic pipeline directly from the working directory. Use `scan_drive.py --semantic-index build` for an incremental pass that walks every shard and emits deterministic embeddings plus FTS5 entries, or `--semantic-index rebuild` to clear and repopulate the standalone semantic database. Both modes honour the `semantic.index_phase` toggle inside `settings.json`; when the phase is set to `off` the command aborts with a clear error.
+- Run ad-hoc lookups without scanning by calling `scan_drive.py --semantic-query "what to find"`. Passing `--hybrid` blends ANN scores with the FTS hits; omitting it favours ANN-only queries unless `semantic.hybrid_weight` in `settings.json` forces hybrid behaviour. Provide `--label <drive>` to scope searches to a single shard and the results print as ranked lines in the console.
+- Populate placeholder transcripts with `scan_drive.py --transcribe`. The helper respects `semantic.transcribe_phase` and updates metadata in place, allowing API callers to surface snippets even before real transcripts land.
+- Tuning lives under the `"semantic"` section of `settings.json`: `index_phase`, `search_phase`, and `transcribe_phase` gate each operation; `vector_dim` and `hybrid_weight` control embedding size and scoring balance; `rebuild_chunk` bounds SQLite transactions. CLI commands and API routes honour these switches automatically.
+- Semantic helpers never rewrite the working directory layout—databases are created under the resolved VideoCatalog home via `core.paths.resolve_working_dir`, just like the rest of the scanner.
+
 ## Reports
 
 - Switch to the **Reports** tab to generate read-only summaries for any catalogued drive. Pick a drive, adjust the *Top N* limit (used for top extensions, heaviest folders, and recents), set the folder depth and recency window, then press **Run**. Queries are executed on background threads so the GUI stays responsive.
@@ -29,6 +37,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - The GUI exposes a **Start Local API** toggle under the Database card. It shows host/port plus whether an API key is configured and runs the server in a background process. Disable it from the same button or let it auto-start when `settings.json` sets `"api.enabled_default": true`.
 - All endpoints are GET-only, paginate with `limit`/`offset`, and require an `X-API-Key` header. Missing or empty keys return `401 Unauthorized`. Defaults bind to `127.0.0.1:8756`; expanding beyond localhost or exposing the API externally is at your own risk.
 - `/v1/reports/*` mirrors the GUI summaries (`overview`, `top-extensions`, `largest-files`, `heaviest-folders`, `recent`) and clamps `limit` parameters to the configured API maximum.
+- `/v1/semantic/search` exposes the same ANN/FTS hybrid search used by the CLI. Supply `q`, optional `mode=ann|text|hybrid`, `limit`, `offset`, `drive_label`, and `hybrid=true` to tweak scoring. New maintenance routes—`GET /v1/semantic/index`, `POST /v1/semantic/index` (mode=`build|rebuild`), and `POST /v1/semantic/transcribe`—wrap the underlying pipeline with authentication and respect the `semantic.*_phase` toggles in `settings.json`.
 - Example requests:
 
   ```bash

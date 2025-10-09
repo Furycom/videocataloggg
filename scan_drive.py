@@ -46,6 +46,13 @@ from core.paths import (
 from core.settings import load_settings
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
+from semantic import (
+    SemanticConfig,
+    SemanticIndexer,
+    SemanticPhaseError,
+    SemanticSearcher,
+    SemanticTranscriber,
+)
 from tools import bootstrap_local_bin, probe_tool
 from fingerprints import (
     audio_chroma as fp_audio,
@@ -2484,6 +2491,28 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Path to Chromaprint fpcalc executable.",
     )
     parser.add_argument(
+        "--semantic-index",
+        choices=["build", "rebuild"],
+        help="Run semantic index maintenance instead of scanning.",
+    )
+    parser.add_argument(
+        "--semantic-query",
+        metavar="QUERY",
+        help="Execute a semantic search query and print results.",
+    )
+    parser.add_argument(
+        "--hybrid",
+        dest="semantic_hybrid",
+        action="store_true",
+        help="Combine ANN and FTS scores when using --semantic-query.",
+    )
+    parser.add_argument(
+        "--transcribe",
+        dest="semantic_transcribe",
+        action="store_true",
+        help="Run the semantic transcription helper on indexed rows.",
+    )
+    parser.add_argument(
         "positional",
         nargs="*",
         help=argparse.SUPPRESS,
@@ -2669,6 +2698,90 @@ def _execute_maintenance_action(
     raise ValueError(f"Unsupported maintenance action: {action}")
 
 
+def _run_cli_semantic(
+    args: argparse.Namespace, settings: Dict[str, object]
+) -> Optional[int]:
+    semantic_index = getattr(args, "semantic_index", None)
+    semantic_query = getattr(args, "semantic_query", None)
+    semantic_transcribe = bool(getattr(args, "semantic_transcribe", False))
+    operations = [bool(semantic_index), bool(semantic_query), semantic_transcribe]
+    if not any(operations):
+        return None
+    if sum(1 for flag in operations if flag) > 1:
+        message = "Choose only one of --semantic-index, --semantic-query, or --transcribe."
+        LOGGER.error(message)
+        print(f"[ERROR] {message}", file=sys.stderr)
+        return 2
+    config = SemanticConfig.from_settings(WORKING_DIR_PATH, settings)
+    try:
+        if semantic_index:
+            rebuild = semantic_index == "rebuild"
+            indexer = SemanticIndexer(config)
+            stats = indexer.build(rebuild=rebuild)
+            action = "Rebuild" if rebuild else "Build"
+            print(
+                f"Semantic index {action.lower()} complete — "
+                f"processed {stats.get('processed', 0)} rows across {stats.get('shards', 0)} shards."
+            )
+            return 0
+        if semantic_query:
+            searcher = SemanticSearcher(config)
+            mode = "hybrid" if getattr(args, "semantic_hybrid", False) else "ann"
+            results, total = searcher.search(
+                semantic_query,
+                limit=25,
+                offset=0,
+                drive_label=getattr(args, "label", None),
+                mode=mode,
+                hybrid=bool(getattr(args, "semantic_hybrid", False)),
+            )
+            if not results:
+                print(f"No semantic matches found for '{semantic_query}'.")
+                return 0
+            print(
+                f"Semantic results for '{semantic_query}' (mode={mode}) — "
+                f"showing {len(results)} of {total} entries:"
+            )
+            for row in results:
+                metadata = row.get("metadata") if isinstance(row, dict) else {}
+                summary = ""
+                if isinstance(metadata, dict):
+                    summary = str(
+                        metadata.get("category")
+                        or metadata.get("mime")
+                        or metadata.get("extension")
+                        or ""
+                    )
+                snippet = row.get("snippet") if isinstance(row, dict) else None
+                line = (
+                    f"[{row.get('rank', '?')}] {row.get('score', 0):.3f} "
+                    f"{row.get('drive_label', '')} :: {row.get('path', '')}"
+                )
+                if summary:
+                    line += f" ({summary})"
+                if snippet:
+                    line += f" — {snippet}"
+                print(line)
+            if total > len(results):
+                print(
+                    "… additional results truncated; use the API for pagination or increase limits."
+                )
+            return 0
+        if semantic_transcribe:
+            transcriber = SemanticTranscriber(config)
+            result = transcriber.run()
+            print(
+                f"Semantic transcription complete — "
+                f"updated {int(result.get('transcribed', 0))} records."
+            )
+            return 0
+    except SemanticPhaseError as exc:
+        LOGGER.error("%s", exc)
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 3
+    return 0
+
+
 def _run_cli_maintenance(args: argparse.Namespace, catalog_db_path: Path) -> int:
     targets = _resolve_maintenance_targets(args.maint_target, catalog_db_path)
     if not targets:
@@ -2749,6 +2862,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
+
+    settings_data = load_settings(WORKING_DIR_PATH)
+    semantic_exit = _run_cli_semantic(args, settings_data)
+    if semantic_exit is not None:
+        return semantic_exit
 
     catalog_db_path = (
         _expand_user_path(args.catalog_db)
@@ -2839,7 +2957,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     if getattr(args, "fingerprint_fpcalc", None):
         fingerprint_cli_overrides["fpcalc_path"] = args.fingerprint_fpcalc
 
-    settings_data = load_settings(WORKING_DIR_PATH)
     gpu_cli_overrides: Dict[str, object] = {}
     if getattr(args, "gpu_policy", None):
         gpu_cli_overrides["policy"] = args.gpu_policy
