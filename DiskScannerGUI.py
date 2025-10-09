@@ -1025,7 +1025,7 @@ class ScannerWorker(threading.Thread):
                 shard.commit()
                 if light_pipeline and path and size is not None:
                     try:
-                        light_pipeline.process(SimpleNamespace(path=path, fs_path=path))
+                        light_pipeline.process(SimpleNamespace(path=path, fs_path=path), metadata=None)
                     except Exception:
                         pass
                 processed_all += 1

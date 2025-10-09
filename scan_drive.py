@@ -19,14 +19,29 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
+
 from analyzers import (
+    CaptionConfig,
+    CaptionRecord,
+    CaptionService,
+    CaptionWriter,
     FeatureRecord,
     FeatureWriter,
     ImageEmbedder,
     ImageEmbedderConfig,
     LightAnalysisModelError,
+    SemanticAnalyzer,
+    SemanticAnalyzerConfig,
+    SemanticModelError,
+    TranscriptRecord,
+    TranscriptWriter,
+    TranscriptionConfig,
+    TranscriptionService,
     VideoThumbnailAnalyzer,
+    ensure_caption_tables,
     ensure_features_table,
+    ensure_transcript_tables,
 )
 from gpu.capabilities import probe_gpu
 from gpu.runtime import (
@@ -43,6 +58,7 @@ from core.paths import (
     resolve_working_dir,
     safe_label,
 )
+from core.ann import ANNIndexManager
 from core.settings import load_settings
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
@@ -167,6 +183,21 @@ class LightAnalysisSettings:
     model_path: Path
     max_video_frames: int
     prefer_ffmpeg: bool
+    semantic_enabled: bool
+    semantic_model: str
+    semantic_pretrained: str
+    scene_threshold: float
+    scene_min_len: float
+    transcription_enabled: bool
+    transcription_model: str
+    transcription_max_duration: Optional[float]
+    transcription_beam_size: int
+    transcription_vad: bool
+    caption_enabled: bool
+    caption_model: str
+    caption_max_length: int
+    ann_enabled: bool
+    ann_backend: str
 
 
 @dataclass
@@ -203,6 +234,7 @@ class LightAnalysisPipeline:
         perf_profile: str,
         progress_callback: Optional[Callable[[dict], None]],
         start_time: float,
+        drive_label: str,
     ) -> None:
         self._requested = bool(settings.enabled)
         self._settings = settings
@@ -212,16 +244,26 @@ class LightAnalysisPipeline:
         self._profile = perf_profile
         self._progress_callback = progress_callback
         self._start = start_time
+        self._drive_label = drive_label
         self._last_emit = 0.0
         self._writer: Optional[FeatureWriter] = None
         self._embedder: Optional[ImageEmbedder] = None
         self._video: Optional[VideoThumbnailAnalyzer] = None
+        self._semantic: Optional[SemanticAnalyzer] = None
+        self._transcriber: Optional[TranscriptionService] = None
+        self._captioner: Optional[CaptionService] = None
+        self._transcript_writer: Optional[TranscriptWriter] = None
+        self._caption_writer: Optional[CaptionWriter] = None
+        self._ann_manager: Optional[ANNIndexManager] = None
         self._active = False
         self._error: Optional[str] = None
         self._warning: Optional[str] = None
         self._gpu_provider: str = "CPU"
         self._gpu_hwaccel = False
         self._ffmpeg_hwaccel_args: list[str] = []
+        self._features_updated = False
+        self._transcripts_written = 0
+        self._captions_written = 0
 
     def prepare(self) -> None:
         if not self._requested:
@@ -242,48 +284,72 @@ class LightAnalysisPipeline:
         self._gpu_provider = provider
         self._ffmpeg_hwaccel_args = list(hwaccel_args)
         self._gpu_hwaccel = bool(self._ffmpeg_hwaccel_args)
-        try:
-            self._embedder = ImageEmbedder(
-                ImageEmbedderConfig(
-                    model_path=self._settings.model_path,
-                    providers=providers,
-                    primary_provider=providers[0] if providers else "CPUExecutionProvider",
-                )
-            )
-        except LightAnalysisModelError as exc:
-            if provider != "CPU":
-                report_provider_failure(provider, exc)
-                fallback_providers = providers_for_session("CPU")
-                self._gpu_provider = "CPU"
-                self._ffmpeg_hwaccel_args = []
-                self._gpu_hwaccel = False
-                if not self._warning:
-                    self._warning = "GPU acceleration unavailable — using CPU."
-                try:
-                    self._embedder = ImageEmbedder(
-                        ImageEmbedderConfig(
-                            model_path=self._settings.model_path,
-                            providers=fallback_providers,
-                            primary_provider="CPUExecutionProvider",
-                        )
+
+        semantic_ready = False
+        if self._settings.semantic_enabled:
+            try:
+                self._semantic = SemanticAnalyzer(
+                    SemanticAnalyzerConfig(
+                        model_name=self._settings.semantic_model,
+                        pretrained=self._settings.semantic_pretrained,
+                        device_policy=self._gpu.policy,
+                        ffmpeg_path=Path(self._ffmpeg_path) if self._ffmpeg_path else None,
+                        max_video_frames=self._settings.max_video_frames,
+                        scene_threshold=self._settings.scene_threshold,
+                        min_scene_len=self._settings.scene_min_len,
                     )
-                except LightAnalysisModelError as cpu_exc:
-                    self._error = str(cpu_exc)
+                )
+                semantic_ready = True
+            except SemanticModelError as exc:
+                self._warning = (self._warning or str(exc))
+            except Exception as exc:  # pragma: no cover - defensive guard
+                self._warning = (self._warning or f"Semantic analysis unavailable: {exc}")
+
+        if not semantic_ready:
+            try:
+                self._embedder = ImageEmbedder(
+                    ImageEmbedderConfig(
+                        model_path=self._settings.model_path,
+                        providers=providers,
+                        primary_provider=providers[0] if providers else "CPUExecutionProvider",
+                    )
+                )
+            except LightAnalysisModelError as exc:
+                if provider != "CPU":
+                    report_provider_failure(provider, exc)
+                    fallback_providers = providers_for_session("CPU")
+                    self._gpu_provider = "CPU"
+                    self._ffmpeg_hwaccel_args = []
+                    self._gpu_hwaccel = False
+                    if not self._warning:
+                        self._warning = "GPU acceleration unavailable — using CPU."
+                    try:
+                        self._embedder = ImageEmbedder(
+                            ImageEmbedderConfig(
+                                model_path=self._settings.model_path,
+                                providers=fallback_providers,
+                                primary_provider="CPUExecutionProvider",
+                            )
+                        )
+                    except LightAnalysisModelError as cpu_exc:
+                        self._error = str(cpu_exc)
+                        self._emit_status("error", self._error)
+                        self._log_gpu_status()
+                        return
+                else:
+                    self._error = str(exc)
                     self._emit_status("error", self._error)
                     self._log_gpu_status()
                     return
-            else:
-                self._error = str(exc)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                self._error = f"Light analysis unavailable: {exc}"
                 self._emit_status("error", self._error)
                 self._log_gpu_status()
                 return
-        except Exception as exc:  # pragma: no cover - defensive guard
-            self._error = f"Light analysis unavailable: {exc}"
-            self._emit_status("error", self._error)
-            self._log_gpu_status()
-            return
+
         self._writer = FeatureWriter(self._conn, batch_size=48)
-        if self._ffmpeg_path:
+
+        if self._semantic is None and self._ffmpeg_path:
             self._video = VideoThumbnailAnalyzer(
                 embedder=self._embedder,
                 ffmpeg_path=self._ffmpeg_path,
@@ -292,11 +358,56 @@ class LightAnalysisPipeline:
                 rate_limit_profile=self._profile,
                 hwaccel_args=self._ffmpeg_hwaccel_args,
             )
-        else:
+        elif self._semantic is None and not self._ffmpeg_path:
             self._warning = "FFmpeg not available — video thumbnails skipped."
             self._emit_status("warning", self._warning)
             self._ffmpeg_hwaccel_args = []
             self._gpu_hwaccel = False
+
+        if self._settings.transcription_enabled:
+            try:
+                ensure_transcript_tables(self._conn)
+            except sqlite3.Error as exc:
+                LOGGER.warning("Unable to prepare transcripts table: %s", exc)
+            transcriber = TranscriptionService(
+                TranscriptionConfig(
+                    enabled=True,
+                    model_size=self._settings.transcription_model,
+                    device_policy=self._gpu.policy,
+                    max_duration=self._settings.transcription_max_duration,
+                    beam_size=self._settings.transcription_beam_size,
+                    vad_filter=self._settings.transcription_vad,
+                )
+            )
+            if transcriber.available:
+                self._transcriber = transcriber
+                self._transcript_writer = TranscriptWriter(self._conn, batch_size=24)
+            elif transcriber.last_error:
+                self._warning = self._warning or f"Transcription unavailable: {transcriber.last_error}"
+
+        if self._settings.caption_enabled:
+            try:
+                ensure_caption_tables(self._conn)
+            except sqlite3.Error as exc:
+                LOGGER.warning("Unable to prepare captions table: %s", exc)
+            captioner = CaptionService(
+                CaptionConfig(
+                    enabled=True,
+                    model_name=self._settings.caption_model,
+                    device_policy=self._gpu.policy,
+                    max_length=self._settings.caption_max_length,
+                )
+            )
+            if captioner.available:
+                self._captioner = captioner
+                self._caption_writer = CaptionWriter(self._conn, batch_size=24)
+            elif self._settings.caption_enabled:
+                self._warning = self._warning or "Captioning unavailable"
+
+        if self._settings.ann_enabled:
+            label = safe_label(self._drive_label or "default")
+            self._ann_manager = ANNIndexManager(WORKING_DIR_PATH, label, backend=self._settings.ann_backend)
+
         self._log_gpu_status()
         self._active = True
 
@@ -314,38 +425,82 @@ class LightAnalysisPipeline:
             "on" if self._gpu_hwaccel else "off",
         )
 
-    def process(self, info: FileInfo) -> None:
-        if not self._active or not self._embedder or not self._writer:
+    @staticmethod
+    def _normalize_vector(vector: np.ndarray) -> np.ndarray:
+        arr = np.asarray(vector, dtype=np.float32)
+        norm = np.linalg.norm(arr)
+        if norm > 0:
+            arr = arr / norm
+        return arr.astype(np.float32, copy=False)
+
+    def process(self, info: FileInfo, metadata: Optional[dict] = None) -> None:
+        if not self._active or not self._writer:
             return
         try:
             suffix = Path(info.path).suffix.lower()
         except Exception:
             return
         if suffix in IMAGE_EXTS:
-            vector = self._embedder.embed_path(Path(info.fs_path))
+            vector: Optional[np.ndarray] = None
+            if self._semantic is not None:
+                vector = self._semantic.encode_image_path(Path(info.fs_path))
+            elif self._embedder is not None:
+                vector = self._embedder.embed_path(Path(info.fs_path))
             if vector is not None:
+                normalized = self._normalize_vector(vector)
                 record = FeatureRecord(
                     path=info.path,
                     kind="image",
-                    vector=vector,
+                    vector=normalized,
                     frames_used=1,
                 )
                 self._writer.add(record)
+                self._features_updated = True
+                if self._captioner and self._caption_writer:
+                    caption = self._captioner.generate(Path(info.fs_path))
+                    if caption:
+                        self._caption_writer.add(
+                            CaptionRecord(
+                                path=info.path,
+                                content=caption,
+                                model=self._settings.caption_model,
+                            )
+                        )
+                        self._captions_written += 1
                 self._emit_progress()
         elif suffix in VIDEO_EXTS:
-            if not self._video:
-                return
-            vector, frames_used = self._video.extract_features(Path(info.fs_path))
+            vector: Optional[np.ndarray] = None
+            frames_used = 0
+            if self._semantic is not None:
+                vector, frames_used = self._semantic.encode_video(Path(info.fs_path))
+            elif self._video is not None:
+                vector, frames_used = self._video.extract_features(Path(info.fs_path))
             if vector is None:
                 return
+            normalized = self._normalize_vector(vector)
             record = FeatureRecord(
                 path=info.path,
                 kind="video",
-                vector=vector,
+                vector=normalized,
                 frames_used=max(1, frames_used),
             )
             self._writer.add(record)
+            self._features_updated = True
             self._emit_progress()
+
+        if (
+            self._transcriber
+            and self._transcript_writer
+            and suffix in AV_EXTS
+        ):
+            duration = _extract_duration(metadata)
+            result = self._transcriber.transcribe(Path(info.fs_path), duration=duration)
+            if result:
+                text, language = result
+                self._transcript_writer.add(
+                    TranscriptRecord(path=info.path, content=text, language=language)
+                )
+                self._transcripts_written += 1
 
     def finalize(self) -> Dict[str, object]:
         summary = {
@@ -377,6 +532,17 @@ class LightAnalysisPipeline:
         summary["status"] = "ok"
         if self._warning:
             summary["warning"] = self._warning
+        if self._transcript_writer:
+            self._transcript_writer.close()
+            summary["transcripts"] = self._transcript_writer.total_written
+        if self._caption_writer:
+            self._caption_writer.close()
+            summary["captions"] = self._caption_writer.total_written
+        if self._ann_manager and self._settings.ann_enabled:
+            try:
+                summary["ann"] = self._ann_manager.rebuild_from_db(self._conn)
+            except Exception as exc:
+                summary["ann"] = {"error": str(exc)}
         self._emit_progress(force=True)
         return summary
 
@@ -395,6 +561,10 @@ class LightAnalysisPipeline:
             "light_videos": self._writer.total_videos,
             "light_avg_dim": self._writer.average_dimension(),
         }
+        if self._transcripts_written:
+            payload["light_transcripts"] = self._transcripts_written
+        if self._captions_written:
+            payload["light_captions"] = self._captions_written
         if self._progress_callback is not None:
             try:
                 self._progress_callback(payload)
@@ -785,11 +955,68 @@ def _resolve_light_analysis(
     except Exception:
         max_frames = 2
     prefer_ffmpeg = bool(config.get("prefer_ffmpeg", True)) if isinstance(config, dict) else True
+
+    semantic_cfg = config.get("semantic") if isinstance(config.get("semantic"), dict) else {}
+    semantic_enabled = bool((semantic_cfg or {}).get("enabled", True))
+    semantic_model = str((semantic_cfg or {}).get("model", "ViT-B-32"))
+    semantic_pretrained = str((semantic_cfg or {}).get("pretrained", "laion2b_s34b_b79k"))
+    try:
+        scene_threshold = float((semantic_cfg or {}).get("scene_threshold", 27.0))
+    except (TypeError, ValueError):
+        scene_threshold = 27.0
+    try:
+        scene_min_len = float((semantic_cfg or {}).get("scene_min_len", 15.0))
+    except (TypeError, ValueError):
+        scene_min_len = 15.0
+
+    transcription_cfg = config.get("transcription") if isinstance(config.get("transcription"), dict) else {}
+    transcription_enabled = bool((transcription_cfg or {}).get("enabled", True))
+    transcription_model = str((transcription_cfg or {}).get("model", "base"))
+    max_duration_value = (transcription_cfg or {}).get("max_duration")
+    try:
+        transcription_max_duration = (
+            float(max_duration_value) if max_duration_value not in (None, "") else None
+        )
+    except (TypeError, ValueError):
+        transcription_max_duration = None
+    try:
+        transcription_beam_size = max(1, int((transcription_cfg or {}).get("beam_size", 5)))
+    except (TypeError, ValueError):
+        transcription_beam_size = 5
+    transcription_vad = bool((transcription_cfg or {}).get("vad_filter", False))
+
+    caption_cfg = config.get("captions") if isinstance(config.get("captions"), dict) else {}
+    caption_enabled = bool((caption_cfg or {}).get("enabled", False))
+    caption_model = str((caption_cfg or {}).get("model", "Salesforce/blip-image-captioning-base"))
+    try:
+        caption_max_length = max(16, int((caption_cfg or {}).get("max_length", 64)))
+    except (TypeError, ValueError):
+        caption_max_length = 64
+
+    ann_cfg = config.get("ann") if isinstance(config.get("ann"), dict) else {}
+    ann_enabled = bool((ann_cfg or {}).get("enabled", True))
+    ann_backend = str((ann_cfg or {}).get("backend", "auto"))
+
     return LightAnalysisSettings(
         enabled=enabled,
         model_path=model_path,
         max_video_frames=max_frames,
         prefer_ffmpeg=prefer_ffmpeg,
+        semantic_enabled=semantic_enabled,
+        semantic_model=semantic_model,
+        semantic_pretrained=semantic_pretrained,
+        scene_threshold=scene_threshold,
+        scene_min_len=scene_min_len,
+        transcription_enabled=transcription_enabled,
+        transcription_model=transcription_model,
+        transcription_max_duration=transcription_max_duration,
+        transcription_beam_size=transcription_beam_size,
+        transcription_vad=transcription_vad,
+        caption_enabled=caption_enabled,
+        caption_model=caption_model,
+        caption_max_length=caption_max_length,
+        ann_enabled=ann_enabled,
+        ann_backend=ann_backend,
     )
 
 
@@ -1590,6 +1817,7 @@ def scan_drive(
             perf_profile=str(perf_config.profile),
             progress_callback=progress_callback,
             start_time=start_time,
+            drive_label=label,
         )
         light_pipeline.prepare()
         fingerprint_pipeline = FingerprintPipeline(
@@ -1918,7 +2146,7 @@ def scan_drive(
                     )
                 )
             if light_pipeline is not None:
-                light_pipeline.process(info)
+                light_pipeline.process(info, metadata=result.media_metadata)
             if fingerprint_pipeline is not None:
                 fingerprint_pipeline.submit(result)
             _flush_db(force=False)
