@@ -84,6 +84,16 @@ Vectors are serialized as float32 arrays so downstream tools can read them direc
 
 If the ONNX model or runtime cannot be loaded the scanner posts a red banner, skips feature extraction, and continues hashing/metadata work as usual.
 
+## Duplicate detection (TMK+PDQF & Chromaprint)
+
+- VideoCatalog can now capture robust perceptual fingerprints for both video and audio assets. Enable them from the CLI (`scan_drive.py --fingerprint-video-tmk` and/or `--fingerprint-audio-chroma`) or from the GUI's scan dialog under the new **Fingerprints** panel.
+- Fingerprints are stored in shard-local tables (`video_fp_tmk`, `audio_fp_chroma`, and optional `video_vhash`) so the primary inventory remains lightweight. Each record includes tool version metadata and timestamps to support incremental updates.
+- TMK+PDQF signatures rely on Meta's ThreatExchange utilities (`tmk-hash-video`, `tmk-compare-post`). Point the scanner at a portable build with `--tmk-bin <PATH>` (or `settings.json → fingerprints.tmk_bin_path`); missing tools gracefully disable video fingerprinting with a banner warning.
+- Audio fingerprints leverage Chromaprint's `fpcalc`. Provide a path with `--fpcalc <PATH>` or configure it once in `settings.json`. When the executable is absent the run continues without audio fingerprints.
+- Optional videohash prefiltering (`videohash` Python package) quickly spots obvious duplicates and reduces expensive TMK comparisons. Toggle it via `--fingerprint-prefilter-vhash` / `--no-prefilter-vhash` or `fingerprints.enable_video_vhash_prefilter` in settings.
+- Fingerprinting can execute concurrently with the main scan (`--fingerprint-phase during-scan`) or deferred to a lighter post-processing pass (`--fingerprint-phase post-scan`). Worker count and I/O pacing are configurable (`--fingerprint-workers N`, `--fingerprint-io-ms N`).
+- Completion summaries include counts for video signatures, audio fingerprints, and prefilter hashes so you can monitor coverage per run. Detailed status (including missing tool hints) is also surfaced to the GUI progress feed.
+
 ## Performance Profiles
 
 `scan_drive.py` and the GUI automatically benchmark the selected mount point to choose one of four performance profiles: **SSD**, **HDD**, **USB**, or **NETWORK**. The profile controls worker-thread counts, hashing chunk sizes, FFmpeg parallelism, and whether gentle I/O backoff is enabled. NETWORK scans always include a small per-file pause so SMB/CIFS shares stay responsive, while slower USB media lower concurrency and shrink read chunks to avoid thrashing.
