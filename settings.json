@@ -64,6 +64,36 @@
     },
     "max_candidates": 5
   },
+  "tv": {
+    "enable": true,
+    "use_opensubtitles": true,
+    "opensubtitles_api_key": null,
+    "opensubtitles_read_kib": 64,
+    "opensubtitles_timeout": 15,
+    "tmdb": {
+      "api_key": null,
+      "lang": "en",
+      "year_tolerance": 1
+    },
+    "tmdb_timeout": 15,
+    "imdb_enabled": true,
+    "max_candidates": 5,
+    "threshold_low": 0.5,
+    "threshold_high": 0.8,
+    "weights": {
+      "series_canon": 0.3,
+      "series_nfo": 0.25,
+      "series_tmdb": 0.2,
+      "series_structure": 0.1,
+      "season_canon": 0.25,
+      "season_tmdb": 0.25,
+      "season_nfo": 0.15,
+      "ep_parse": 0.3,
+      "ep_tmdb": 0.25,
+      "ep_oshash": 0.2,
+      "ep_langs": 0.1
+    }
+  },
   "docpreview": {
     "enable": false,
     "max_pages": 6,
