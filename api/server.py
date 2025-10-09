@@ -31,6 +31,9 @@ from .models import (
     SemanticSearchHit,
     SemanticSearchResponse,
     SemanticStatusResponse,
+    StructureDetailsResponse,
+    StructureReviewResponse,
+    StructureSummaryResponse,
     TopExtensionsReport,
 )
 from semantic import SemanticPhaseError
@@ -207,6 +210,47 @@ def create_app(config: APIServerConfig) -> FastAPI:
             source=result.source,
             categories=categories,
         )
+
+    @app.get("/v1/structure/summary", response_model=StructureSummaryResponse)
+    def structure_summary(
+        drive_label: str = Query(..., description="Drive label to query."),
+        _: str = Depends(auth_dependency),
+    ) -> StructureSummaryResponse:
+        ensure_drive(drive_label)
+        payload = data.structure_summary(drive_label)
+        return StructureSummaryResponse(**payload)
+
+    @app.get("/v1/structure/review", response_model=StructureReviewResponse)
+    def structure_review(
+        drive_label: str = Query(..., description="Drive label to query."),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        _: str = Depends(auth_dependency),
+    ) -> StructureReviewResponse:
+        ensure_drive(drive_label)
+        rows, pagination, next_offset, total = data.structure_review_page(
+            drive_label, limit=limit, offset=offset
+        )
+        return StructureReviewResponse(
+            drive_label=drive_label,
+            results=rows,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/structure/details", response_model=StructureDetailsResponse)
+    def structure_details(
+        drive_label: str = Query(..., description="Drive label to query."),
+        folder_path: str = Query(..., description="Folder path relative to the drive."),
+        _: str = Depends(auth_dependency),
+    ) -> StructureDetailsResponse:
+        ensure_drive(drive_label)
+        profile = data.structure_details(drive_label, folder_path)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="structure profile not found")
+        return StructureDetailsResponse(drive_label=drive_label, profile=profile)
 
     @app.get("/v1/reports/top-extensions", response_model=TopExtensionsReport)
     def reports_top_extensions(

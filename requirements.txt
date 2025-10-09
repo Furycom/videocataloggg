@@ -9,3 +9,8 @@ nvidia-ml-py
 opencv-python-headless
 fastapi
 uvicorn
+guessit
+rapidfuzz
+tmdbsimple
+IMDbPY
+requests

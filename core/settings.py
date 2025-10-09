@@ -84,6 +84,32 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "default_limit": 100,
         "max_page_size": 500,
     },
+    "structure": {
+        "enable": True,
+        "weights": {
+            "canon": 0.35,
+            "nfo": 0.25,
+            "oshash": 0.20,
+            "name_match": 0.15,
+            "runtime": 0.05,
+        },
+        "low_threshold": 0.50,
+        "high_threshold": 0.80,
+        "opensubtitles": {
+            "enabled": True,
+            "read_kib": 64,
+            "timeout_s": 15,
+            "api_key": None,
+        },
+        "tmdb": {
+            "enabled": True,
+            "api_key": None,
+        },
+        "imdb": {
+            "enabled": True,
+        },
+        "max_candidates": 5,
+    },
 }
 
 

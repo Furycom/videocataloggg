@@ -198,12 +198,90 @@ class OverviewCategoryModel(BaseModel):
 
 class OverviewReport(BaseModel):
     drive_label: str = Field(..., description="Drive label referenced by the report.")
-    total_files: int = Field(..., description="Total files discovered in the inventory.")
-    total_size: int = Field(..., description="Aggregate size in bytes.")
+    total_files: int = Field(..., description="Total number of files analysed.")
+    total_size: int = Field(..., description="Aggregate size in bytes across the drive.")
     average_size: int = Field(..., description="Average file size in bytes.")
-    source: str = Field(..., description="Data source used (inventory or inventory_stats).")
+    source: str = Field(..., description="Source table used to build the report.")
     categories: List[OverviewCategoryModel] = Field(
         ..., description="Category-level breakdown rows."
+    )
+
+
+class StructureCandidateModel(BaseModel):
+    source: str = Field(..., description="Signal source identifier (tmdb/imdb/opensubs/name).")
+    candidate_id: Optional[str] = Field(
+        None, description="Source-specific identifier such as TMDb or IMDb ID."
+    )
+    title: Optional[str] = Field(None, description="Candidate title returned by the source.")
+    year: Optional[int] = Field(None, description="Candidate release year when available.")
+    score: float = Field(..., description="Normalized score in the 0..1 range.")
+    extra: Dict[str, object] = Field(
+        default_factory=dict,
+        description="Additional metadata returned by the lookup source.",
+    )
+
+
+class StructureFolderProfile(BaseModel):
+    folder_path: str = Field(..., description="Folder path relative to the scanned drive.")
+    kind: Optional[str] = Field(None, description="Detected content kind: movie/series/other.")
+    main_video_path: Optional[str] = Field(
+        None, description="Relative path to the primary video file when detected."
+    )
+    parsed_title: Optional[str] = Field(None, description="Best-effort parsed title.")
+    parsed_year: Optional[int] = Field(None, description="Best-effort parsed year.")
+    assets: Dict[str, object] = Field(
+        default_factory=dict, description="Detected local assets such as poster/subtitles." 
+    )
+    issues: List[str] = Field(default_factory=list, description="Recorded anomalies for the folder.")
+    confidence: float = Field(..., description="Combined confidence score (0..1).")
+    source_signals: Dict[str, float] = Field(
+        default_factory=dict, description="Contribution of each signal to the confidence score."
+    )
+    updated_utc: Optional[str] = Field(
+        None, description="Last time the profile was updated (UTC ISO format)."
+    )
+    candidates: List[StructureCandidateModel] = Field(
+        default_factory=list,
+        description="Sorted verification candidates associated with this folder.",
+    )
+
+
+class StructureSummaryResponse(BaseModel):
+    drive_label: str = Field(..., description="Drive label referenced by the summary.")
+    total: int = Field(..., description="Total profiled folders in this shard.")
+    confident: int = Field(..., description="Folders with confidence >= high threshold.")
+    medium: int = Field(..., description="Folders with confidence between low/high thresholds.")
+    low: int = Field(..., description="Folders with confidence below the low threshold.")
+    updated_utc: Optional[str] = Field(
+        None, description="Most recent update timestamp across profiled folders."
+    )
+
+
+class StructureReviewEntry(BaseModel):
+    folder_path: str = Field(..., description="Folder requiring manual review.")
+    confidence: float = Field(..., description="Current confidence score (0..1).")
+    reasons: List[str] = Field(
+        default_factory=list, description="Reasons that led to manual review."
+    )
+    questions: List[Dict[str, object]] = Field(
+        default_factory=list, description="Suggested follow-up actions/questions."
+    )
+    kind: Optional[str] = Field(None, description="Detected folder kind when available.")
+    parsed_title: Optional[str] = Field(None, description="Best-effort parsed title.")
+    parsed_year: Optional[int] = Field(None, description="Best-effort parsed year.")
+
+
+class StructureReviewResponse(PaginatedResponse):
+    drive_label: str = Field(..., description="Drive label referenced by the review queue.")
+    results: List[StructureReviewEntry] = Field(
+        ..., description="Manual review entries ordered by ascending confidence."
+    )
+
+
+class StructureDetailsResponse(BaseModel):
+    drive_label: str = Field(..., description="Drive label referenced by the profile.")
+    profile: StructureFolderProfile = Field(
+        ..., description="Detailed folder profile including verification candidates."
     )
 
 

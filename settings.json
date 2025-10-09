@@ -38,5 +38,30 @@
     ],
     "default_limit": 100,
     "max_page_size": 500
+  },
+  "structure": {
+    "enable": true,
+    "weights": {
+      "canon": 0.35,
+      "nfo": 0.25,
+      "oshash": 0.2,
+      "name_match": 0.15,
+      "runtime": 0.05
+    },
+    "low_threshold": 0.5,
+    "high_threshold": 0.8,
+    "opensubtitles": {
+      "enabled": true,
+      "read_kib": 64,
+      "timeout_s": 15
+    },
+    "tmdb": {
+      "enabled": true,
+      "api_key": null
+    },
+    "imdb": {
+      "enabled": true
+    },
+    "max_candidates": 5
   }
 }
