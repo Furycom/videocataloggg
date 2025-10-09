@@ -130,3 +130,75 @@ class DrivesResponse(BaseModel):
     """Wrapper around drive list payload."""
 
     results: List[DriveInfo] = Field(..., description="Known drive entries in the catalog.")
+
+
+class OverviewCategoryModel(BaseModel):
+    category: str = Field(..., description="Category key (video/audio/image/etc.)")
+    files: int = Field(..., description="File count within this category.")
+    bytes: int = Field(..., description="Total bytes across the category.")
+
+
+class OverviewReport(BaseModel):
+    drive_label: str = Field(..., description="Drive label referenced by the report.")
+    total_files: int = Field(..., description="Total files discovered in the inventory.")
+    total_size: int = Field(..., description="Aggregate size in bytes.")
+    average_size: int = Field(..., description="Average file size in bytes.")
+    source: str = Field(..., description="Data source used (inventory or inventory_stats).")
+    categories: List[OverviewCategoryModel] = Field(
+        ..., description="Category-level breakdown rows."
+    )
+
+
+class TopExtensionEntryModel(BaseModel):
+    extension: str = Field(..., description="File extension (lowercase, dotted).")
+    files: int = Field(..., description="File count for this extension.")
+    bytes: int = Field(..., description="Total bytes contributed by this extension.")
+    rank_count: Optional[int] = Field(None, description="Rank based on file count.")
+    rank_size: Optional[int] = Field(None, description="Rank based on total bytes.")
+
+
+class TopExtensionsReport(BaseModel):
+    drive_label: str = Field(..., description="Drive label referenced by the report.")
+    limit: int = Field(..., description="Maximum number of rows returned.")
+    entries: List[TopExtensionEntryModel] = Field(..., description="Top extension rows.")
+
+
+class LargestFileModel(BaseModel):
+    path: str = Field(..., description="Inventory path for the file.")
+    size_bytes: int = Field(..., description="File size in bytes.")
+    mtime_utc: Optional[str] = Field(None, description="Modification timestamp in UTC.")
+    category: Optional[str] = Field(None, description="Category classification if available.")
+
+
+class LargestFilesReport(BaseModel):
+    drive_label: str = Field(..., description="Drive label referenced by the report.")
+    limit: int = Field(..., description="Maximum number of rows returned.")
+    results: List[LargestFileModel] = Field(..., description="Largest file rows.")
+
+
+class HeaviestFolderModel(BaseModel):
+    folder: str = Field(..., description="Folder path aggregated to the configured depth.")
+    files: int = Field(..., description="File count within this aggregated folder.")
+    bytes: int = Field(..., description="Total bytes across the folder tree.")
+
+
+class HeaviestFoldersReport(BaseModel):
+    drive_label: str = Field(..., description="Drive label referenced by the report.")
+    depth: int = Field(..., description="Depth used to aggregate folders.")
+    limit: int = Field(..., description="Maximum number of rows returned.")
+    results: List[HeaviestFolderModel] = Field(..., description="Heaviest folder rows.")
+
+
+class RecentChangeModel(BaseModel):
+    path: str = Field(..., description="Inventory path for the file.")
+    size_bytes: int = Field(..., description="File size in bytes.")
+    mtime_utc: Optional[str] = Field(None, description="Modification timestamp in UTC.")
+    category: Optional[str] = Field(None, description="Category classification if available.")
+
+
+class RecentChangesReport(BaseModel):
+    drive_label: str = Field(..., description="Drive label referenced by the report.")
+    days: int = Field(..., description="Window in days used for the report.")
+    limit: int = Field(..., description="Maximum number of rows returned.")
+    total: int = Field(..., description="Total files matching the window across the inventory.")
+    results: List[RecentChangeModel] = Field(..., description="Recent change rows.")

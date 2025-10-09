@@ -21,7 +21,12 @@ from .models import (
     FeaturesResponse,
     FileResponse,
     HealthResponse,
+    HeaviestFoldersReport,
     InventoryResponse,
+    LargestFilesReport,
+    OverviewReport,
+    RecentChangesReport,
+    TopExtensionsReport,
 )
 
 LOGGER = logging.getLogger("videocatalog.api")
@@ -100,6 +105,14 @@ def create_app(config: APIServerConfig) -> FastAPI:
         except LookupError:
             raise HTTPException(status_code=404, detail="unknown drive_label")
 
+    def clamp_limit(value: Optional[int], default: int) -> int:
+        try:
+            parsed = int(value) if value is not None else int(default)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        parsed = max(1, parsed)
+        return min(parsed, data.max_page_size)
+
     @app.get("/v1/health", response_model=HealthResponse)
     def health_check(_: str = Depends(auth_dependency)) -> HealthResponse:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -164,6 +177,129 @@ def create_app(config: APIServerConfig) -> FastAPI:
         ensure_drive(drive_label)
         payload = data.drive_stats(drive_label)
         return DriveStatsResponse(**payload)
+
+    @app.get("/v1/reports/overview", response_model=OverviewReport)
+    def reports_overview(
+        drive_label: str = Query(..., description="Drive label to query."),
+        _: str = Depends(auth_dependency),
+    ) -> OverviewReport:
+        ensure_drive(drive_label)
+        result = data.report_overview(drive_label)
+        categories = [
+            {
+                "category": cat.category,
+                "files": cat.files,
+                "bytes": cat.bytes,
+            }
+            for cat in result.categories
+        ]
+        return OverviewReport(
+            drive_label=drive_label,
+            total_files=result.total_files,
+            total_size=result.total_size,
+            average_size=result.average_size,
+            source=result.source,
+            categories=categories,
+        )
+
+    @app.get("/v1/reports/top-extensions", response_model=TopExtensionsReport)
+    def reports_top_extensions(
+        drive_label: str = Query(..., description="Drive label to query."),
+        limit: Optional[int] = Query(20, ge=1),
+        _: str = Depends(auth_dependency),
+    ) -> TopExtensionsReport:
+        ensure_drive(drive_label)
+        resolved_limit = clamp_limit(limit, 20)
+        result = data.report_top_extensions(drive_label, resolved_limit)
+        entries = [
+            {
+                "extension": entry.extension or "",
+                "files": entry.files,
+                "bytes": entry.bytes,
+                "rank_count": entry.rank_count,
+                "rank_size": entry.rank_size,
+            }
+            for entry in result.entries
+        ]
+        return TopExtensionsReport(
+            drive_label=drive_label,
+            limit=resolved_limit,
+            entries=entries,
+        )
+
+    @app.get("/v1/reports/largest-files", response_model=LargestFilesReport)
+    def reports_largest_files(
+        drive_label: str = Query(..., description="Drive label to query."),
+        limit: Optional[int] = Query(100, ge=1),
+        _: str = Depends(auth_dependency),
+    ) -> LargestFilesReport:
+        ensure_drive(drive_label)
+        resolved_limit = clamp_limit(limit, 100)
+        rows = data.report_largest_files(drive_label, resolved_limit)
+        results = [
+            {
+                "path": row.path,
+                "size_bytes": row.size_bytes,
+                "mtime_utc": row.mtime_utc,
+                "category": row.category,
+            }
+            for row in rows
+        ]
+        return LargestFilesReport(
+            drive_label=drive_label,
+            limit=resolved_limit,
+            results=results,
+        )
+
+    @app.get("/v1/reports/heaviest-folders", response_model=HeaviestFoldersReport)
+    def reports_heaviest_folders(
+        drive_label: str = Query(..., description="Drive label to query."),
+        depth: Optional[int] = Query(2, ge=0),
+        limit: Optional[int] = Query(20, ge=1),
+        _: str = Depends(auth_dependency),
+    ) -> HeaviestFoldersReport:
+        ensure_drive(drive_label)
+        resolved_limit = clamp_limit(limit, 20)
+        resolved_depth = max(0, int(depth or 0))
+        rows = data.report_heaviest_folders(drive_label, resolved_depth, resolved_limit)
+        results = [
+            {"folder": row.folder, "files": row.files, "bytes": row.bytes}
+            for row in rows
+        ]
+        return HeaviestFoldersReport(
+            drive_label=drive_label,
+            depth=resolved_depth,
+            limit=resolved_limit,
+            results=results,
+        )
+
+    @app.get("/v1/reports/recent", response_model=RecentChangesReport)
+    def reports_recent(
+        drive_label: str = Query(..., description="Drive label to query."),
+        days: Optional[int] = Query(30, ge=0),
+        limit: Optional[int] = Query(20, ge=1),
+        _: str = Depends(auth_dependency),
+    ) -> RecentChangesReport:
+        ensure_drive(drive_label)
+        resolved_limit = clamp_limit(limit, 20)
+        resolved_days = max(0, int(days or 0))
+        recent = data.report_recent_changes(drive_label, resolved_days, resolved_limit)
+        results = [
+            {
+                "path": row.path,
+                "size_bytes": row.size_bytes,
+                "mtime_utc": row.mtime_utc,
+                "category": row.category,
+            }
+            for row in recent.rows
+        ]
+        return RecentChangesReport(
+            drive_label=drive_label,
+            days=resolved_days,
+            limit=resolved_limit,
+            total=recent.total,
+            results=results,
+        )
 
     @app.get("/v1/features", response_model=FeaturesResponse)
     def features(

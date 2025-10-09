@@ -13,11 +13,18 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - Results return the latest 1,000 matches with name, category, size, modified time, drive label, and full path. Double-click opens the file's folder in Explorer, the context menu can copy the full path, and exports land as CSV/JSONL under `<working_dir>/exports`.
 - The first search against an older shard performs a lightweight migration that backfills the lowercase `inventory.name` column and index; if migration fails the UI falls back to path-only matching and surfaces the error.
 
+## Reports
+
+- Switch to the **Reports** tab to generate read-only summaries for any catalogued drive. Pick a drive, adjust the *Top N* limit (used for top extensions, heaviest folders, and recents), set the folder depth and recency window, then press **Run**. Queries are executed on background threads so the GUI stays responsive.
+- The tab renders five sections: an overview (totals, average size, and per-category counts), top extensions (by count and total bytes), largest files, heaviest folders (aggregated to the selected depth), and recent changes (files modified in the last *X* days). Column headers are clickable to sort in place.
+- Use **Export CSV…** or **Export JSON…** to dump the current result sets. CSV exports create one file per section and JSON bundles everything into a single structured document. Files land under `<working_dir>/exports/reports/` with timestamped names.
+
 ## Local read-only API
 
 - Launch the service directly with `python videocatalog_api.py --api-key <KEY>` (optional `--host`, `--port`, and repeated `--cors` flags override `settings.json`). On start the CLI prints `API listening on http://<host>:<port>` so other tools can probe it locally.
 - The GUI exposes a **Start Local API** toggle under the Database card. It shows host/port plus whether an API key is configured and runs the server in a background process. Disable it from the same button or let it auto-start when `settings.json` sets `"api.enabled_default": true`.
 - All endpoints are GET-only, paginate with `limit`/`offset`, and require an `X-API-Key` header. Missing or empty keys return `401 Unauthorized`. Defaults bind to `127.0.0.1:8756`; expanding beyond localhost or exposing the API externally is at your own risk.
+- `/v1/reports/*` mirrors the GUI summaries (`overview`, `top-extensions`, `largest-files`, `heaviest-folders`, `recent`) and clamps `limit` parameters to the configured API maximum.
 - Example requests:
 
   ```bash

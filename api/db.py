@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import reports_util
+
 from paths import (
     get_catalog_db_path,
     get_shard_db_path,
@@ -297,7 +299,7 @@ class DataAccess:
                 )
                 for row in cursor.fetchall():
                     category = str(row["cat"])
-                    totals[category] = int(row["count"] or 0)
+                totals[category] = int(row["count"] or 0)
                 total_files = sum(totals.values())
         return {
             "drive_label": drive_label,
@@ -307,6 +309,60 @@ class DataAccess:
                 "scanned_at_utc": scanned_at,
             },
         }
+
+    def report_bundle(
+        self,
+        drive_label: str,
+        *,
+        top_n: int = 20,
+        folder_depth: int = 2,
+        recent_days: int = 30,
+        largest_limit: int = 100,
+    ) -> reports_util.ReportBundle:
+        shard_path = self._shard_path_for(drive_label)
+        catalog = self.catalog_path if self.catalog_path.exists() else None
+        return reports_util.generate_report(
+            shard_path,
+            catalog,
+            drive_label,
+            top_n=top_n,
+            folder_depth=folder_depth,
+            recent_days=recent_days,
+            largest_limit=largest_limit,
+        )
+
+    def report_overview(self, drive_label: str) -> reports_util.OverviewResult:
+        shard_path = self._shard_path_for(drive_label)
+        catalog = self.catalog_path if self.catalog_path.exists() else None
+        return reports_util.fetch_overview(shard_path, catalog, drive_label)
+
+    def report_top_extensions(
+        self, drive_label: str, limit: int
+    ) -> reports_util.TopExtensionsResult:
+        shard_path = self._shard_path_for(drive_label)
+        return reports_util.fetch_top_extensions(shard_path, max(1, int(limit)))
+
+    def report_largest_files(
+        self, drive_label: str, limit: int
+    ) -> List[reports_util.LargestFileRow]:
+        shard_path = self._shard_path_for(drive_label)
+        return reports_util.fetch_largest_files(shard_path, max(1, int(limit)))
+
+    def report_heaviest_folders(
+        self, drive_label: str, depth: int, limit: int
+    ) -> List[reports_util.HeaviestFolderRow]:
+        shard_path = self._shard_path_for(drive_label)
+        return reports_util.fetch_heaviest_folders(
+            shard_path, max(0, int(depth)), max(1, int(limit))
+        )
+
+    def report_recent_changes(
+        self, drive_label: str, days: int, limit: int
+    ) -> reports_util.RecentChangesResult:
+        shard_path = self._shard_path_for(drive_label)
+        return reports_util.fetch_recent_changes(
+            shard_path, max(0, int(days)), max(1, int(limit))
+        )
     def features_page(
         self,
         drive_label: str,

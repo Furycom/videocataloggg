@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 from types import SimpleNamespace
 
 import scan_drive
@@ -57,6 +57,7 @@ from search_util import (
     format_results,
     export_results,
 )
+import reports_util
 from tkinter import (
     Tk, Toplevel, StringVar, IntVar, END, N, S, E, W,
     filedialog, messagebox, ttk, Menu, Spinbox
@@ -1796,6 +1797,21 @@ class App:
         self._search_results: list[dict] = []
         self._search_drive_options: list[str] = []
 
+        self.reports_drive_var = StringVar()
+        self.reports_topn_var = IntVar(value=20)
+        self.reports_depth_var = IntVar(value=2)
+        self.reports_days_var = IntVar(value=30)
+        self.reports_status_var = StringVar(value="Reports idle.")
+        self._reports_queue: "queue.Queue[dict]" = queue.Queue()
+        self._reports_thread: Optional[threading.Thread] = None
+        self._reports_cancel: Optional[threading.Event] = None
+        self._reports_bundle: Optional[reports_util.ReportBundle] = None
+        self._report_sections: dict[str, reports_util.SectionResult] = {}
+        self._report_tree_rows: dict[str, dict[str, dict[str, Any]]] = {}
+        self._report_sort_state: dict[tuple[str, str], bool] = {}
+        self.report_trees: dict[str, ttk.Treeview] = {}
+        self._reports_run_token = 0
+
         self.api_enabled_default = API_ENABLED_DEFAULT
         self.api_default_host = API_HOST_DEFAULT
         self.api_default_port = API_PORT_DEFAULT
@@ -1819,6 +1835,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self._poll_worker_queue)
         self.root.after(200, self._poll_search_queue)
+        self.root.after(200, self._poll_reports_queue)
 
         for d in (SCANS_DIR, LOGS_DIR, EXPORTS_DIR, SHARDS_DIR):
             os.makedirs(d, exist_ok=True)
@@ -2191,9 +2208,15 @@ class App:
         self.search_tab.columnconfigure(0, weight=1)
         self.search_tab.rowconfigure(1, weight=1)
         self.main_notebook.add(self.search_tab, text="Search")
+        self.reports_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.reports_tab.columnconfigure(0, weight=1)
+        for idx in range(1, 6):
+            self.reports_tab.rowconfigure(idx, weight=1)
+        self.main_notebook.add(self.reports_tab, text="Reports")
 
         self._build_dashboard_controls(self.dashboard_tab)
         self._build_search_tab(self.search_tab)
+        self._build_reports_tab(self.reports_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -2415,6 +2438,99 @@ class App:
         self.search_menu.add_command(label="Export results…", command=self._export_search_results)
 
         self._on_search_focus_out()
+
+    def _build_reports_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        controls = ttk.LabelFrame(parent, text="Reports", padding=(16, 16), style="Card.TLabelframe")
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+
+        ttk.Label(controls, text="Drive:").grid(row=0, column=0, sticky="w")
+        self.reports_drive_combo = ttk.Combobox(
+            controls,
+            textvariable=self.reports_drive_var,
+            state="readonly",
+            values=(),
+        )
+        self.reports_drive_combo.grid(row=0, column=1, sticky="ew", padx=(12, 12))
+
+        ttk.Label(controls, text="Top N:").grid(row=0, column=2, sticky="e")
+        self.reports_topn_spin = Spinbox(
+            controls,
+            from_=5,
+            to=500,
+            width=6,
+            textvariable=self.reports_topn_var,
+        )
+        self.reports_topn_spin.grid(row=0, column=3, sticky="w")
+
+        ttk.Label(controls, text="Depth:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        self.reports_depth_spin = Spinbox(
+            controls,
+            from_=1,
+            to=10,
+            width=6,
+            textvariable=self.reports_depth_var,
+        )
+        self.reports_depth_spin.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(12, 0))
+
+        ttk.Label(controls, text="Last X days:").grid(row=1, column=2, sticky="e", pady=(12, 0))
+        self.reports_days_spin = Spinbox(
+            controls,
+            from_=1,
+            to=365,
+            width=6,
+            textvariable=self.reports_days_var,
+        )
+        self.reports_days_spin.grid(row=1, column=3, sticky="w", pady=(12, 0))
+
+        actions = ttk.Frame(controls, style="Card.TFrame")
+        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        for idx in range(3):
+            actions.columnconfigure(idx, weight=1)
+        ttk.Button(actions, text="Run", command=self.run_reports, style="Accent.TButton").grid(
+            row=0, column=0, sticky="ew"
+        )
+        ttk.Button(actions, text="Export CSV…", command=lambda: self.export_reports("csv")).grid(
+            row=0, column=1, sticky="ew", padx=(12, 0)
+        )
+        ttk.Button(actions, text="Export JSON…", command=lambda: self.export_reports("json")).grid(
+            row=0, column=2, sticky="ew", padx=(12, 0)
+        )
+
+        ttk.Label(
+            controls,
+            textvariable=self.reports_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        section_specs = [
+            ("overview", "Overview", 6),
+            ("top_extensions", "Top extensions", 8),
+            ("largest_files", "Largest files", 10),
+            ("heaviest_folders", "Heaviest folders", 8),
+            ("recent_changes", "Recent changes", 10),
+        ]
+        for row_index, (key, title, height) in enumerate(section_specs, start=1):
+            frame = ttk.LabelFrame(parent, text=title, padding=(16, 12), style="Card.TLabelframe")
+            frame.grid(row=row_index, column=0, sticky=(N, S, E, W), pady=(12 if row_index > 1 else 16, 0))
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            tree = ttk.Treeview(
+                frame,
+                columns=(),
+                show="headings",
+                height=height,
+                style="Card.Treeview",
+            )
+            tree.grid(row=0, column=0, sticky=(N, S, E, W))
+            scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=scroll.set)
+            scroll.grid(row=0, column=1, sticky=(N, S))
+            self.report_trees[key] = tree
+            self._report_tree_rows[key] = {}
 
     def _build_tables(self):
         parent = getattr(self, "dashboard_tab", self.content)
@@ -2835,6 +2951,302 @@ class App:
         else:
             self.search_drive_var.set("")
 
+    def _update_reports_drive_options(self, labels: List[str]) -> None:
+        unique = sorted({label for label in labels if label})
+        if not hasattr(self, "reports_drive_combo"):
+            return
+        self.reports_drive_combo["values"] = unique
+        current = self.reports_drive_var.get()
+        candidate = self._last_scan_label or self.label_var.get().strip()
+        if current and current in unique:
+            return
+        selected = None
+        if candidate and candidate in unique:
+            selected = candidate
+        elif unique:
+            selected = unique[0]
+        if selected:
+            self.reports_drive_var.set(selected)
+        else:
+            self.reports_drive_var.set("")
+
+    def _reset_report_views(self) -> None:
+        self._report_sections = {}
+        self._reports_bundle = None
+        self._report_sort_state.clear()
+        for key, tree in self.report_trees.items():
+            try:
+                tree.delete(*tree.get_children())
+            except Exception:
+                pass
+            tree["columns"] = ()
+            tree["displaycolumns"] = ()
+            self._report_tree_rows[key] = {}
+
+    def _set_report_headings(
+        self, section_key: str, active_column: Optional[str] = None, ascending: bool = True
+    ) -> None:
+        section = self._report_sections.get(section_key)
+        tree = self.report_trees.get(section_key)
+        if not section or not tree:
+            return
+        for column in section.columns:
+            text = column.heading
+            if active_column == column.key:
+                text = f"{column.heading} {'▲' if ascending else '▼'}"
+            tree.heading(
+                column.key,
+                text=text,
+                command=lambda c=column.key, key=section_key: self._sort_report_tree(key, c),
+            )
+
+    def _sort_report_tree(self, section_key: str, column_key: str) -> None:
+        tree = self.report_trees.get(section_key)
+        section = self._report_sections.get(section_key)
+        if not tree or not section:
+            return
+        rows = list(tree.get_children(""))
+        if not rows:
+            return
+        column_meta = next((col for col in section.columns if col.key == column_key), None)
+        numeric = bool(column_meta and column_meta.numeric)
+        raw_map = self._report_tree_rows.get(section_key, {})
+
+        def key_func(item: str):
+            raw = raw_map.get(item) or {}
+            value = raw.get(column_key)
+            if value is None:
+                value = tree.set(item, column_key)
+            if numeric:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return 0.0
+            return str(value)
+
+        ascending = not self._report_sort_state.get((section_key, column_key), False)
+        rows.sort(key=key_func, reverse=not ascending)
+        for index, item in enumerate(rows):
+            tree.move(item, "", index)
+        self._report_sort_state[(section_key, column_key)] = ascending
+        self._set_report_headings(section_key, column_key, ascending)
+
+    def run_reports(self) -> None:
+        drive_label = (self.reports_drive_var.get() or "").strip()
+        if not drive_label:
+            message = "Select a drive to run reports."
+            self.reports_status_var.set(message)
+            self.show_banner(message, "INFO")
+            return
+        shard = shard_path_for(drive_label)
+        if not shard.exists():
+            message = "No inventory available for this drive."
+            self._reset_report_views()
+            self.reports_status_var.set(message)
+            self.show_banner(message, "ERROR")
+            return
+        try:
+            top_n = max(5, int(self.reports_topn_var.get()))
+        except (TypeError, ValueError):
+            top_n = 20
+            self.reports_topn_var.set(top_n)
+        try:
+            depth = max(1, int(self.reports_depth_var.get()))
+        except (TypeError, ValueError):
+            depth = 2
+            self.reports_depth_var.set(depth)
+        try:
+            days = max(1, int(self.reports_days_var.get()))
+        except (TypeError, ValueError):
+            days = 30
+            self.reports_days_var.set(days)
+        largest_limit = max(100, top_n)
+        if self._reports_thread and self._reports_thread.is_alive():
+            if self._reports_cancel:
+                self._reports_cancel.set()
+        catalog_path = Path(self.db_path.get()) if self.db_path.get() else None
+        self._reports_cancel = threading.Event()
+        self._reports_run_token += 1
+        token = self._reports_run_token
+        worker_args = (
+            token,
+            shard,
+            catalog_path,
+            drive_label,
+            top_n,
+            depth,
+            days,
+            largest_limit,
+            self._reports_cancel,
+        )
+        self._reports_thread = threading.Thread(
+            target=self._reports_worker,
+            args=worker_args,
+            daemon=True,
+        )
+        self._reports_thread.start()
+        self._reset_report_views()
+        self.reports_status_var.set(f"Running reports for {drive_label}…")
+        try:
+            self.main_notebook.select(self.reports_tab)
+        except Exception:
+            pass
+
+    def _reports_worker(
+        self,
+        token: int,
+        shard_path: Path,
+        catalog_path: Optional[Path],
+        drive_label: str,
+        top_n: int,
+        depth: int,
+        days: int,
+        largest_limit: int,
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        try:
+            bundle = reports_util.generate_report(
+                shard_path,
+                catalog_path,
+                drive_label,
+                top_n=top_n,
+                folder_depth=depth,
+                recent_days=days,
+                largest_limit=largest_limit,
+                cancel_event=cancel_event,
+            )
+        except reports_util.ReportCancelled:
+            return
+        except reports_util.MissingInventoryError:
+            self._reports_queue.put({"type": "no_inventory", "token": token, "drive": drive_label})
+        except Exception as exc:
+            self._reports_queue.put({"type": "error", "token": token, "message": str(exc)})
+        else:
+            self._reports_queue.put({"type": "results", "token": token, "bundle": bundle})
+
+    def _poll_reports_queue(self):
+        try:
+            while True:
+                payload = self._reports_queue.get_nowait()
+                token = payload.get("token")
+                if token is not None and token != self._reports_run_token:
+                    continue
+                kind = payload.get("type")
+                if kind == "results":
+                    bundle = payload.get("bundle")
+                    if isinstance(bundle, reports_util.ReportBundle):
+                        self._apply_reports_results(bundle)
+                elif kind == "error":
+                    self._handle_reports_error(payload.get("message") or "Unknown error")
+                elif kind == "no_inventory":
+                    self._handle_reports_no_inventory()
+        except queue.Empty:
+            pass
+        finally:
+            if not self._closing:
+                self.root.after(200, self._poll_reports_queue)
+
+    def _apply_reports_results(self, bundle: reports_util.ReportBundle) -> None:
+        self._reports_thread = None
+        self._reports_cancel = None
+        self._reports_bundle = bundle
+        sections = reports_util.bundle_to_sections(bundle)
+        self._report_sections = sections
+        total_rows = 0
+        for key, section in sections.items():
+            tree = self.report_trees.get(key)
+            if not tree:
+                continue
+            self._report_tree_rows[key] = {}
+            columns = [column.key for column in section.columns]
+            tree["columns"] = columns
+            tree["displaycolumns"] = columns
+            for column in section.columns:
+                anchor = column.anchor.lower() if column.anchor else "w"
+                if anchor == "e":
+                    anchor_value = E
+                elif anchor == "center":
+                    anchor_value = "center"
+                else:
+                    anchor_value = W
+                width = column.width if column.width is not None else 160
+                tree.column(
+                    column.key,
+                    anchor=anchor_value,
+                    stretch=bool(column.stretch),
+                    width=width,
+                )
+            self._set_report_headings(key)
+            for idx, row in enumerate(section.rows):
+                values = [row.get(column.key, "") for column in section.columns]
+                item = tree.insert("", END, values=values)
+                export_rows = section.export_rows
+                if idx < len(export_rows):
+                    self._report_tree_rows[key][item] = export_rows[idx]
+                else:
+                    self._report_tree_rows[key][item] = {}
+            total_rows += len(section.rows)
+        recent_total = bundle.recent_changes.total
+        recent_shown = len(bundle.recent_changes.rows)
+        status = f"Report generated in {bundle.elapsed_ms} ms — results: {total_rows:,} rows"
+        if recent_total:
+            if recent_total > recent_shown:
+                status += f" — recent files: {recent_total:,} (showing {recent_shown:,})"
+            else:
+                status += f" — recent files: {recent_total:,}"
+        source = bundle.overview.source
+        if source and source != "inventory":
+            status += f" — categories from {source.replace('_', ' ')}"
+        self.reports_status_var.set(status)
+
+    def _handle_reports_error(self, message: str) -> None:
+        self._reports_thread = None
+        self._reports_cancel = None
+        self.reports_status_var.set(f"Error: {message}")
+        self.show_banner(f"Reports error: {message}", "ERROR")
+
+    def _handle_reports_no_inventory(self) -> None:
+        self._reports_thread = None
+        self._reports_cancel = None
+        self._reset_report_views()
+        message = "No inventory available for this drive."
+        self.reports_status_var.set(message)
+        self.show_banner(message, "ERROR")
+
+    def export_reports(self, fmt: str) -> None:
+        bundle = self._reports_bundle
+        if not bundle:
+            messagebox.showinfo("Reports", "Run the reports before exporting.")
+            return
+        export_dir = EXPORTS_DIR_PATH / "reports"
+        try:
+            if fmt == "csv":
+                paths = reports_util.export_bundle_to_csv(bundle, export_dir)
+                summary = f"CSV exports saved: {', '.join(path.name for path in paths)}"
+                self.reports_status_var.set(summary)
+                self.show_banner(
+                    summary,
+                    "SUCCESS",
+                    action=("Open exports folder", self.open_exports_folder),
+                )
+                self._recent_export_paths.extend(paths)
+            elif fmt == "json":
+                path = reports_util.export_bundle_to_json(bundle, export_dir)
+                summary = f"JSON export saved: {path.name}"
+                self.reports_status_var.set(summary)
+                self.show_banner(
+                    summary,
+                    "SUCCESS",
+                    action=("Open exports folder", self.open_exports_folder),
+                )
+                self._recent_export_paths.append(path)
+            else:
+                raise ValueError("Unsupported export format")
+            if len(self._recent_export_paths) > 5:
+                self._recent_export_paths = self._recent_export_paths[-5:]
+        except Exception as exc:
+            messagebox.showerror("Reports", f"Export failed: {exc}")
+            self.reports_status_var.set(f"Export failed: {exc}")
 
     def _set_status(self, message: str, level: str = "info"):
         if not hasattr(self, "status_var"):
@@ -4103,6 +4515,7 @@ class App:
                 drive_labels.append(label_value)
         con.close()
         self._update_search_drive_options(drive_labels)
+        self._update_reports_drive_options(drive_labels)
 
     def refresh_jobs(self):
         self.jobs.delete(*self.jobs.get_children())
