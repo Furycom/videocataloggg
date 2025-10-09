@@ -6,6 +6,13 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
 `DiskScannerGUI.py` provides a Tk-based interface for launching scans and reviewing job history.
 
+## Quick Search
+
+- Open the **Search** tab (or click the toolbar Search button) and pick a drive/shard to query.
+- Enter at least three characters; the query is normalized to lower-case and matches the shard inventory by basename and full path.
+- Results return the latest 1,000 matches with name, category, size, modified time, drive label, and full path. Double-click opens the file's folder in Explorer, the context menu can copy the full path, and exports land as CSV/JSONL under `<working_dir>/exports`.
+- The first search against an older shard performs a lightweight migration that backfills the lowercase `inventory.name` column and index; if migration fails the UI falls back to path-only matching and surfaces the error.
+
 ## Rescan modes
 
 The scanner now supports two rescan strategies when revisiting a drive:
