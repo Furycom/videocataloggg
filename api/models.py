@@ -46,6 +46,64 @@ class PaginatedResponse(BaseModel):
 
 
 
+class SemanticSearchHit(BaseModel):
+    """Single semantic search hit."""
+
+    rank: int = Field(..., description="Rank within the current page starting at 1.")
+    path: str = Field(..., description="Inventory path returned by the semantic engine.")
+    drive_label: str = Field(..., description="Drive label owning this path.")
+    score: float = Field(..., description="Combined similarity score (0..1).")
+    mode: str = Field(..., description="Search mode used for this hit (ann/text/hybrid).")
+    snippet: Optional[str] = Field(
+        None, description="Optional snippet produced by the FTS query when available."
+    )
+    metadata: Dict[str, object] = Field(
+        default_factory=dict,
+        description="Additional metadata captured in the semantic index.",
+    )
+
+
+class SemanticSearchResponse(PaginatedResponse):
+    """Paginated semantic search payload."""
+
+    query: str = Field(..., description="Original query string that was executed.")
+    mode: str = Field(..., description="Mode requested: ann, text, or hybrid.")
+    hybrid: bool = Field(..., description="True when hybrid scoring blended ANN and FTS results.")
+    results: List[SemanticSearchHit] = Field(
+        ..., description="Semantic search hits ordered by descending score."
+    )
+
+
+class SemanticIndexRequest(BaseModel):
+    """Request body for semantic index operations."""
+
+    mode: str = Field(
+        "build",
+        description="Operation to execute: build (incremental) or rebuild (clear and rebuild).",
+    )
+
+
+class SemanticOperationResponse(BaseModel):
+    """Simple acknowledgement for semantic maintenance operations."""
+
+    ok: bool = Field(True, description="Indicates the operation completed without raising errors.")
+    action: str = Field(..., description="Operation that was performed.")
+    stats: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Optional counters returned by the semantic pipeline.",
+    )
+
+
+class SemanticStatusResponse(BaseModel):
+    """Status summary for the semantic index."""
+
+    documents: int = Field(..., description="Total documents currently stored in the index.")
+    latest_updated_utc: Optional[str] = Field(
+        None, description="Timestamp of the most recently updated entry when available."
+    )
+    vector_dim: int = Field(..., description="Vector dimensionality configured for ANN search.")
+
+
 class InventoryRow(BaseModel):
     """Single file entry coming from a drive inventory shard."""
 

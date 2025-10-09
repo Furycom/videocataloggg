@@ -26,8 +26,14 @@ from .models import (
     LargestFilesReport,
     OverviewReport,
     RecentChangesReport,
+    SemanticIndexRequest,
+    SemanticOperationResponse,
+    SemanticSearchHit,
+    SemanticSearchResponse,
+    SemanticStatusResponse,
     TopExtensionsReport,
 )
+from semantic import SemanticPhaseError
 
 LOGGER = logging.getLogger("videocatalog.api")
 
@@ -346,6 +352,79 @@ def create_app(config: APIServerConfig) -> FastAPI:
                 ),
             )
         return FeatureVectorResponse(**row)
+
+    @app.get("/v1/semantic/search", response_model=SemanticSearchResponse)
+    def semantic_search(
+        q: str = Query(..., description="Query string used for semantic search."),
+        mode: str = Query("ann", description="Search mode: ann, text, or hybrid."),
+        drive_label: Optional[str] = Query(
+            None, description="Optional drive label to scope the search."
+        ),
+        hybrid: bool = Query(
+            False, description="Enable hybrid scoring (ANN + FTS) regardless of mode."
+        ),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        _: str = Depends(auth_dependency),
+    ) -> SemanticSearchResponse:
+        mode_value = (mode or "ann").lower()
+        if mode_value not in {"ann", "text", "hybrid"}:
+            mode_value = "ann"
+        if drive_label:
+            ensure_drive(drive_label)
+        try:
+            results, pagination, next_offset, total = data.semantic_search(
+                q,
+                mode=mode_value,
+                limit=limit,
+                offset=offset,
+                drive_label=drive_label,
+                hybrid=bool(hybrid),
+            )
+        except SemanticPhaseError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        hits = [SemanticSearchHit(**row) for row in results]
+        return SemanticSearchResponse(
+            query=q,
+            mode=mode_value,
+            hybrid=bool(hybrid or mode_value == "hybrid"),
+            results=hits,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/semantic/index", response_model=SemanticStatusResponse)
+    def semantic_index_status(_: str = Depends(auth_dependency)) -> SemanticStatusResponse:
+        try:
+            payload = data.semantic_status()
+        except SemanticPhaseError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return SemanticStatusResponse(**payload)
+
+    @app.post("/v1/semantic/index", response_model=SemanticOperationResponse)
+    def semantic_index(
+        body: SemanticIndexRequest,
+        _: str = Depends(auth_dependency),
+    ) -> SemanticOperationResponse:
+        mode_value = (body.mode or "build").lower()
+        if mode_value not in {"build", "rebuild"}:
+            raise HTTPException(status_code=400, detail="mode must be build or rebuild")
+        rebuild = mode_value == "rebuild"
+        try:
+            stats = data.semantic_index(rebuild=rebuild)
+        except SemanticPhaseError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return SemanticOperationResponse(ok=True, action=mode_value, stats=stats)
+
+    @app.post("/v1/semantic/transcribe", response_model=SemanticOperationResponse)
+    def semantic_transcribe(_: str = Depends(auth_dependency)) -> SemanticOperationResponse:
+        try:
+            stats = data.semantic_transcribe()
+        except SemanticPhaseError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return SemanticOperationResponse(ok=True, action="transcribe", stats=stats)
 
     return app
 

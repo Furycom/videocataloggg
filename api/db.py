@@ -14,6 +14,14 @@ import reports_util
 from core.db import connect
 from core.paths import get_catalog_db_path, get_shard_db_path, get_shards_dir, resolve_working_dir
 from core.settings import load_settings
+from semantic import (
+    SemanticConfig,
+    SemanticIndexer,
+    SemanticPhaseError,
+    SemanticSearcher,
+    SemanticTranscriber,
+)
+from semantic.db import semantic_connection
 
 _DEFAULT_LIMIT = 100
 _MAX_PAGE_SIZE = 500
@@ -67,6 +75,9 @@ class DataAccess:
             max_page = _MAX_PAGE_SIZE
         self.default_limit = min(default_limit, max_page)
         self.max_page_size = max_page
+        
+    def _semantic_config(self) -> SemanticConfig:
+        return SemanticConfig.from_settings(self.working_dir, self._settings)
 
     def _resolve_catalog_path(self) -> Path:
         settings_value = self._settings.get("catalog_db")
@@ -450,6 +461,59 @@ class DataAccess:
         if count > _COUNT_GUARD:
             return None
         return int(count)
+
+    def semantic_search(
+        self,
+        query: str,
+        *,
+        mode: str = "ann",
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        drive_label: Optional[str] = None,
+        hybrid: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], Pagination, Optional[int], int]:
+        config = self._semantic_config()
+        pagination = self.resolve_pagination(limit, offset)
+        searcher = SemanticSearcher(config)
+        results, total = searcher.search(
+            query,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            drive_label=drive_label,
+            mode=mode,
+            hybrid=hybrid,
+        )
+        next_offset = (
+            pagination.offset + len(results)
+            if len(results) == pagination.limit
+            else None
+        )
+        return results, pagination, next_offset, total
+
+    def semantic_index(self, *, rebuild: bool = False) -> Dict[str, int]:
+        config = self._semantic_config()
+        indexer = SemanticIndexer(config)
+        return indexer.build(rebuild=rebuild)
+
+    def semantic_transcribe(self) -> Dict[str, int]:
+        config = self._semantic_config()
+        transcriber = SemanticTranscriber(config)
+        return transcriber.run()
+
+    def semantic_status(self) -> Dict[str, Any]:
+        config = self._semantic_config()
+        with semantic_connection(config.working_dir) as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS count FROM semantic_documents"
+            ).fetchone()["count"]
+            latest = conn.execute(
+                "SELECT MAX(updated_utc) AS updated FROM semantic_documents"
+            ).fetchone()["updated"]
+        return {
+            "documents": int(total or 0),
+            "latest_updated_utc": latest,
+            "vector_dim": config.vector_dim,
+        }
 
 
 def _lower_basename(path_value: Any) -> str:
