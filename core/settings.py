@@ -36,6 +36,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "max_video_frames": 2,
         "prefer_ffmpeg": True,
     },
+    "gpu": {
+        "policy": "AUTO",
+        "allow_hwaccel_video": True,
+        "min_free_vram_mb": 512,
+        "max_gpu_workers": 2,
+    },
     "api": {
         "enabled_default": False,
         "host": "127.0.0.1",

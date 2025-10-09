@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -13,6 +13,8 @@ try:  # pragma: no cover - optional dependency guard
     import onnxruntime as ort  # type: ignore
 except Exception:  # pragma: no cover - optional dependency guard
     ort = None  # type: ignore
+
+from gpu.runtime import report_provider_failure
 
 
 class LightAnalysisModelError(RuntimeError):
@@ -23,6 +25,8 @@ class LightAnalysisModelError(RuntimeError):
 class ImageEmbedderConfig:
     model_path: Path
     input_size: int = 224
+    providers: Optional[Sequence[str]] = None
+    primary_provider: str = "CPUExecutionProvider"
 
 
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -42,15 +46,16 @@ class ImageEmbedder:
             raise LightAnalysisModelError(
                 f"ONNX model not found at {model_path}. Place a MobileNetV3-Small model there."
             )
-        try:
-            self._session = ort.InferenceSession(  # type: ignore[attr-defined]
-                str(model_path), providers=["CPUExecutionProvider"]
-            )
-        except Exception as exc:  # pragma: no cover - runtime guard
-            raise LightAnalysisModelError(f"Failed to initialize ONNXRuntime: {exc}") from exc
-        self._input_name = self._session.get_inputs()[0].name
-        height = self._infer_size(self._session.get_inputs()[0].shape)
-        self._size = int(height or config.input_size)
+        providers = list(config.providers) if config.providers else ["CPUExecutionProvider"]
+        if not providers:
+            providers = ["CPUExecutionProvider"]
+        primary_provider = config.primary_provider or providers[0]
+        self._model_path = model_path
+        self._config_input_size = int(config.input_size)
+        self._providers: list[str] = []
+        self._primary_provider: str = primary_provider
+        self._fallback_triggered = False
+        self._initialize_session(providers, primary_provider)
 
     @staticmethod
     def _infer_size(shape: list[Optional[int]]) -> int:
@@ -85,7 +90,21 @@ class ImageEmbedder:
         try:
             prepared = self._prepare(image)
             outputs = self._session.run(None, {self._input_name: prepared})
-        except Exception:
+        except Exception as exc:
+            if (
+                self._primary_provider != "CPUExecutionProvider"
+                and not self._fallback_triggered
+            ):
+                self._fallback_triggered = True
+                try:
+                    report_provider_failure(self._primary_provider, exc)
+                except Exception:
+                    pass
+                try:
+                    self._switch_to_cpu()
+                except LightAnalysisModelError:
+                    return None
+                return self.embed_image(image)
             return None
         if not outputs:
             return None
@@ -101,6 +120,32 @@ class ImageEmbedder:
         if norm > 0:
             vector = vector / norm
         return vector
+
+    def _initialize_session(self, providers: Sequence[str], primary: Optional[str] = None) -> None:
+        try:
+            session = ort.InferenceSession(  # type: ignore[attr-defined]
+                str(self._model_path), providers=list(providers)
+            )
+        except Exception as exc:  # pragma: no cover - runtime guard
+            providers_desc = ", ".join(providers) if providers else "CPUExecutionProvider"
+            raise LightAnalysisModelError(
+                f"Failed to initialize ONNXRuntime ({providers_desc}): {exc}"
+            ) from exc
+        self._session = session
+        self._providers = list(providers)
+        if primary:
+            self._primary_provider = primary
+        else:
+            self._primary_provider = (
+                self._providers[0] if self._providers else "CPUExecutionProvider"
+            )
+        inputs = self._session.get_inputs()
+        self._input_name = inputs[0].name
+        height = self._infer_size(inputs[0].shape)
+        self._size = int(height or self._config_input_size)
+
+    def _switch_to_cpu(self) -> None:
+        self._initialize_session(["CPUExecutionProvider"], "CPUExecutionProvider")
 
     def _prepare(self, image: Image.Image) -> np.ndarray:
         img = ImageOps.exif_transpose(image).convert("RGB")

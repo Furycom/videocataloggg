@@ -88,6 +88,23 @@ Vectors are serialized as float32 arrays so downstream tools can read them direc
 
 If the ONNX model or runtime cannot be loaded the scanner posts a red banner, skips feature extraction, and continues hashing/metadata work as usual.
 
+## GPU acceleration
+
+VideoCatalog automatically probes NVIDIA hardware on Windows via NVML (`nvidia-ml-py`), validates the CUDA execution provider, and falls back to DirectML or the CPU-only runtime when a compatible GPU stack is unavailable. Detection also queries FFmpeg (`ffmpeg -hwaccels`) so NVDEC can be enabled for thumbnail sampling whenever `cuda` support is advertised. The results are cached for the current process and surfaced through both the CLI and GUI so you can confirm the active backend at a glance.
+
+- `settings.json` now ships with a `"gpu"` block controlling the default policy, whether FFmpeg hardware acceleration is allowed, the minimum free VRAM required to activate GPU inference, and an upper bound for GPU worker slots.
+- New CLI flags `--gpu-policy AUTO|FORCE_GPU|CPU_ONLY` and `--gpu-hwaccel` / `--no-gpu-hwaccel` override those defaults per scan. AUTO prefers CUDA, then DirectML, then the CPU provider. FORCE_GPU logs a warning and downgrades gracefully when no compatible execution provider can be created.
+- The GUI adds a **GPU** card to the scan form with a status line (`Detected: … VRAM: … ORT: …`), Auto/Force/CPU radio buttons, a “Use FFmpeg hwaccel when available” checkbox, and a **Refresh** button to rerun detection after updating drivers or swapping binaries.
+- When the CUDA provider fails to initialize (missing runtime, incompatible drivers, or insufficient free VRAM) the scanner logs `GPU: CUDA EP unavailable — falling back to DirectML/CPU`, reloads the ONNX model on the CPU, and continues without interrupting the scan. Runtime inference errors are caught once, logged, and future embeddings stay on the CPU for the remainder of the run.
+- FFmpeg automatically receives `-hwaccel cuda` when hardware decoding is allowed and NVDEC support is detected. Clearing the checkbox (or passing `--no-gpu-hwaccel`) forces software decode while leaving the ONNX execution provider untouched.
+- TMK+PDQF and Chromaprint fingerprinting remain CPU-bound; only light-analysis embeddings and optional video frame sampling use the GPU so disk I/O pacing and hashing behaviour stay unchanged.
+
+**Troubleshooting tips**
+
+- Verify `nvidia-smi` works and the CUDA runtime DLLs are on the system path. The status line falls back to `ORT: CPU` when GPU providers cannot be loaded.
+- Inspect `scanner.log` for messages such as `GPU: FORCE_GPU requested but no compatible provider found — using CPU` or `GPU: CUDA runtime missing — using CPU instead` when acceleration is disabled.
+- If FFmpeg lacks NVDEC support, run `ffmpeg -hwaccels` manually to confirm the build. The GUI refresh button reruns detection once a new binary is installed.
+
 ## Duplicate detection (TMK+PDQF & Chromaprint)
 
 - VideoCatalog can now capture robust perceptual fingerprints for both video and audio assets. Enable them from the CLI (`scan_drive.py --fingerprint-video-tmk` and/or `--fingerprint-audio-chroma`) or from the GUI's scan dialog under the new **Fingerprints** panel.
