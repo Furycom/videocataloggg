@@ -59,6 +59,7 @@ from core.paths import (
     safe_label,
 )
 from core.ann import ANNIndexManager
+from core.db import connect
 from core.settings import load_settings
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
@@ -107,6 +108,7 @@ from db_maint import (
     update_maintenance_metadata,
     vacuum_if_needed,
 )
+from structure import StructureProfiler, load_structure_settings as load_structure_config
 
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
@@ -2481,6 +2483,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Optional path to the shard database (defaults to working dir).",
     )
     parser.add_argument(
+        "--structure-scan",
+        action="store_true",
+        help="Profile folder structure and compute confidence scores without hashing.",
+    )
+    parser.add_argument(
+        "--structure-verify",
+        action="store_true",
+        help="Augment structure profiling with external verification sources.",
+    )
+    parser.add_argument(
+        "--structure-export-review",
+        metavar="PATH",
+        help="Export low-confidence review queue to the given JSON path.",
+    )
+    parser.add_argument(
         "--maint-target",
         dest="maint_target",
         help="Maintenance target: catalog, shard:<label>, or all-shards.",
@@ -3044,6 +3061,71 @@ def _run_cli_maintenance(args: argparse.Namespace, catalog_db_path: Path) -> int
     return exit_code
 
 
+def _run_structure_cli(
+    args: argparse.Namespace,
+    settings_data: Dict[str, object],
+    catalog_db_path: Path,
+    shard_db_path: Path,
+    mount_path: Optional[Path],
+) -> int:
+    structure_settings = load_structure_config(settings_data)
+    if not structure_settings.enable:
+        LOGGER.info("Structure profiling disabled via settings.json (structure.enable=false)")
+        return 0
+    if not args.label:
+        LOGGER.error("Structure operations require --label to resolve shard DBs.")
+        print("[ERROR] --label is required for structure profiling.", file=sys.stderr)
+        return 2
+    do_scan = bool(args.structure_scan or args.structure_verify)
+    if do_scan and mount_path is None:
+        LOGGER.error("Structure scan requires --mount to locate folders.")
+        print("[ERROR] --mount is required when running structure scans.", file=sys.stderr)
+        return 2
+    active_mount = mount_path or Path(args.mount_path or ".")
+    if do_scan and not active_mount.exists():
+        LOGGER.warning("Mount path %s does not exist; proceeding may skip folders.", active_mount)
+    conn = connect(shard_db_path, read_only=False, check_same_thread=False)
+    try:
+        profiler = StructureProfiler(
+            conn,
+            settings=structure_settings,
+            drive_label=args.label,
+            mount_path=active_mount,
+        )
+        if do_scan:
+            summary = profiler.profile(verify_external=bool(args.structure_verify))
+            LOGGER.info(
+                "Structure profiling complete — processed=%s, confident=%s, medium=%s, low=%s",
+                summary.processed,
+                summary.confident,
+                summary.medium,
+                summary.low,
+            )
+            print(
+                "Structure profiling complete — processed="
+                f"{summary.processed} (confident={summary.confident}, medium={summary.medium}, low={summary.low})"
+            )
+        if args.structure_export_review:
+            destination = Path(args.structure_export_review)
+            export_info = profiler.export_review(destination)
+            LOGGER.info(
+                "Exported %s review entries to %s",
+                export_info.get("exported", 0),
+                export_info.get("path"),
+            )
+            print(
+                f"Review queue exported to {export_info.get('path')} "
+                f"({int(export_info.get('exported', 0))} entries)."
+            )
+        return 0
+    except Exception as exc:
+        LOGGER.error("Structure profiling failed: %s", exc)
+        print(f"[ERROR] Structure profiling failed: {exc}", file=sys.stderr)
+        return 4
+    finally:
+        conn.close()
+
+
 def _auto_optimize_after_scan(shard_path: Path, label: str, options: MaintenanceOptions) -> None:
     if not shard_path.exists():
         return
@@ -3115,6 +3197,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"catalog: {catalog_db_path} | shard: {shard_db_path}"
     )
     LOGGER.info(startup_info)
+
+    structure_requested = bool(
+        args.structure_scan or args.structure_verify or args.structure_export_review
+    )
+    if structure_requested:
+        mount_path = _expand_user_path(args.mount_path) if args.mount_path else None
+        return _run_structure_cli(
+            args,
+            settings_data,
+            Path(catalog_db_path),
+            Path(shard_db_path),
+            mount_path,
+        )
 
     if args.maint_action:
         return _run_cli_maintenance(args, catalog_db_path)

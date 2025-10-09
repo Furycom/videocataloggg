@@ -1,6 +1,7 @@
 """Read-only SQLite helpers for the VideoCatalog local API."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -136,6 +137,15 @@ class DataAccess:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _structure_tables_present(self, conn: sqlite3.Connection) -> bool:
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='folder_profile'"
+            )
+            return cursor.fetchone() is not None
+        except sqlite3.DatabaseError:
+            return False
+
     def resolve_pagination(self, limit: Optional[int], offset: Optional[int]) -> Pagination:
         try:
             lim = int(limit) if limit is not None else self.default_limit
@@ -171,6 +181,186 @@ class DataAccess:
                     }
                 )
         return rows
+
+    def structure_summary(self, drive_label: str) -> Dict[str, Any]:
+        with self._shard(drive_label) as conn:
+            if not self._structure_tables_present(conn):
+                return {
+                    "drive_label": drive_label,
+                    "total": 0,
+                    "confident": 0,
+                    "medium": 0,
+                    "low": 0,
+                    "updated_utc": None,
+                }
+            total = conn.execute("SELECT COUNT(*) FROM folder_profile").fetchone()[0]
+            thresholds = self._settings.get("structure") if isinstance(self._settings.get("structure"), dict) else {}
+            high = float(thresholds.get("high_threshold", 0.8))
+            low = float(thresholds.get("low_threshold", 0.5))
+            confident = conn.execute(
+                "SELECT COUNT(*) FROM folder_profile WHERE confidence >= ?",
+                (high,),
+            ).fetchone()[0]
+            medium = conn.execute(
+                "SELECT COUNT(*) FROM folder_profile WHERE confidence >= ? AND confidence < ?",
+                (low, high),
+            ).fetchone()[0]
+            low_count = conn.execute(
+                "SELECT COUNT(*) FROM folder_profile WHERE confidence < ?",
+                (low,),
+            ).fetchone()[0]
+            updated = conn.execute(
+                "SELECT MAX(updated_utc) FROM folder_profile"
+            ).fetchone()[0]
+        return {
+            "drive_label": drive_label,
+            "total": int(total or 0),
+            "confident": int(confident or 0),
+            "medium": int(medium or 0),
+            "low": int(low_count or 0),
+            "updated_utc": updated,
+        }
+
+    def structure_review_page(
+        self,
+        drive_label: str,
+        *,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], Pagination, Optional[int], Optional[int]]:
+        pagination = self.resolve_pagination(limit, offset)
+        with self._shard(drive_label) as conn:
+            if not self._structure_tables_present(conn):
+                return [], pagination, None, 0
+            total = conn.execute("SELECT COUNT(*) FROM review_queue").fetchone()[0]
+            cursor = conn.execute(
+                """
+                SELECT rq.folder_path,
+                       rq.confidence,
+                       rq.reasons_json,
+                       rq.questions_json,
+                       fp.kind,
+                       fp.parsed_title,
+                       fp.parsed_year,
+                       fp.issues_json
+                FROM review_queue AS rq
+                LEFT JOIN folder_profile AS fp ON fp.folder_path = rq.folder_path
+                ORDER BY rq.confidence ASC, rq.folder_path ASC
+                LIMIT ? OFFSET ?
+                """,
+                (pagination.limit, pagination.offset),
+            )
+            rows: List[Dict[str, Any]] = []
+            for entry in cursor.fetchall():
+                try:
+                    reasons = json.loads(entry["reasons_json"]) if entry["reasons_json"] else []
+                except Exception:
+                    reasons = []
+                try:
+                    questions = json.loads(entry["questions_json"]) if entry["questions_json"] else []
+                except Exception:
+                    questions = []
+                try:
+                    issues = json.loads(entry["issues_json"]) if entry["issues_json"] else []
+                except Exception:
+                    issues = []
+                rows.append(
+                    {
+                        "folder_path": entry["folder_path"],
+                        "confidence": float(entry["confidence"] or 0.0),
+                        "reasons": reasons,
+                        "questions": questions,
+                        "kind": entry["kind"],
+                        "parsed_title": entry["parsed_title"],
+                        "parsed_year": entry["parsed_year"],
+                        "issues": issues,
+                    }
+                )
+        next_offset = None
+        if pagination.offset + len(rows) < int(total or 0):
+            next_offset = pagination.offset + len(rows)
+        return rows, pagination, next_offset, int(total or 0)
+
+    def structure_details(
+        self, drive_label: str, folder_path: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._shard(drive_label) as conn:
+            if not self._structure_tables_present(conn):
+                return None
+            cursor = conn.execute(
+                """
+                SELECT folder_path,
+                       kind,
+                       main_video_path,
+                       parsed_title,
+                       parsed_year,
+                       assets_json,
+                       issues_json,
+                       confidence,
+                       source_signals_json,
+                       updated_utc
+                FROM folder_profile
+                WHERE folder_path = ?
+                """,
+                (folder_path,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            try:
+                assets = json.loads(row["assets_json"]) if row["assets_json"] else {}
+            except Exception:
+                assets = {}
+            try:
+                issues = json.loads(row["issues_json"]) if row["issues_json"] else []
+            except Exception:
+                issues = []
+            try:
+                signals = (
+                    json.loads(row["source_signals_json"])
+                    if row["source_signals_json"]
+                    else {}
+                )
+            except Exception:
+                signals = {}
+            candidates_cursor = conn.execute(
+                """
+                SELECT source, candidate_id, title, year, score, extra_json
+                FROM folder_candidates
+                WHERE folder_path = ?
+                ORDER BY score DESC
+                """,
+                (folder_path,),
+            )
+            candidates: List[Dict[str, Any]] = []
+            for candidate in candidates_cursor.fetchall():
+                try:
+                    extra = json.loads(candidate["extra_json"]) if candidate["extra_json"] else {}
+                except Exception:
+                    extra = {}
+                candidates.append(
+                    {
+                        "source": candidate["source"],
+                        "candidate_id": candidate["candidate_id"] or None,
+                        "title": candidate["title"],
+                        "year": candidate["year"],
+                        "score": float(candidate["score"] or 0.0),
+                        "extra": extra,
+                    }
+                )
+        return {
+            "folder_path": row["folder_path"],
+            "kind": row["kind"],
+            "main_video_path": row["main_video_path"],
+            "parsed_title": row["parsed_title"],
+            "parsed_year": row["parsed_year"],
+            "assets": assets if isinstance(assets, dict) else {},
+            "issues": issues if isinstance(issues, list) else [],
+            "confidence": float(row["confidence"] or 0.0),
+            "source_signals": signals if isinstance(signals, dict) else {},
+            "updated_utc": row["updated_utc"],
+            "candidates": candidates,
+        }
 
     def inventory_page(
         self,

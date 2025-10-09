@@ -8,10 +8,11 @@ from dataclasses import dataclass, asdict
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from types import SimpleNamespace
 
 import scan_drive
+from structure import load_structure_settings as load_structure_config
 
 from db_maint import (
     MaintenanceOptions,
@@ -1771,6 +1772,11 @@ class App:
         self.db_path = StringVar(value=DB_DEFAULT)
         self._maintenance_window: Optional[MaintenanceDialog] = None
         self._last_scan_label: Optional[str] = None
+        self.structure_settings = load_structure_config(_SETTINGS if isinstance(_SETTINGS, dict) else {})
+        self.structure_worker: Optional[threading.Thread] = None
+        self.structure_status_var = StringVar(value="Structure profiling idle.")
+        self.structure_summary_var = StringVar(value="No structure data available yet.")
+        self._structure_action = "idle"
 
         # inputs
         self.path_var  = StringVar()
@@ -2432,11 +2438,16 @@ class App:
         for idx in range(1, 6):
             self.reports_tab.rowconfigure(idx, weight=1)
         self.main_notebook.add(self.reports_tab, text="Reports")
+        self.structure_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.structure_tab.columnconfigure(0, weight=1)
+        self.structure_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.structure_tab, text="Structure")
 
         self._build_dashboard_controls(self.dashboard_tab)
         self._build_search_tab(self.search_tab)
         self._build_search_plus_tab(self.search_plus_tab)
         self._build_reports_tab(self.reports_tab)
+        self._build_structure_tab(self.structure_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3030,6 +3041,102 @@ class App:
             self.report_trees[key] = tree
             self._report_tree_rows[key] = {}
 
+    def _build_structure_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        controls = ttk.LabelFrame(
+            parent,
+            text="Structure Profiling",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        controls.grid(row=0, column=0, sticky="ew")
+        for column in range(4):
+            controls.columnconfigure(column, weight=1 if column in (1, 2) else 0)
+
+        ttk.Button(
+            controls,
+            text="Profile",
+            command=lambda: self.start_structure_job(verify=False),
+            style="Accent.TButton",
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            controls,
+            text="Profile + Verify",
+            command=lambda: self.start_structure_job(verify=True),
+        ).grid(row=0, column=1, sticky="ew", padx=(12, 0))
+        ttk.Button(
+            controls,
+            text="Export Review…",
+            command=self.export_structure_review,
+        ).grid(row=0, column=2, sticky="ew", padx=(12, 0))
+        ttk.Button(
+            controls,
+            text="Refresh",
+            command=self.refresh_structure_view,
+        ).grid(row=0, column=3, sticky="ew", padx=(12, 0))
+
+        ttk.Label(
+            controls,
+            textvariable=self.structure_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        review_frame = ttk.LabelFrame(
+            parent,
+            text="Manual Review Queue",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        review_frame.grid(row=1, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        review_frame.columnconfigure(0, weight=1)
+        review_frame.rowconfigure(0, weight=1)
+
+        columns = ("folder", "confidence", "title", "year", "issues")
+        self.structure_tree = ttk.Treeview(
+            review_frame,
+            columns=columns,
+            show="headings",
+            height=12,
+            style="Card.Treeview",
+        )
+        headings = {
+            "folder": "Folder",
+            "confidence": "Confidence",
+            "title": "Title",
+            "year": "Year",
+            "issues": "Issues",
+        }
+        widths = {
+            "folder": 320,
+            "confidence": 90,
+            "title": 220,
+            "year": 70,
+            "issues": 320,
+        }
+        for key in columns:
+            self.structure_tree.heading(key, text=headings[key])
+            anchor = W if key in {"folder", "title", "issues"} else E
+            self.structure_tree.column(key, anchor=anchor, width=widths[key], stretch=True)
+
+        review_scroll = ttk.Scrollbar(
+            review_frame,
+            orient="vertical",
+            command=self.structure_tree.yview,
+        )
+        self.structure_tree.configure(yscrollcommand=review_scroll.set)
+        self.structure_tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        review_scroll.grid(row=0, column=1, sticky=(N, S))
+
+        summary_frame = ttk.Frame(parent, style="Card.TFrame")
+        summary_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(
+            summary_frame,
+            textvariable=self.structure_summary_var,
+            style="Subtle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+
     def _build_tables(self):
         parent = getattr(self, "dashboard_tab", self.content)
         parent.rowconfigure(2, weight=1)
@@ -3047,6 +3154,189 @@ class App:
         drives_container.grid(row=0, column=0, sticky=(N, S, E, W))
         drives_container.columnconfigure(0, weight=1)
         drives_container.rowconfigure(0, weight=1)
+
+    def start_structure_job(self, verify: bool) -> None:
+        label = self.label_var.get().strip()
+        mount = self.path_var.get().strip()
+        if not (label and mount):
+            messagebox.showerror("Missing", "Please fill Mount Path and Disk Label.")
+            return
+        args = [
+            "--label",
+            label,
+            "--mount",
+            mount,
+            "--catalog-db",
+            self.db_path.get(),
+            "--structure-scan",
+        ]
+        if verify:
+            args.append("--structure-verify")
+        shard = shard_path_for(label)
+        args.extend(["--shard-db", str(shard)])
+        action = "verify" if verify else "profile"
+        self._start_structure_thread(args, "Running structure profiling…", action)
+
+    def export_structure_review(self) -> None:
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showerror("Missing", "Please fill Disk Label before exporting review queue.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export Structure Review",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        args = [
+            "--label",
+            label,
+            "--catalog-db",
+            self.db_path.get(),
+            "--structure-export-review",
+            path,
+        ]
+        shard = shard_path_for(label)
+        args.extend(["--shard-db", str(shard)])
+        self._start_structure_thread(args, "Exporting review queue…", "export")
+
+    def _start_structure_thread(self, args: List[str], status: str, action: str) -> None:
+        if self.structure_worker and self.structure_worker.is_alive():
+            messagebox.showwarning("Busy", "A structure task is already running.")
+            return
+        self._structure_action = action
+        self.structure_status_var.set(status)
+        self.structure_worker = threading.Thread(
+            target=self._run_structure_task,
+            args=(list(args),),
+            daemon=True,
+        )
+        self.structure_worker.start()
+
+    def _run_structure_task(self, cli_args: List[str]) -> None:
+        try:
+            exit_code = scan_drive.main(cli_args)
+            self.root.after(0, lambda: self._on_structure_finished(exit_code, None))
+        except Exception as exc:
+            self.root.after(0, lambda: self._on_structure_finished(-1, str(exc)))
+
+    def _on_structure_finished(self, exit_code: int, error: Optional[str]) -> None:
+        self.structure_worker = None
+        action = getattr(self, "_structure_action", "profile")
+        if exit_code == 0 and not error:
+            if action == "export":
+                self.structure_status_var.set("Review export completed.")
+                messagebox.showinfo("Structure", "Manual review queue exported successfully.")
+            else:
+                self.structure_status_var.set("Structure profiling completed.")
+                self.refresh_structure_view()
+        else:
+            message = error or f"Exited with code {exit_code}" if exit_code not in (0, None) else (error or "Unknown error")
+            self.structure_status_var.set(f"Structure task failed: {message}")
+            messagebox.showerror("Structure", f"Structure task failed: {message}")
+
+    def refresh_structure_view(self) -> None:
+        if not hasattr(self, "structure_tree"):
+            return
+        label = self.label_var.get().strip()
+        self.structure_tree.delete(*self.structure_tree.get_children())
+        if not label:
+            self.structure_summary_var.set("Select a drive label to view structure data.")
+            return
+        summary, rows = self._load_structure_data(label)
+        if summary is None:
+            self.structure_summary_var.set("No structure profiling data available for this drive.")
+        else:
+            self.structure_summary_var.set(
+                f"Folders: {summary['total']} — confident {summary['confident']} | "
+                f"medium {summary['medium']} | low {summary['low']}"
+            )
+        if rows:
+            for row in rows:
+                issues = ", ".join(row.get("issues", [])) if row.get("issues") else ""
+                self.structure_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        row.get("folder_path"),
+                        f"{row.get('confidence', 0.0):.2f}",
+                        row.get("parsed_title") or "",
+                        row.get("parsed_year") or "",
+                        issues,
+                    ),
+                )
+            self.structure_status_var.set(f"{len(rows)} folders queued for manual review.")
+        else:
+            self.structure_status_var.set("Manual review queue is empty.")
+
+    def _load_structure_data(self, label: str) -> Tuple[Optional[Dict[str, int]], List[Dict[str, object]]]:
+        shard = shard_path_for(label)
+        if not shard.exists():
+            return None, []
+        try:
+            conn = sqlite3.connect(shard)
+        except sqlite3.Error:
+            return None, []
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='folder_profile'"
+            )
+            if cur.fetchone() is None:
+                return None, []
+            high = float(getattr(self.structure_settings, "high_threshold", 0.8))
+            low = float(getattr(self.structure_settings, "low_threshold", 0.5))
+            total = conn.execute("SELECT COUNT(*) FROM folder_profile").fetchone()[0]
+            confident = conn.execute(
+                "SELECT COUNT(*) FROM folder_profile WHERE confidence >= ?",
+                (high,),
+            ).fetchone()[0]
+            medium = conn.execute(
+                "SELECT COUNT(*) FROM folder_profile WHERE confidence >= ? AND confidence < ?",
+                (low, high),
+            ).fetchone()[0]
+            low_count = conn.execute(
+                "SELECT COUNT(*) FROM folder_profile WHERE confidence < ?",
+                (low,),
+            ).fetchone()[0]
+            summary = {
+                "total": int(total or 0),
+                "confident": int(confident or 0),
+                "medium": int(medium or 0),
+                "low": int(low_count or 0),
+            }
+            rows: List[Dict[str, object]] = []
+            cursor = conn.execute(
+                """
+                SELECT rq.folder_path, rq.confidence, fp.parsed_title, fp.parsed_year, fp.issues_json
+                FROM review_queue AS rq
+                LEFT JOIN folder_profile AS fp ON fp.folder_path = rq.folder_path
+                ORDER BY rq.confidence ASC
+                LIMIT 200
+                """
+            )
+            for entry in cursor.fetchall():
+                try:
+                    issues = (
+                        json.loads(entry["issues_json"])
+                        if entry["issues_json"]
+                        else []
+                    )
+                except Exception:
+                    issues = []
+                rows.append(
+                    {
+                        "folder_path": entry["folder_path"],
+                        "confidence": float(entry["confidence"] or 0.0),
+                        "parsed_title": entry["parsed_title"],
+                        "parsed_year": entry["parsed_year"],
+                        "issues": issues,
+                    }
+                )
+        finally:
+            conn.close()
+        return summary, rows
 
         self.tree = ttk.Treeview(drives_container, columns=cols, show="headings", height=9, style="Card.Treeview")
         for c in cols:
@@ -5469,7 +5759,7 @@ class App:
             self.stop_evt = None
 
     def refresh_all(self):
-        self.refresh_drives(); self.refresh_jobs()
+        self.refresh_drives(); self.refresh_jobs(); self.refresh_structure_view()
 
     def refresh_drives(self):
         self.tree.delete(*self.tree.get_children())
