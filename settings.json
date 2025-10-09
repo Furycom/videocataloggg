@@ -5,5 +5,17 @@
     "model_path": null,
     "max_video_frames": 2,
     "prefer_ffmpeg": true
+  },
+  "api": {
+    "enabled_default": false,
+    "host": "127.0.0.1",
+    "port": 8756,
+    "api_key": null,
+    "cors_origins": [
+      "http://localhost",
+      "http://127.0.0.1"
+    ],
+    "default_limit": 100,
+    "max_page_size": 500
   }
 }
