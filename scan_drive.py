@@ -40,6 +40,13 @@ from paths import (
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
 from tools import bootstrap_local_bin, probe_tool
+from fingerprints import (
+    audio_chroma as fp_audio,
+    store as fp_store,
+    tools as fp_tools,
+    video_tmk as fp_video,
+    video_vhash as fp_vhash,
+)
 
 from perf import (
     RateController,
@@ -144,6 +151,7 @@ class WorkerResult:
     media_blob: Optional[str]
     integrity_ok: Optional[int]
     error_message: Optional[str] = None
+    media_metadata: Optional[dict] = None
 
 
 @dataclass
@@ -152,6 +160,20 @@ class LightAnalysisSettings:
     model_path: Path
     max_video_frames: int
     prefer_ffmpeg: bool
+
+
+@dataclass
+class FingerprintSettings:
+    enable_video_tmk: bool
+    enable_audio_chroma: bool
+    enable_video_vhash_prefilter: bool
+    phase_mode: str
+    max_concurrency: int
+    io_gentle_ms: int
+    tmk_similarity_threshold: float
+    chroma_match_threshold: float
+    tmk_bin_path: Optional[Path]
+    fpcalc_path: Optional[Path]
 
 
 class LightAnalysisPipeline:
@@ -314,6 +336,264 @@ class LightAnalysisPipeline:
                 pass
 
 
+@dataclass(slots=True)
+class _FingerprintTask:
+    info: FileInfo
+    metadata: Optional[dict]
+
+
+class FingerprintPipeline:
+    def __init__(
+        self,
+        *,
+        settings: FingerprintSettings,
+        shard_path: Path,
+        progress_callback: Optional[Callable[[dict], None]],
+        start_time: float,
+    ) -> None:
+        self._settings = settings
+        self._shard_path = shard_path
+        self._progress_callback = progress_callback
+        self._start = start_time
+        self._last_emit = 0.0
+        self._queue: "queue.Queue[object]" = queue.Queue()
+        self._sentinel = object()
+        self._threads: List[threading.Thread] = []
+        self._pending: List[_FingerprintTask] = []
+        self._prepared = False
+        self._enabled = False
+        self._video_enabled = False
+        self._audio_enabled = False
+        self._prefilter_enabled = False
+        self._tmk_toolchain: Optional[fp_tools.TMKToolchain] = None
+        self._chromaprint_tool: Optional[fp_tools.ChromaprintTool] = None
+        self._stats = {"video": 0, "audio": 0, "vhash": 0}
+        self._lock = threading.Lock()
+        self._errors: List[str] = []
+
+    def prepare(self, connection: sqlite3.Connection) -> None:
+        if self._prepared:
+            return
+        self._prepared = True
+        fp_store.ensure_schema(connection)
+
+        if self._settings.phase_mode == "off":
+            self._enabled = False
+            return
+
+        if self._settings.enable_video_tmk:
+            override = str(self._settings.tmk_bin_path) if self._settings.tmk_bin_path else None
+            self._tmk_toolchain = fp_tools.resolve_tmk_toolchain(override)
+            if not self._tmk_toolchain:
+                self._errors.append("TMK+PDQF tools not available; video hashing disabled.")
+            else:
+                self._video_enabled = True
+        if self._settings.enable_audio_chroma:
+            override = str(self._settings.fpcalc_path) if self._settings.fpcalc_path else None
+            self._chromaprint_tool = fp_tools.resolve_chromaprint(override)
+            if not self._chromaprint_tool:
+                self._errors.append("Chromaprint fpcalc not found; audio hashing disabled.")
+            else:
+                self._audio_enabled = True
+
+        self._prefilter_enabled = bool(
+            self._settings.enable_video_vhash_prefilter and fp_tools.have_videohash()
+        )
+        if self._settings.enable_video_vhash_prefilter and not self._prefilter_enabled:
+            self._errors.append("videohash library not installed; prefilter disabled.")
+
+        self._enabled = any([self._video_enabled, self._audio_enabled, self._prefilter_enabled])
+        if not self._enabled:
+            return
+
+    def submit(self, result: WorkerResult) -> None:
+        if not self._enabled:
+            return
+        info = result.info
+        try:
+            suffix = Path(info.path).suffix.lower()
+        except Exception:
+            return
+        wants_video = self._video_enabled and suffix in VIDEO_EXTS
+        wants_audio = self._audio_enabled and suffix in AUDIO_EXTS
+        wants_prefilter = self._prefilter_enabled and suffix in VIDEO_EXTS
+        if not any([wants_video, wants_audio, wants_prefilter]):
+            return
+        task = _FingerprintTask(info=info, metadata=result.media_metadata)
+        if self._settings.phase_mode == "during-scan":
+            self._ensure_workers()
+            self._queue.put(task)
+        else:
+            self._pending.append(task)
+
+    def flush(self) -> None:
+        if not self._enabled:
+            return
+        if self._pending:
+            self._ensure_workers()
+            for task in self._pending:
+                self._queue.put(task)
+            self._pending.clear()
+        if not self._threads:
+            return
+        self._queue.join()
+
+    def finalize(self) -> Dict[str, object]:
+        summary: Dict[str, object] = {
+            "status": "skipped" if not self._enabled else "ok",
+            "video": self._stats["video"],
+            "audio": self._stats["audio"],
+            "vhash": self._stats["vhash"],
+        }
+        if self._errors:
+            summary["errors"] = list(self._errors)
+        if not self._enabled:
+            summary["status"] = "skipped"
+            return summary
+        for _ in self._threads:
+            self._queue.put(self._sentinel)
+        for thread in self._threads:
+            thread.join()
+        summary["status"] = "ok"
+        self._emit_progress(force=True)
+        return summary
+
+    def _ensure_workers(self) -> None:
+        if self._threads:
+            return
+        for idx in range(self._settings.max_concurrency):
+            thread = threading.Thread(target=self._worker, name=f"fp-worker-{idx+1}")
+            thread.daemon = True
+            thread.start()
+            self._threads.append(thread)
+
+    def _worker(self) -> None:
+        store = fp_store.FingerprintStore(self._shard_path)
+        fingerprinter = fp_video.TMKVideoFingerprinter(self._tmk_toolchain)
+        chroma = fp_audio.ChromaprintGenerator(self._chromaprint_tool)
+        sleep_seconds = max(0.0, float(self._settings.io_gentle_ms) / 1000.0)
+        while True:
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if item is self._sentinel:
+                    break
+                assert isinstance(item, _FingerprintTask)
+                self._process_task(item, store, fingerprinter, chroma)
+                if sleep_seconds:
+                    time.sleep(sleep_seconds)
+            finally:
+                self._queue.task_done()
+        store.close()
+
+    def _process_task(
+        self,
+        task: _FingerprintTask,
+        store: fp_store.FingerprintStore,
+        fingerprinter: fp_video.TMKVideoFingerprinter,
+        chroma: fp_audio.ChromaprintGenerator,
+    ) -> None:
+        info = task.info
+        duration_hint = _extract_duration(task.metadata)
+        suffix = Path(info.path).suffix.lower()
+        errors: List[str] = []
+        try:
+            if self._prefilter_enabled and suffix in VIDEO_EXTS:
+                if not store.has_vhash(info.path):
+                    vhash = fp_vhash.compute_vhash(Path(info.fs_path))
+                    if vhash:
+                        store.upsert_video_vhash(path=info.path, vhash=vhash.hash64)
+                        with self._lock:
+                            self._stats["vhash"] += 1
+            if self._video_enabled and suffix in VIDEO_EXTS:
+                if not store.has_video_signature(info.path):
+                    signature = fingerprinter.compute(
+                        Path(info.fs_path), duration_hint=duration_hint
+                    )
+                    if signature:
+                        store.upsert_video_signature(
+                            path=info.path,
+                            duration=signature.duration_seconds,
+                            signature=signature.signature,
+                            version=signature.tool_version,
+                        )
+                        with self._lock:
+                            self._stats["video"] += 1
+            if self._audio_enabled and suffix in AUDIO_EXTS:
+                if not store.has_audio_signature(info.path):
+                    fingerprint = chroma.compute(Path(info.fs_path))
+                    if fingerprint:
+                        store.upsert_audio_signature(
+                            path=info.path,
+                            duration=fingerprint.duration_seconds,
+                            fingerprint=fingerprint.fingerprint,
+                            version=fingerprint.tool_version,
+                        )
+                        with self._lock:
+                            self._stats["audio"] += 1
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            if errors:
+                with self._lock:
+                    self._errors.extend(errors)
+            self._emit_progress()
+
+    def _emit_progress(self, *, force: bool = False) -> None:
+        if not self._progress_callback:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_emit) < 5:
+            return
+        elapsed = int(time.perf_counter() - self._start)
+        payload = {
+            "type": "progress",
+            "phase": "fingerprinting",
+            "elapsed_s": elapsed,
+            "fingerprint_video": self._stats["video"],
+            "fingerprint_audio": self._stats["audio"],
+            "fingerprint_vhash": self._stats["vhash"],
+        }
+        try:
+            self._progress_callback(payload)
+        except Exception:
+            pass
+        self._last_emit = now
+
+
+def _extract_duration(metadata: Optional[dict]) -> Optional[float]:
+    if not isinstance(metadata, dict):
+        return None
+    duration_fields = []
+    if "duration" in metadata:
+        duration_fields.append(metadata.get("duration"))
+    media = metadata.get("media") if isinstance(metadata.get("media"), dict) else None
+    if media and isinstance(media.get("track"), list):
+        for track in media["track"]:
+            if not isinstance(track, dict):
+                continue
+            if track.get("@type") in {"General", "Video", "Audio"}:
+                if "Duration" in track:
+                    duration_fields.append(track.get("Duration"))
+                if "Duration/String" in track:
+                    duration_fields.append(track.get("Duration/String"))
+    for value in duration_fields:
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                continue
+    return None
+
 def _resolve_light_analysis(
     settings: Optional[Dict[str, object]], override: Optional[bool]
 ) -> LightAnalysisSettings:
@@ -347,6 +627,66 @@ def _resolve_light_analysis(
         model_path=model_path,
         max_video_frames=max_frames,
         prefer_ffmpeg=prefer_ffmpeg,
+    )
+
+
+def _resolve_fingerprint_settings(
+    settings: Optional[Dict[str, object]], overrides: Optional[Dict[str, object]]
+) -> FingerprintSettings:
+    config: Dict[str, object] = {}
+    if isinstance(settings, dict):
+        maybe = settings.get("fingerprints")
+        if isinstance(maybe, dict):
+            config = maybe
+    overrides = overrides or {}
+
+    def _bool(name: str, default: bool) -> bool:
+        if name in overrides:
+            return bool(overrides[name])
+        return bool(config.get(name, default))
+
+    def _float(name: str, default: float) -> float:
+        value = overrides.get(name, config.get(name, default))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _int(name: str, default: int, minimum: int = 1) -> int:
+        value = overrides.get(name, config.get(name, default))
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            result = default
+        return max(minimum, result)
+
+    def _path(name: str) -> Optional[Path]:
+        value = overrides.get(name, config.get(name))
+        if isinstance(value, str) and value.strip():
+            candidate = Path(os.path.expanduser(value.strip()))
+            if not candidate.is_absolute():
+                return (WORKING_DIR_PATH / candidate).resolve()
+            return candidate
+        return None
+
+    phase = overrides.get("phase_mode", config.get("phase_mode", "off"))
+    if not isinstance(phase, str):
+        phase = "off"
+    phase = phase.lower()
+    if phase not in {"off", "during-scan", "post-scan"}:
+        phase = "off"
+
+    return FingerprintSettings(
+        enable_video_tmk=_bool("enable_video_tmk", False),
+        enable_audio_chroma=_bool("enable_audio_chroma", False),
+        enable_video_vhash_prefilter=_bool("enable_video_vhash_prefilter", True),
+        phase_mode=phase,
+        max_concurrency=_int("max_concurrency", 2, minimum=1),
+        io_gentle_ms=_int("io_gentle_ms", 2, minimum=0),
+        tmk_similarity_threshold=_float("tmk_similarity_threshold", 0.75),
+        chroma_match_threshold=_float("chroma_match_threshold", 0.15),
+        tmk_bin_path=_path("tmk_bin_path"),
+        fpcalc_path=_path("fpcalc_path"),
     )
 
 
@@ -959,6 +1299,7 @@ def scan_drive(
     debug_slow: bool = False,
     settings: Optional[Dict[str, object]] = None,
     perf_overrides: Optional[Dict[str, object]] = None,
+    fingerprint_overrides: Optional[Dict[str, object]] = None,
     robust_overrides: Optional[Dict[str, object]] = None,
     light_analysis: Optional[bool] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
@@ -973,6 +1314,7 @@ def scan_drive(
     effective_settings = settings or load_settings(WORKING_DIR_PATH)
     perf_overrides = perf_overrides or {}
     light_cfg = _resolve_light_analysis(effective_settings, light_analysis)
+    fingerprint_cfg = _resolve_fingerprint_settings(effective_settings, fingerprint_overrides)
     perf_config = resolve_performance_config(
         str(mount),
         settings=effective_settings,
@@ -1031,6 +1373,7 @@ def scan_drive(
     total, used, free = shutil.disk_usage(mount)
     conn = init_db(str(shard_path))
     light_pipeline: Optional[LightAnalysisPipeline] = None
+    fingerprint_pipeline: Optional[FingerprintPipeline] = None
     if not inventory_only:
         light_pipeline = LightAnalysisPipeline(
             settings=light_cfg,
@@ -1041,6 +1384,13 @@ def scan_drive(
             start_time=start_time,
         )
         light_pipeline.prepare()
+        fingerprint_pipeline = FingerprintPipeline(
+            settings=fingerprint_cfg,
+            shard_path=shard_path,
+            progress_callback=progress_callback,
+            start_time=start_time,
+        )
+        fingerprint_pipeline.prepare(conn)
     conn.execute(
         """
         INSERT INTO drives(label, mount_path, total_bytes, free_bytes, smart_scan, scanned_at)
@@ -1359,6 +1709,8 @@ def scan_drive(
                 )
             if light_pipeline is not None:
                 light_pipeline.process(info)
+            if fingerprint_pipeline is not None:
+                fingerprint_pipeline.submit(result)
             _flush_db(force=False)
             _emit_progress("hashing")
 
@@ -1428,6 +1780,7 @@ def scan_drive(
             media_blob=media_blob,
             integrity_ok=integrity_ok,
             error_message=error_message,
+            media_metadata=metadata,
         )
 
     def _worker() -> None:
@@ -1638,8 +1991,12 @@ def scan_drive(
         metrics["retries"],
     )
     light_summary: Optional[Dict[str, object]] = None
+    fingerprint_summary: Optional[Dict[str, object]] = None
     if light_pipeline is not None:
         light_summary = light_pipeline.finalize()
+    if fingerprint_pipeline is not None:
+        fingerprint_pipeline.flush()
+        fingerprint_summary = fingerprint_pipeline.finalize()
     conn.close()
     return {
         "total_files": metrics["files_seen"],
@@ -1653,6 +2010,7 @@ def scan_drive(
         "skipped_toolong": metrics["skipped_toolong"],
         "skipped_ignored": metrics["skipped_ignored"],
         "light_analysis": light_summary,
+        "fingerprints": fingerprint_summary,
     }
 
 
@@ -1844,6 +2202,54 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.set_defaults(light_analysis=None)
+    parser.add_argument(
+        "--fingerprint-video-tmk",
+        action="store_true",
+        help="Enable TMK+PDQF video fingerprinting during this scan.",
+    )
+    parser.add_argument(
+        "--fingerprint-audio-chroma",
+        action="store_true",
+        help="Enable Chromaprint audio fingerprinting during this scan.",
+    )
+    parser.add_argument(
+        "--fingerprint-prefilter-vhash",
+        dest="fingerprint_prefilter_vhash",
+        action="store_true",
+        help="Enable videohash prefilter when fingerprinting videos.",
+    )
+    parser.add_argument(
+        "--no-prefilter-vhash",
+        dest="fingerprint_prefilter_vhash",
+        action="store_false",
+        help="Disable videohash prefilter even if enabled in settings.",
+    )
+    parser.set_defaults(fingerprint_prefilter_vhash=None)
+    parser.add_argument(
+        "--fingerprint-phase",
+        choices=["during-scan", "post-scan", "off"],
+        help="Choose when to compute fingerprints (default from settings).",
+    )
+    parser.add_argument(
+        "--fingerprint-workers",
+        type=int,
+        help="Override fingerprint worker count.",
+    )
+    parser.add_argument(
+        "--fingerprint-io-ms",
+        type=int,
+        help="Override fingerprint I/O pacing in milliseconds between files.",
+    )
+    parser.add_argument(
+        "--tmk-bin",
+        dest="fingerprint_tmk_bin",
+        help="Path to TMK binaries if not on PATH.",
+    )
+    parser.add_argument(
+        "--fpcalc",
+        dest="fingerprint_fpcalc",
+        help="Path to Chromaprint fpcalc executable.",
+    )
     parser.add_argument(
         "positional",
         nargs="*",
@@ -2179,6 +2585,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     if getattr(args, "op_timeout", None) is not None:
         robust_cli_overrides["op_timeout_s"] = args.op_timeout
 
+    fingerprint_cli_overrides: Dict[str, object] = {}
+    if getattr(args, "fingerprint_video_tmk", False):
+        fingerprint_cli_overrides["enable_video_tmk"] = True
+    if getattr(args, "fingerprint_audio_chroma", False):
+        fingerprint_cli_overrides["enable_audio_chroma"] = True
+    pref_value = getattr(args, "fingerprint_prefilter_vhash", None)
+    if pref_value is not None:
+        fingerprint_cli_overrides["enable_video_vhash_prefilter"] = pref_value
+    if getattr(args, "fingerprint_phase", None):
+        fingerprint_cli_overrides["phase_mode"] = args.fingerprint_phase
+    if getattr(args, "fingerprint_workers", None) is not None:
+        fingerprint_cli_overrides["max_concurrency"] = args.fingerprint_workers
+    if getattr(args, "fingerprint_io_ms", None) is not None:
+        fingerprint_cli_overrides["io_gentle_ms"] = args.fingerprint_io_ms
+    if getattr(args, "fingerprint_tmk_bin", None):
+        fingerprint_cli_overrides["tmk_bin_path"] = args.fingerprint_tmk_bin
+    if getattr(args, "fingerprint_fpcalc", None):
+        fingerprint_cli_overrides["fpcalc_path"] = args.fingerprint_fpcalc
+
     settings_data = load_settings(WORKING_DIR_PATH)
 
     result = scan_drive(
@@ -2193,6 +2618,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         debug_slow=debug_flag,
         settings=settings_data,
         perf_overrides=perf_cli_overrides,
+        fingerprint_overrides=fingerprint_cli_overrides,
         robust_overrides=robust_cli_overrides,
         light_analysis=getattr(args, "light_analysis", None),
     )
@@ -2215,6 +2641,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"{total_files:,} — AV files: {av_files:,} — duration: {_format_duration(duration_seconds)}"
         )
         light_line = None
+        fingerprint_line = None
         light_info = result.get("light_analysis") if isinstance(result, dict) else None
         if isinstance(light_info, dict):
             status = str(light_info.get("status") or "").lower()
@@ -2228,6 +2655,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                     light_line += f" (warning: {light_info.get('warning')})"
             elif status in {"error", "skipped"} and light_info.get("message"):
                 light_line = f"Light analysis skipped — {light_info.get('message')}"
+        fp_info = result.get("fingerprints") if isinstance(result, dict) else None
+        if isinstance(fp_info, dict):
+            status = str(fp_info.get("status") or "").lower()
+            if status == "ok":
+                fingerprint_line = (
+                    "Fingerprints — video: "
+                    f"{int(fp_info.get('video', 0)):,}, audio: {int(fp_info.get('audio', 0)):,}, "
+                    f"prefilter: {int(fp_info.get('vhash', 0)):,}"
+                )
+            elif fp_info.get("errors"):
+                fingerprint_line = "Fingerprints skipped — " + "; ".join(
+                    str(err) for err in fp_info.get("errors", [])
+                )
+            elif status == "skipped":
+                fingerprint_line = "Fingerprints skipped — disabled"
 
     export_requests: list[tuple[str, Optional[str]]] = []
     if getattr(args, "export_csv", None) is not None:
@@ -2267,8 +2709,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
     print(summary_line)
-    if not getattr(args, "inventory_only", False) and light_line:
-        print(light_line)
+    if not getattr(args, "inventory_only", False):
+        if light_line:
+            print(light_line)
+        if fingerprint_line:
+            print(fingerprint_line)
     if not getattr(args, "inventory_only", False):
         try:
             maintenance_options = resolve_options(settings_data)
