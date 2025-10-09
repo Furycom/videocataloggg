@@ -2,7 +2,7 @@
 # Requiert: Python 3.10+, mediainfo (CLI), sqlite3 (intégré), smartctl/ffmpeg optionnels, blake3 (pip)
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
-import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue
+import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import lru_cache
@@ -64,6 +64,7 @@ from tkinter import (
 from tkinter.scrolledtext import ScrolledText
 
 from gpu.capabilities import probe_gpu
+from gpu.runtime import get_hwaccel_args, select_provider
 
 # ---------------- Config & constantes ----------------
 WORKING_DIR_PATH = resolve_working_dir()
@@ -1803,6 +1804,9 @@ class App:
         self.gpu_policy_var = StringVar(value=policy_default)
         self.gpu_hwaccel_var = IntVar(value=1 if allow_hwaccel_default else 0)
         self.gpu_status_var = StringVar(value="Probing GPU…")
+        self._last_gpu_caps: Dict[str, object] = {}
+        self._gpu_dialog: Optional["GPUProvisioningDialog"] = None
+        self._gpu_prompted = False
         self.inventory_var = IntVar(value=0)
         self.rescan_mode_var = StringVar(value="delta")
         self.resume_var = IntVar(value=1)
@@ -1948,11 +1952,12 @@ class App:
         statuses = self._probe_all_tools()
         self._update_tool_statuses(statuses, log_line=initial)
 
-    def _format_gpu_status(self) -> str:
-        try:
-            caps = probe_gpu()
-        except Exception:
-            return "Detected: unknown, VRAM: n/a, ORT: CPU"
+    def _format_gpu_status(
+        self,
+        caps: Dict[str, object],
+        provider: str,
+        hwaccel_enabled: bool,
+    ) -> str:
         if caps.get("has_nvidia"):
             name = str(caps.get("nv_name") or "NVIDIA GPU")
             total_bytes = caps.get("nv_vram_bytes") or 0
@@ -1962,21 +1967,58 @@ class App:
                 total_gib = 0.0
             vram_text = f"{total_gib:.1f} GiB" if total_gib > 0 else "n/a"
         else:
-            name = "None"
+            name = "No NVIDIA GPU"
             vram_text = "0 GiB"
-        if caps.get("onnx_cuda_ok"):
-            ort_mode = "CUDA"
-        elif caps.get("onnx_directml_ok"):
-            ort_mode = "DML"
-        else:
-            ort_mode = "CPU"
-        return f"Detected: {name}, VRAM: {vram_text}, ORT: {ort_mode}"
+        driver = str(caps.get("nv_driver_version") or "n/a")
+        label_map = {
+            "CUDAExecutionProvider": "CUDA",
+            "DmlExecutionProvider": "DirectML",
+            "CPU": "CPU",
+        }
+        provider_label = label_map.get(provider, provider or "CPU")
+        hwaccel_state = "on" if hwaccel_enabled else "off"
+        summary = (
+            f"Detected: {name} ({vram_text}), driver {driver}\n"
+            f"ONNX provider: {provider_label} — hwaccel {hwaccel_state}"
+        )
+        error_text = caps.get("onnx_cuda_error")
+        if error_text and not caps.get("onnx_cuda_ok"):
+            snippet = str(error_text).strip().splitlines()[0]
+            if len(snippet) > 120:
+                snippet = snippet[:117] + "…"
+            summary += f"\nCUDA unavailable: {snippet}"
+        return summary
 
-    def _refresh_gpu_status(self) -> None:
+    def _refresh_gpu_status(self, *, force: bool = False, caps: Optional[Dict[str, object]] = None) -> None:
         try:
-            self.gpu_status_var.set(self._format_gpu_status())
+            snapshot = probe_gpu(refresh=force) if caps is None else caps
         except Exception:
             self.gpu_status_var.set("Detected: unknown, VRAM: n/a, ORT: CPU")
+            return
+        provider = select_provider(
+            self.gpu_policy_var.get(),
+            min_free_vram_mb=self.gpu_min_vram,
+            caps=snapshot,
+        )
+        hwaccel_args = get_hwaccel_args(
+            self.gpu_policy_var.get(),
+            allow_hwaccel=bool(self.gpu_hwaccel_var.get()),
+            caps=snapshot,
+        )
+        self.gpu_status_var.set(
+            self._format_gpu_status(snapshot, provider, bool(hwaccel_args))
+        )
+        self._last_gpu_caps = dict(snapshot)
+        if snapshot.get("onnx_cuda_ok"):
+            self._gpu_prompted = False
+            if self._gpu_dialog and self._gpu_dialog.winfo_exists():
+                self._gpu_dialog.destroy()
+                self._gpu_dialog = None
+        else:
+            if self._gpu_dialog and self._gpu_dialog.winfo_exists():
+                self._gpu_dialog.update_caps(snapshot)
+            else:
+                self._maybe_prompt_cuda_help(snapshot)
 
     def _save_gpu_settings(self) -> None:
         payload = {
@@ -1996,6 +2038,74 @@ class App:
 
     def _on_gpu_hwaccel_toggle(self) -> None:
         self._save_gpu_settings()
+
+    def _maybe_prompt_cuda_help(self, caps: Dict[str, object]) -> None:
+        if not sys.platform.startswith("win"):
+            return
+        if (self.gpu_policy_var.get() or "AUTO").upper() == "CPU_ONLY":
+            return
+        if not caps.get("has_nvidia"):
+            return
+        if caps.get("onnx_cuda_ok"):
+            return
+        if not caps.get("onnx_cuda_error"):
+            return
+        if self._gpu_prompted and not (
+            self._gpu_dialog and self._gpu_dialog.winfo_exists()
+        ):
+            return
+        if self._gpu_dialog and self._gpu_dialog.winfo_exists():
+            self._gpu_dialog.update_caps(caps)
+            return
+        self._gpu_prompted = True
+        self._gpu_dialog = GPUProvisioningDialog(self, caps)
+
+    def open_gpu_troubleshooter(self) -> None:
+        caps = self._last_gpu_caps
+        if not caps:
+            try:
+                caps = probe_gpu()
+            except Exception:
+                caps = {}
+        if self._gpu_dialog and self._gpu_dialog.winfo_exists():
+            try:
+                self._gpu_dialog.lift()
+                self._gpu_dialog.focus_set()
+            except Exception:
+                pass
+            self._gpu_dialog.update_caps(caps)
+            return
+        self._gpu_prompted = True
+        self._gpu_dialog = GPUProvisioningDialog(self, caps)
+
+    def _gpu_dialog_closed(self) -> None:
+        self._gpu_dialog = None
+
+    def use_directml_now(self, *, refresh: bool = False) -> None:
+        try:
+            caps = probe_gpu(refresh=refresh)
+        except Exception:
+            caps = self._last_gpu_caps
+        if not caps or not caps.get("onnx_directml_ok"):
+            messagebox.showwarning(
+                "DirectML unavailable",
+                "DirectML execution provider is not ready yet. Install the DirectML package or refresh after installing ONNX Runtime GPU dependencies.",
+            )
+            return
+        self.gpu_policy_var.set("AUTO")
+        self._save_gpu_settings()
+        self._gpu_prompted = True
+        self._refresh_gpu_status(force=False, caps=caps)
+        messagebox.showinfo(
+            "DirectML enabled",
+            "DirectML will be used for inference until CUDA is ready. You can retry CUDA from the GPU panel at any time.",
+        )
+        if self._gpu_dialog and self._gpu_dialog.winfo_exists():
+            try:
+                self._gpu_dialog.destroy()
+            except Exception:
+                pass
+            self._gpu_dialog = None
 
     def recheck_tool(self, tool: ToolName) -> dict:
         statuses = self._probe_all_tools()
@@ -2380,18 +2490,23 @@ class App:
             scan_frame, text="GPU", padding=(12, 10), style="Card.TLabelframe"
         )
         gpu_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(0, 12))
-        for col in range(3):
+        for col in range(4):
             gpu_frame.columnconfigure(col, weight=1 if col == 1 else 0)
         ttk.Label(
             gpu_frame,
             textvariable=self.gpu_status_var,
             style="Subtle.TLabel",
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Button(
             gpu_frame,
             text="Refresh",
             command=self._refresh_gpu_status,
         ).grid(row=0, column=2, sticky="e")
+        ttk.Button(
+            gpu_frame,
+            text="Troubleshoot…",
+            command=self.open_gpu_troubleshooter,
+        ).grid(row=0, column=3, sticky="e", padx=(6, 0))
         ttk.Radiobutton(
             gpu_frame,
             text="Auto",
@@ -4735,6 +4850,263 @@ class App:
             self._try_finalize_worker()
             if on_complete:
                 on_complete()
+
+
+class GPUProvisioningDialog(Toplevel):
+    """Self-healing assistant for CUDA Execution Provider provisioning."""
+
+    DOC_URL = (
+        "https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html"
+    )
+
+    def __init__(self, app: "App", caps: Dict[str, object]):
+        super().__init__(app.root)
+        self.app = app
+        self.caps: Dict[str, object] = dict(caps or {})
+        self._retry_thread: Optional[threading.Thread] = None
+        self.status_var = StringVar(
+            value="CUDA Execution Provider failed to initialise."
+        )
+        self._check_vars: Dict[str, IntVar] = {}
+        self._check_labels: Dict[str, ttk.Checkbutton] = {}
+
+        self.title("GPU provisioning assistant")
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Escape>", lambda _event: self._on_close())
+
+        container = ttk.Frame(self, padding=(20, 18))
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            container,
+            text=(
+                "CUDA acceleration is currently unavailable. Review the checklist "
+                "below, install missing components, then retry the CUDA provider."
+            ),
+            wraplength=420,
+            style="Subtle.TLabel",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+
+        checklist = [
+            ("driver", "NVIDIA driver present and recent"),
+            ("cuda_toolkit", "CUDA Toolkit installed"),
+            ("cudnn", "cuDNN installed"),
+            ("msvc", "MSVC runtime present"),
+        ]
+
+        for idx, (key, text) in enumerate(checklist, start=1):
+            var = IntVar(value=0)
+            cb = ttk.Checkbutton(
+                container,
+                text=text,
+                variable=var,
+                state="disabled",
+            )
+            cb.grid(row=idx, column=0, sticky="w", pady=(6 if idx == 1 else 2, 0))
+            self._check_vars[key] = var
+            self._check_labels[key] = cb
+
+        ttk.Label(
+            container,
+            text="Latest CUDA provider error:",
+            style="StatusDanger.TLabel",
+        ).grid(row=len(checklist) + 1, column=0, sticky="w", pady=(12, 4))
+
+        self.error_box = ScrolledText(
+            container,
+            width=64,
+            height=6,
+            wrap="word",
+            font=("Consolas", 9),
+        )
+        self.error_box.grid(row=len(checklist) + 2, column=0, sticky="nsew")
+        container.rowconfigure(len(checklist) + 2, weight=1)
+        self.error_box.configure(state="disabled", background="#f8f8f8")
+
+        ttk.Label(
+            container,
+            textvariable=self.status_var,
+            wraplength=420,
+            justify="left",
+        ).grid(row=len(checklist) + 3, column=0, sticky="w", pady=(12, 0))
+
+        buttons = ttk.Frame(container)
+        buttons.grid(row=len(checklist) + 4, column=0, sticky="ew", pady=(12, 0))
+        for col in range(2):
+            buttons.columnconfigure(col, weight=1)
+
+        self.install_button = ttk.Button(
+            buttons,
+            text="Install CUDA Toolkit (winget)",
+            command=self._install_cuda_toolkit,
+        )
+        self.install_button.grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            buttons,
+            text="Open CUDA/cuDNN requirements",
+            command=self._open_docs,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        self.retry_button = ttk.Button(
+            buttons,
+            text="Retry CUDA provider",
+            command=self._retry_cuda,
+        )
+        self.retry_button.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.directml_button = ttk.Button(
+            buttons,
+            text="Use DirectML instead",
+            command=self._use_directml,
+        )
+        self.directml_button.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+
+        ttk.Button(buttons, text="Close", command=self._on_close).grid(
+            row=2, column=1, sticky="e", pady=(12, 0)
+        )
+
+        self.update_caps(self.caps)
+
+    # ------------------------------------------------------------------
+    def update_caps(self, caps: Dict[str, object]) -> None:
+        self.caps = dict(caps or {})
+        hints = self.caps.get("cuda_dependency_hints") or {}
+        label_suffix = {
+            True: " — OK",
+            False: " — missing",
+            None: " — verify",
+        }
+        for key, cb in self._check_labels.items():
+            status = hints.get(key)
+            base_text = cb.cget("text").split(" — ")[0]
+            suffix = label_suffix.get(status if status in label_suffix else None, "")
+            cb.configure(text=base_text + suffix)
+            var = self._check_vars[key]
+            var.set(1 if status else 0)
+
+        error_text = self.caps.get("onnx_cuda_error")
+        self._set_error_text(
+            str(error_text).strip() if error_text else "No CUDA error was reported."
+        )
+
+        if self.caps.get("onnx_cuda_ok"):
+            self.status_var.set(
+                "CUDA Execution Provider initialised successfully."
+            )
+            self.retry_button.configure(state="disabled")
+        else:
+            self.status_var.set(
+                "CUDA provider is unavailable. Install missing dependencies or use DirectML as a fallback."
+            )
+            self.retry_button.configure(state="normal")
+
+        if self.caps.get("onnx_directml_ok"):
+            self.directml_button.configure(state="normal")
+        else:
+            self.directml_button.configure(state="disabled")
+
+    def _set_error_text(self, text: str) -> None:
+        self.error_box.configure(state="normal")
+        self.error_box.delete("1.0", "end")
+        self.error_box.insert("1.0", text or "(empty)")
+        self.error_box.configure(state="disabled")
+
+    def _install_cuda_toolkit(self) -> None:
+        if not sys.platform.startswith("win"):
+            messagebox.showinfo(
+                "Unsupported platform",
+                "winget installation is only available on Windows.",
+            )
+            return
+        if not winget_available():
+            messagebox.showerror(
+                "winget unavailable",
+                "winget is not available. Install winget or install the CUDA Toolkit manually.",
+            )
+            return
+        command = ["winget", "install", "-e", "--id", "Nvidia.CUDA"]
+        creation_flags = 0
+        if hasattr(subprocess, "CREATE_NEW_CONSOLE"):
+            creation_flags = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+        try:
+            subprocess.Popen(command, creationflags=creation_flags)  # type: ignore[arg-type]
+        except Exception as exc:
+            messagebox.showerror("CUDA install", f"Failed to launch winget: {exc}")
+            return
+        log("Launched winget install for Nvidia.CUDA")
+        self.status_var.set(
+            "winget installation launched. Follow the CUDA installer window to complete setup."
+        )
+
+    def _open_docs(self) -> None:
+        try:
+            webbrowser.open(self.DOC_URL)
+        except Exception:
+            messagebox.showerror(
+                "Open documentation", "Unable to launch the default browser."
+            )
+
+    def _retry_cuda(self) -> None:
+        if self._retry_thread and self._retry_thread.is_alive():
+            return
+
+        self.status_var.set("Retrying CUDA provider…")
+        self.retry_button.configure(state="disabled")
+
+        def worker():
+            error: Optional[str] = None
+            snapshot: Optional[Dict[str, object]] = None
+            try:
+                snapshot = probe_gpu(refresh=True)
+            except Exception as exc:  # pragma: no cover - defensive
+                error = str(exc)
+            self.after(0, lambda: self._retry_finished(snapshot, error))
+
+        self._retry_thread = threading.Thread(target=worker, daemon=True)
+        self._retry_thread.start()
+
+    def _retry_finished(
+        self,
+        caps: Optional[Dict[str, object]],
+        error: Optional[str],
+    ) -> None:
+        self._retry_thread = None
+        if caps is None:
+            if error:
+                messagebox.showerror("CUDA retry failed", error)
+                self.status_var.set(f"Retry failed: {error}")
+            self.retry_button.configure(state="normal")
+            return
+
+        self.app._refresh_gpu_status(force=False, caps=caps)
+        self.update_caps(caps)
+        if caps.get("onnx_cuda_ok"):
+            messagebox.showinfo(
+                "CUDA ready",
+                "CUDA Execution Provider initialised successfully.",
+            )
+            self.app._gpu_prompted = False
+            self.after(200, self._on_close)
+        else:
+            self.status_var.set(
+                "CUDA provider is still unavailable. Review the checklist above."
+            )
+            self.retry_button.configure(state="normal")
+
+    def _use_directml(self) -> None:
+        self.app.use_directml_now(refresh=True)
+
+    def _on_close(self) -> None:
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+        self.app._gpu_dialog_closed()
 
 
 class DiagnosticsDialog(Toplevel):

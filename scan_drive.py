@@ -30,10 +30,10 @@ from analyzers import (
 )
 from gpu.capabilities import probe_gpu
 from gpu.runtime import (
-    get_video_hwaccel,
+    get_hwaccel_args,
     providers_for_session,
     report_provider_failure,
-    select_onnx_provider,
+    select_provider,
 )
 from core.paths import (
     ensure_working_dir_structure,
@@ -228,12 +228,12 @@ class LightAnalysisPipeline:
             return
         ensure_features_table(self._conn)
         caps = probe_gpu()
-        provider = select_onnx_provider(
+        provider = select_provider(
             self._gpu.policy,
             min_free_vram_mb=self._gpu.min_free_vram_mb,
             caps=caps,
         )
-        hwaccel_args = get_video_hwaccel(
+        hwaccel_args = get_hwaccel_args(
             self._gpu.policy,
             allow_hwaccel=self._gpu.allow_hwaccel_video,
             caps=caps,

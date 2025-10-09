@@ -30,9 +30,9 @@ _NVML_LOCK = threading.Lock()
 _NVML_INITIALIZED = False
 _NVML_FAILED = False
 
-_FFMPEG_HWACCEL_CUDA: Optional[bool] = None
-_ONNX_CUDA_OK: Optional[bool] = None
-_ONNX_DML_OK: Optional[bool] = None
+_NVML_CACHE: Optional[Dict[str, object]] = None
+_ONNX_CACHE: Optional[Dict[str, Dict[str, object]]] = None
+_FFMPEG_CACHE: Optional[Dict[str, bool]] = None
 
 
 def _ensure_nvml() -> bool:
@@ -88,73 +88,42 @@ def _cuda_runtime_available() -> bool:
     return False
 
 
-def _probe_onnx_provider(provider: str) -> bool:
-    global _ONNX_CUDA_OK, _ONNX_DML_OK
-    if ort is None:
-        return False
-    cache_attr = "_ONNX_CUDA_OK" if provider == "CUDAExecutionProvider" else "_ONNX_DML_OK"
-    cached = globals().get(cache_attr)
-    if cached is not None:
-        return bool(cached)
-    try:
-        session = ort.InferenceSession(  # type: ignore[attr-defined]
-            _TINY_MODEL_BYTES,
-            providers=[provider],
-        )
-        available = provider in session.get_providers()
-    except Exception as exc:  # pragma: no cover - runtime guard
-        _LOGGER.debug("ONNX provider %s unavailable: %s", provider, exc)
-        available = False
-    globals()[cache_attr] = available
-    return available
+def _classify_cuda_error(message: Optional[str]) -> Dict[str, Optional[bool]]:
+    """Return heuristic dependency hints based on CUDA provider error text."""
+
+    hints: Dict[str, Optional[bool]] = {
+        "driver": None,
+        "cuda_toolkit": None,
+        "cudnn": None,
+        "msvc": None,
+    }
+    if not message:
+        return hints
+    text = message.lower()
+    if "cudart" in text or "cuda runtime" in text or "cuda driver" in text:
+        hints["cuda_toolkit"] = False
+    if "cudnn" in text:
+        hints["cudnn"] = False
+    if "vcruntime" in text or "msvcp" in text or "ucrt" in text or "visual c++" in text:
+        hints["msvc"] = False
+    if "driver" in text and "nvidia" in text and "update" in text:
+        hints["driver"] = False
+    return hints
 
 
-def _ffmpeg_supports_cuda() -> bool:
-    global _FFMPEG_HWACCEL_CUDA
-    if _FFMPEG_HWACCEL_CUDA is not None:
-        return _FFMPEG_HWACCEL_CUDA
-    candidates = [os.environ.get("VIDEOCATALOG_FFMPEG"), "ffmpeg"]
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate:
-            continue
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        try:
-            completed = subprocess.run(
-                [candidate, "-hwaccels"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-        except FileNotFoundError:
-            continue
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("ffmpeg -hwaccels failed for %s: %s", candidate, exc)
-            continue
-        output = "\n".join(filter(None, [completed.stdout, completed.stderr])).lower()
-        if "cuda" in output.split():
-            _FFMPEG_HWACCEL_CUDA = True
-            return True
-    _FFMPEG_HWACCEL_CUDA = False
-    return False
+def probe_nvml(*, refresh: bool = False) -> Dict[str, object]:
+    """Return information from NVML about the first NVIDIA GPU."""
 
-
-def probe_gpu() -> Dict[str, object]:
-    """Gather GPU-related capabilities and runtime readiness information."""
+    global _NVML_CACHE
+    if not refresh and _NVML_CACHE is not None:
+        return dict(_NVML_CACHE)
 
     result: Dict[str, object] = {
         "has_nvidia": False,
-        "nv_name": None,
-        "nv_vram_bytes": None,
-        "nv_free_vram_bytes": None,
-        "nv_driver_version": None,
-        "cuda_available": False,
-        "onnx_cuda_ok": False,
-        "onnx_directml_ok": False,
-        "ffmpeg_hwaccel_cuda": False,
+        "name": None,
+        "vram_bytes": None,
+        "free_vram_bytes": None,
+        "driver_version": None,
     }
 
     handle = None
@@ -173,27 +142,140 @@ def probe_gpu() -> Dict[str, object]:
             else:
                 name = str(raw_name) if raw_name else None
             if name:
-                result["nv_name"] = name
+                result["name"] = name
             mem_info = _nvml_value("nvmlDeviceGetMemoryInfo", handle)
             if mem_info is not None:
                 total = getattr(mem_info, "total", None)
                 free = getattr(mem_info, "free", None)
                 try:
-                    result["nv_vram_bytes"] = int(total) if total is not None else None
+                    result["vram_bytes"] = int(total) if total is not None else None
                 except Exception:
-                    result["nv_vram_bytes"] = None
+                    result["vram_bytes"] = None
                 try:
-                    result["nv_free_vram_bytes"] = int(free) if free is not None else None
+                    result["free_vram_bytes"] = int(free) if free is not None else None
                 except Exception:
-                    result["nv_free_vram_bytes"] = None
+                    result["free_vram_bytes"] = None
             driver = _nvml_value("nvmlSystemGetDriverVersion")
             if isinstance(driver, bytes):
-                result["nv_driver_version"] = driver.decode("utf-8", "ignore")
+                result["driver_version"] = driver.decode("utf-8", "ignore")
             elif driver:
-                result["nv_driver_version"] = str(driver)
-    if result["has_nvidia"]:
-        result["cuda_available"] = _cuda_runtime_available()
-    result["onnx_cuda_ok"] = _probe_onnx_provider("CUDAExecutionProvider")
-    result["onnx_directml_ok"] = _probe_onnx_provider("DmlExecutionProvider")
-    result["ffmpeg_hwaccel_cuda"] = _ffmpeg_supports_cuda()
+                result["driver_version"] = str(driver)
+
+    _NVML_CACHE = dict(result)
+    return result
+
+
+def _probe_single_provider(provider: str) -> Dict[str, object]:
+    status = {
+        "provider": provider,
+        "ok": False,
+        "error": None,
+    }
+    if ort is None:
+        status["error"] = "onnxruntime not installed"
+        return status
+    try:
+        session = ort.InferenceSession(  # type: ignore[attr-defined]
+            _TINY_MODEL_BYTES,
+            providers=[provider],
+        )
+        available = provider in session.get_providers()
+        status["ok"] = bool(available)
+    except Exception as exc:  # pragma: no cover - runtime guard
+        text = str(exc)
+        status["error"] = text or repr(exc)
+        status["ok"] = False
+        _LOGGER.debug("ONNX provider %s unavailable: %s", provider, exc)
+    return status
+
+
+def probe_onnx_providers(*, refresh: bool = False) -> Dict[str, Dict[str, object]]:
+    """Probe ONNX Runtime CUDA and DirectML execution providers."""
+
+    global _ONNX_CACHE
+    if not refresh and _ONNX_CACHE is not None:
+        return {key: dict(value) for key, value in _ONNX_CACHE.items()}
+
+    result: Dict[str, Dict[str, object]] = {
+        "cuda": _probe_single_provider("CUDAExecutionProvider"),
+        "directml": _probe_single_provider("DmlExecutionProvider"),
+    }
+
+    _ONNX_CACHE = {key: dict(value) for key, value in result.items()}
+    return result
+
+
+def probe_ffmpeg_hwaccel(*, refresh: bool = False) -> Dict[str, bool]:
+    """Check whether FFmpeg exposes CUDA/NVDEC acceleration."""
+
+    global _FFMPEG_CACHE
+    if not refresh and _FFMPEG_CACHE is not None:
+        return dict(_FFMPEG_CACHE)
+
+    has_cuda = False
+    candidates = [os.environ.get("VIDEOCATALOG_FFMPEG"), "ffmpeg"]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            completed = subprocess.run(
+                [candidate, "-hwaccels"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("ffmpeg -hwaccels failed for %s: %s", candidate, exc)
+            continue
+        output = "\n".join(filter(None, [completed.stdout, completed.stderr])).lower()
+        tokens = {token.strip() for token in output.split() if token.strip()}
+        if "cuda" in tokens:
+            has_cuda = True
+            break
+
+    cache = {"has_cuda": has_cuda}
+    _FFMPEG_CACHE = dict(cache)
+    return cache
+
+
+def probe_gpu(*, refresh: bool = False) -> Dict[str, object]:
+    """Gather GPU-related capabilities and runtime readiness information."""
+
+    nvml_info = probe_nvml(refresh=refresh)
+    provider_info = probe_onnx_providers(refresh=refresh)
+    ffmpeg_info = probe_ffmpeg_hwaccel(refresh=refresh)
+
+    cuda_ok = bool(provider_info["cuda"].get("ok"))
+    cuda_error = provider_info["cuda"].get("error")
+    dependency_hints = _classify_cuda_error(cuda_error)
+    if nvml_info.get("has_nvidia"):
+        dependency_hints.setdefault("driver", True)
+    if cuda_ok:
+        for key in ("cuda_toolkit", "cudnn", "msvc"):
+            dependency_hints[key] = True
+    elif dependency_hints.get("cuda_toolkit") is None and cuda_error:
+        lowered = str(cuda_error).lower()
+        if "onnxruntime" not in lowered:
+            dependency_hints["cuda_toolkit"] = False
+
+    result: Dict[str, object] = {
+        "has_nvidia": bool(nvml_info.get("has_nvidia")),
+        "nv_name": nvml_info.get("name"),
+        "nv_vram_bytes": nvml_info.get("vram_bytes"),
+        "nv_free_vram_bytes": nvml_info.get("free_vram_bytes"),
+        "nv_driver_version": nvml_info.get("driver_version"),
+        "cuda_available": _cuda_runtime_available() if nvml_info.get("has_nvidia") else False,
+        "onnx_cuda_ok": bool(provider_info["cuda"].get("ok")),
+        "onnx_cuda_error": provider_info["cuda"].get("error"),
+        "onnx_directml_ok": bool(provider_info["directml"].get("ok")),
+        "onnx_directml_error": provider_info["directml"].get("error"),
+        "ffmpeg_hwaccel_cuda": bool(ffmpeg_info.get("has_cuda")),
+        "cuda_dependency_hints": dependency_hints,
+    }
+
     return result
