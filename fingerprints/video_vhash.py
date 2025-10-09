@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from core.paths import to_long_path
+
 from .tools import have_videohash
 
 
@@ -26,7 +28,7 @@ def compute_vhash(source: Path) -> Optional[VideoVHash]:
         raise VideoVHashError(str(exc)) from exc
 
     try:
-        vh = VideoHash(str(source), hash_size=16)
+        vh = VideoHash(to_long_path(source), hash_size=16)
     except Exception as exc:  # pragma: no cover - underlying library errors
         raise VideoVHashError(str(exc)) from exc
     digest = getattr(vh, "videohash", None)

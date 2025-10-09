@@ -6,6 +6,10 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
 `DiskScannerGUI.py` provides a Tk-based interface for launching scans and reviewing job history.
 
+## Core modules
+
+- Foundational helpers now live under `core/` (`core.paths`, `core.db`, `core.settings`) and are shared by the CLI and GUI. The path utilities add Windows long-path/UNC handling, database helpers enable WAL mode with sane busy timeouts, and settings management merges defaults with `settings.json` while preserving legacy layouts.
+
 ## Quick Search
 
 - Open the **Search** tab (or click the toolbar Search button) and pick a drive/shard to query.
@@ -91,7 +95,9 @@ If the ONNX model or runtime cannot be loaded the scanner posts a red banner, sk
 - TMK+PDQF signatures rely on Meta's ThreatExchange utilities (`tmk-hash-video`, `tmk-compare-post`). Point the scanner at a portable build with `--tmk-bin <PATH>` (or `settings.json → fingerprints.tmk_bin_path`); missing tools gracefully disable video fingerprinting with a banner warning.
 - Audio fingerprints leverage Chromaprint's `fpcalc`. Provide a path with `--fpcalc <PATH>` or configure it once in `settings.json`. When the executable is absent the run continues without audio fingerprints.
 - Optional videohash prefiltering (`videohash` Python package) quickly spots obvious duplicates and reduces expensive TMK comparisons. Toggle it via `--fingerprint-prefilter-vhash` / `--no-prefilter-vhash` or `fingerprints.enable_video_vhash_prefilter` in settings.
-- Fingerprinting can execute concurrently with the main scan (`--fingerprint-phase during-scan`) or deferred to a lighter post-processing pass (`--fingerprint-phase post-scan`). Worker count and I/O pacing are configurable (`--fingerprint-workers N`, `--fingerprint-io-ms N`).
+- Fingerprinting now defaults to the gentler post-scan phase with two worker threads. Work is chunked in batches of 50 files with a configurable sleep (`fingerprints.io_gentle_ms`, override via `--fingerprint-io-ms` and `--fingerprint-batch-size`) and the NETWORK/USB performance profiles automatically widen those delays to keep remote media responsive.
+- Missing tools raise clear “Tool missing: …” banners in the GUI and warnings in the CLI; counts and warnings are surfaced in the completion summary so you can act on them immediately.
+- Consensus scoring blends TMK similarity with Chromaprint distance (defaults: 0.7 weight on video, 0.3 on audio). Adjust thresholds and weights in `settings.json` (`fingerprints.tmk_similarity_threshold`, `fingerprints.chroma_match_threshold`, `fingerprints.consensus_video_weight`).
 - Completion summaries include counts for video signatures, audio fingerprints, and prefilter hashes so you can monitor coverage per run. Detailed status (including missing tool hints) is also surfaced to the GUI progress feed.
 
 ## Performance Profiles

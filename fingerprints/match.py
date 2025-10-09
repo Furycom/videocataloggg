@@ -54,48 +54,49 @@ def find_probable_duplicates(
     matches: Dict[Tuple[str, str], Dict[str, float]] = {}
     results: List[Tuple[str, str, float, str]] = []
 
-    if options.use_video and fingerprinter.available:
-        progress.emit("video", total=len(video_pairs))
-        for idx, (a, b, sig_a, sig_b) in enumerate(video_pairs, start=1):
-            try:
-                score = fingerprinter.similarity(sig_a, sig_b)
-            except Exception:
-                continue
-            if score >= options.tmk_threshold:
-                key = _pair_key(a, b)
-                matches.setdefault(key, {})["video"] = score
-                results.append((key[0], key[1], score, "video"))
-                store.store_candidate(key[0], key[1], score, "video")
-            if idx % 25 == 0:
-                progress.emit("video", processed=idx, total=len(video_pairs))
-        progress.emit("video", processed=len(video_pairs), total=len(video_pairs))
+    with store.batch():
+        if options.use_video and fingerprinter.available:
+            progress.emit("video", total=len(video_pairs))
+            for idx, (a, b, sig_a, sig_b) in enumerate(video_pairs, start=1):
+                try:
+                    score = fingerprinter.similarity(sig_a, sig_b)
+                except Exception:
+                    continue
+                if score >= options.tmk_threshold:
+                    key = _pair_key(a, b)
+                    matches.setdefault(key, {})["video"] = score
+                    results.append((key[0], key[1], score, "video"))
+                    store.store_candidate(key[0], key[1], score, "video")
+                if idx % 25 == 0:
+                    progress.emit("video", processed=idx, total=len(video_pairs))
+            progress.emit("video", processed=len(video_pairs), total=len(video_pairs))
 
-    if options.use_audio:
-        progress.emit("audio", total=len(audio_pairs))
-        for idx, (a, b, fp_a, fp_b) in enumerate(audio_pairs, start=1):
-            distance = chroma_distance(fp_a, fp_b)
-            if distance <= options.chroma_threshold:
-                score = 1.0 - distance
-                key = _pair_key(a, b)
-                matches.setdefault(key, {})["audio"] = score
-                results.append((key[0], key[1], score, "audio"))
-                store.store_candidate(key[0], key[1], score, "audio")
-            if idx % 100 == 0:
-                progress.emit("audio", processed=idx, total=len(audio_pairs))
-        progress.emit("audio", processed=len(audio_pairs), total=len(audio_pairs))
+        if options.use_audio:
+            progress.emit("audio", total=len(audio_pairs))
+            for idx, (a, b, fp_a, fp_b) in enumerate(audio_pairs, start=1):
+                distance = chroma_distance(fp_a, fp_b)
+                if distance <= options.chroma_threshold:
+                    score = max(0.0, 1.0 - distance)
+                    key = _pair_key(a, b)
+                    matches.setdefault(key, {})["audio"] = score
+                    results.append((key[0], key[1], score, "audio"))
+                    store.store_candidate(key[0], key[1], score, "audio")
+                if idx % 100 == 0:
+                    progress.emit("audio", processed=idx, total=len(audio_pairs))
+            progress.emit("audio", processed=len(audio_pairs), total=len(audio_pairs))
 
-    if options.use_consensus:
-        for key, parts in matches.items():
-            if "video" not in parts or "audio" not in parts:
-                continue
-            video_score = parts.get("video", 0.0)
-            audio_score = parts.get("audio", 0.0)
-            consensus = (
-                options.consensus_video_weight * video_score
-                + (1.0 - options.consensus_video_weight) * audio_score
-            )
-            results.append((key[0], key[1], consensus, "consensus"))
-            store.store_candidate(key[0], key[1], consensus, "consensus")
+        if options.use_consensus:
+            for key, parts in matches.items():
+                if "video" not in parts or "audio" not in parts:
+                    continue
+                video_score = parts.get("video", 0.0)
+                audio_score = parts.get("audio", 0.0)
+                consensus = (
+                    options.consensus_video_weight * video_score
+                    + (1.0 - options.consensus_video_weight) * audio_score
+                )
+                results.append((key[0], key[1], consensus, "consensus"))
+                store.store_candidate(key[0], key[1], consensus, "consensus")
     return results
 
 

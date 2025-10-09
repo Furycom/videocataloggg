@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from core.paths import to_long_path
+
 from .tools import ChromaprintTool, resolve_chromaprint
 
 
@@ -36,7 +38,7 @@ class ChromaprintGenerator:
     def compute(self, source: Path, timeout: int = 900) -> Optional[ChromaprintFingerprint]:
         if not self._tool:
             return None
-        cmd = [self._tool.executable, "-json", str(source)]
+        cmd = [self._tool.executable, "-json", to_long_path(source)]
         try:
             completed = subprocess.run(
                 cmd,
