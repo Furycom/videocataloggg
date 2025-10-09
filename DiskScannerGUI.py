@@ -78,6 +78,23 @@ def _expand_user_path(value: str) -> Path:
 _SETTINGS = load_settings(WORKING_DIR_PATH)
 _settings_catalog = _SETTINGS.get("catalog_db") if isinstance(_SETTINGS, dict) else None
 
+_api_settings = _SETTINGS.get("api") if isinstance(_SETTINGS, dict) else {}
+if isinstance(_api_settings, dict):
+    API_ENABLED_DEFAULT = bool(_api_settings.get("enabled_default", False))
+    API_HOST_DEFAULT = str(_api_settings.get("host") or "127.0.0.1")
+    try:
+        API_PORT_DEFAULT = int(_api_settings.get("port") or 8756)
+    except (TypeError, ValueError):
+        API_PORT_DEFAULT = 8756
+    API_KEY_PRESENT_DEFAULT = bool(str(_api_settings.get("api_key") or "").strip())
+else:
+    API_ENABLED_DEFAULT = False
+    API_HOST_DEFAULT = "127.0.0.1"
+    API_PORT_DEFAULT = 8756
+    API_KEY_PRESENT_DEFAULT = False
+
+API_SCRIPT_PATH = Path(__file__).resolve().with_name("videocatalog_api.py")
+
 if isinstance(_settings_catalog, str) and _settings_catalog.strip():
     DB_DEFAULT_PATH = _expand_user_path(_settings_catalog.strip())
 else:
@@ -1779,6 +1796,17 @@ class App:
         self._search_results: list[dict] = []
         self._search_drive_options: list[str] = []
 
+        self.api_enabled_default = API_ENABLED_DEFAULT
+        self.api_default_host = API_HOST_DEFAULT
+        self.api_default_port = API_PORT_DEFAULT
+        self.api_key_present = API_KEY_PRESENT_DEFAULT
+        self.api_process: Optional[subprocess.Popen] = None
+        self.api_monitor_thread: Optional[threading.Thread] = None
+        self.api_running = False
+        self.api_stopping = False
+        self.api_endpoint: Optional[str] = None
+        self.api_status_var = StringVar(value=self._format_api_status(False))
+
         self._build_menu()
         self._build_form()
         self._build_tables()
@@ -1798,6 +1826,9 @@ class App:
         self.refresh_all()
         self._update_status_line(force=True)
         self._schedule_status_ticker()
+
+        if self.api_enabled_default:
+            self.root.after(800, self.start_local_api)
 
     def _probe_all_tools(self) -> Dict[str, dict]:
         statuses: Dict[str, dict] = {}
@@ -2176,6 +2207,21 @@ class App:
         ttk.Label(db_frame, textvariable=self.db_path, style="Value.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Button(db_frame, text="Browse…", command=self.db_open, style="Accent.TButton").grid(row=0, column=2, sticky="e", padx=(12, 0))
         ttk.Button(db_frame, text="New DB…", command=self.db_new).grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+        api_controls = ttk.Frame(db_frame, style="Card.TFrame")
+        api_controls.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        api_controls.columnconfigure(1, weight=1)
+        self.api_toggle_button = ttk.Button(
+            api_controls,
+            text="Start Local API",
+            command=self.toggle_local_api,
+        )
+        self.api_toggle_button.grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            api_controls,
+            textvariable=self.api_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         scan_frame = ttk.LabelFrame(parent, text="Scan parameters", padding=(16, 16), style="Card.TLabelframe")
         scan_frame.grid(row=1, column=0, sticky="ew", pady=(0, 16))
@@ -3093,6 +3139,129 @@ class App:
             self.status_line_label.configure(style=self.status_line_idle_style)
             self.status_line_var.set(self.status_line_idle_text)
 
+    # ----- Local API helpers
+    def _format_api_status(self, running: bool, extra: Optional[str] = None) -> str:
+        key_text = "key set" if self.api_key_present else "key missing"
+        base = f"host {self.api_default_host}:{self.api_default_port} — API {key_text}"
+        if running:
+            endpoint = extra or f"http://{self.api_default_host}:{self.api_default_port}"
+            return f"Running — {endpoint} — {base}"
+        if extra:
+            return f"{extra} — {base}"
+        return f"Stopped — {base}"
+
+    def toggle_local_api(self):
+        process = getattr(self, "api_process", None)
+        if process and process.poll() is None:
+            self.stop_local_api()
+        else:
+            self.start_local_api()
+
+    def start_local_api(self):
+        if getattr(self, "api_process", None) and self.api_process.poll() is None:
+            return
+        if not API_SCRIPT_PATH.exists():
+            messagebox.showerror(
+                "Local API",
+                "videocatalog_api.py is missing. Ensure the CLI script is present before starting the API.",
+            )
+            return
+        cmd = [
+            sys.executable,
+            str(API_SCRIPT_PATH),
+            "--host",
+            str(self.api_default_host),
+            "--port",
+            str(self.api_default_port),
+        ]
+        self.api_stopping = False
+        self.api_endpoint = None
+        self.api_status_var.set(self._format_api_status(False, "Starting…"))
+        self.api_toggle_button.configure(state="disabled")
+        try:
+            self.api_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            self.api_process = None
+            self.api_toggle_button.configure(state="normal")
+            self.api_status_var.set(self._format_api_status(False, "Start failed"))
+            messagebox.showerror("Local API", f"Could not start the local API: {exc}")
+            return
+        self.api_toggle_button.configure(text="Stop Local API", state="normal")
+        self.api_monitor_thread = threading.Thread(
+            target=self._monitor_api_process,
+            args=(self.api_process,),
+            daemon=True,
+        )
+        self.api_monitor_thread.start()
+
+    def _monitor_api_process(self, process: subprocess.Popen):
+        endpoint_reported = False
+        try:
+            if process.stdout:
+                for line in process.stdout:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    log(f"[api] {text}")
+                    if not endpoint_reported and text.lower().startswith("api listening on"):
+                        endpoint_reported = True
+                        endpoint = text.split("API listening on", 1)[-1].strip()
+                        self.root.after(0, lambda e=endpoint: self._set_api_running(True, e))
+            return_code = process.wait()
+        except Exception as exc:
+            log(f"[api] monitor error: {exc}")
+            return_code = -1
+        finally:
+            self.root.after(0, lambda code=return_code: self._handle_api_exit(code))
+
+    def _set_api_running(self, running: bool, endpoint: Optional[str] = None):
+        self.api_running = running
+        if running:
+            self.api_endpoint = endpoint
+            self.api_toggle_button.configure(text="Stop Local API", state="normal")
+            self.api_status_var.set(self._format_api_status(True, endpoint))
+        else:
+            self.api_toggle_button.configure(text="Start Local API", state="normal")
+            self.api_status_var.set(self._format_api_status(False))
+
+    def _handle_api_exit(self, return_code: int):
+        process = getattr(self, "api_process", None)
+        if process and process.poll() is None:
+            return
+        self.api_process = None
+        self.api_monitor_thread = None
+        if self.api_stopping:
+            self.api_stopping = False
+            self._set_api_running(False)
+            return
+        if self.api_running:
+            self.api_running = False
+        self.api_toggle_button.configure(text="Start Local API", state="normal")
+        status_text = "Stopped"
+        if return_code not in (0, None):
+            status_text = f"Stopped (exit {return_code})"
+            self.show_banner("Local API stopped unexpectedly.", "WARNING")
+        self.api_status_var.set(self._format_api_status(False, status_text))
+
+    def stop_local_api(self):
+        process = getattr(self, "api_process", None)
+        if not process:
+            self._set_api_running(False)
+            return
+        self.api_stopping = True
+        self.api_status_var.set(self._format_api_status(False, "Stopping…"))
+        self.api_toggle_button.configure(state="disabled")
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
     def _progress_style_for(self, percent: float) -> str:
         if percent >= 100:
             return "Success.Horizontal.TProgressbar"
@@ -3955,6 +4124,13 @@ class App:
         if self._closing:
             return
         self._closing = True
+        api_proc = getattr(self, "api_process", None)
+        if api_proc and api_proc.poll() is None:
+            self.stop_local_api()
+            try:
+                api_proc.wait(timeout=2)
+            except Exception:
+                pass
         for toast in list(self._active_toasts):
             try:
                 toast.destroy()

@@ -13,6 +13,23 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - Results return the latest 1,000 matches with name, category, size, modified time, drive label, and full path. Double-click opens the file's folder in Explorer, the context menu can copy the full path, and exports land as CSV/JSONL under `<working_dir>/exports`.
 - The first search against an older shard performs a lightweight migration that backfills the lowercase `inventory.name` column and index; if migration fails the UI falls back to path-only matching and surfaces the error.
 
+## Local read-only API
+
+- Launch the service directly with `python videocatalog_api.py --api-key <KEY>` (optional `--host`, `--port`, and repeated `--cors` flags override `settings.json`). On start the CLI prints `API listening on http://<host>:<port>` so other tools can probe it locally.
+- The GUI exposes a **Start Local API** toggle under the Database card. It shows host/port plus whether an API key is configured and runs the server in a background process. Disable it from the same button or let it auto-start when `settings.json` sets `"api.enabled_default": true`.
+- All endpoints are GET-only, paginate with `limit`/`offset`, and require an `X-API-Key` header. Missing or empty keys return `401 Unauthorized`. Defaults bind to `127.0.0.1:8756`; expanding beyond localhost or exposing the API externally is at your own risk.
+- Example requests:
+
+  ```bash
+  curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" http://127.0.0.1:8756/v1/health
+  curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" \
+       "http://127.0.0.1:8756/v1/inventory?drive_label=MyDrive&limit=25&q=hdr"
+  curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" \
+       "http://127.0.0.1:8756/v1/features/vector?drive_label=MyDrive&path=movies/clip.mp4&raw=true"
+  ```
+
+- Configure behaviour under the `"api"` section of `settings.json` (host, port, API key, allowed CORS origins, default page size). Pagination caps at `max_page_size`, and `/v1/features/vector` enforces a dimensionality guard unless `?raw=true` is supplied to download large vectors explicitly.
+
 ## Rescan modes
 
 The scanner now supports two rescan strategies when revisiting a drive:
