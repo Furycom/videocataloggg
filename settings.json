@@ -105,5 +105,53 @@
     "summary_target_tokens": 120,
     "keywords_topk": 10,
     "gpu_allowed": true
+  },
+  "visualreview": {
+    "enable": false,
+    "frames_per_video": 9,
+    "max_thumb_px": 640,
+    "thumbnail_format": "JPEG",
+    "thumbnail_quality": 85,
+    "max_thumbnail_bytes": 600000,
+    "max_contact_sheet_bytes": 2000000,
+    "thumbnail_retention": 800,
+    "sheet_retention": 400,
+    "batch_size": 3,
+    "sleep_seconds": 1.0,
+    "ffmpeg_path": null,
+    "prefer_pyav": false,
+    "scene_threshold": 27.0,
+    "min_scene_len": 24.0,
+    "fallback_percentages": [
+      0.05,
+      0.2,
+      0.35,
+      0.5,
+      0.65,
+      0.8,
+      0.95
+    ],
+    "cropdetect": false,
+    "cropdetect_frames": 12,
+    "cropdetect_skip_seconds": 1.0,
+    "cropdetect_round": 16,
+    "allow_hwaccel": true,
+    "hwaccel_policy": "AUTO",
+    "sheet_columns": 4,
+    "sheet_max_rows": null,
+    "sheet_cell_px": [
+      320,
+      180
+    ],
+    "sheet_background": [
+      16,
+      16,
+      16
+    ],
+    "sheet_margin": 24,
+    "sheet_padding": 6,
+    "sheet_format": "WEBP",
+    "sheet_quality": 80,
+    "sheet_optimize": true
   }
 }

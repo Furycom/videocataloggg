@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, Optional, Sequence
+from typing import Callable, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 from PIL import Image
 
@@ -22,6 +22,255 @@ LOGGER = logging.getLogger("videocatalog.visualreview.run")
 
 ProgressCallback = Callable[["ReviewProgress"], None]
 CancelCallback = Callable[[], bool]
+
+
+@dataclass(slots=True)
+class VisualReviewSettings:
+    """User configurable options for the visual review pipeline."""
+
+    enable: bool = False
+    frames_per_video: int = 9
+    max_thumb_px: int = 640
+    thumbnail_format: str = "JPEG"
+    thumbnail_quality: int = 85
+    max_thumbnail_bytes: int = 600_000
+    max_contact_sheet_bytes: int = 2_000_000
+    thumbnail_retention: int = 800
+    sheet_retention: int = 400
+    batch_size: int = 3
+    sleep_seconds: float = 1.0
+    ffmpeg_path: Optional[Path] = None
+    prefer_pyav: bool = False
+    scene_threshold: float = 27.0
+    min_scene_len: float = 24.0
+    fallback_percentages: Tuple[float, ...] = (
+        0.05,
+        0.20,
+        0.35,
+        0.50,
+        0.65,
+        0.80,
+        0.95,
+    )
+    cropdetect: bool = False
+    cropdetect_frames: int = 12
+    cropdetect_skip_seconds: float = 1.0
+    cropdetect_round: int = 16
+    allow_hwaccel: bool = True
+    hwaccel_policy: str = "AUTO"
+    sheet_columns: int = 4
+    sheet_max_rows: Optional[int] = None
+    sheet_cell_px: Tuple[int, int] = (320, 180)
+    sheet_background: Tuple[int, int, int] = (16, 16, 16)
+    sheet_margin: int = 24
+    sheet_padding: int = 6
+    sheet_format: str = "WEBP"
+    sheet_quality: int = 80
+    sheet_optimize: bool = True
+
+    @classmethod
+    def from_mapping(cls, mapping: Optional[Dict[str, object]]) -> "VisualReviewSettings":
+        data = dict(mapping or {})
+
+        def _get_int(name: str, default: int, *, minimum: Optional[int] = None) -> int:
+            value = data.get(name, default)
+            try:
+                intval = int(value)
+            except (TypeError, ValueError):
+                return default
+            if minimum is not None:
+                intval = max(minimum, intval)
+            return intval
+
+        def _get_float(name: str, default: float, *, minimum: Optional[float] = None) -> float:
+            value = data.get(name, default)
+            try:
+                floatval = float(value)
+            except (TypeError, ValueError):
+                return default
+            if minimum is not None:
+                floatval = max(minimum, floatval)
+            return floatval
+
+        def _get_bool(name: str, default: bool) -> bool:
+            value = data.get(name, default)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"1", "true", "yes", "on"}:
+                    return True
+                if lowered in {"0", "false", "no", "off"}:
+                    return False
+            return bool(value)
+
+        def _get_sequence(name: str, length: int) -> Optional[Tuple[int, ...]]:
+            value = data.get(name)
+            if not isinstance(value, (list, tuple)) or len(value) != length:
+                return None
+            items: list[int] = []
+            for item in value:
+                try:
+                    items.append(int(item))
+                except (TypeError, ValueError):
+                    return None
+            return tuple(items)
+
+        def _get_percentages(name: str, default: Tuple[float, ...]) -> Tuple[float, ...]:
+            value = data.get(name)
+            if not isinstance(value, (list, tuple)):
+                return default
+            result: list[float] = []
+            for item in value:
+                try:
+                    result.append(float(item))
+                except (TypeError, ValueError):
+                    continue
+            return tuple(result) if result else default
+
+        ffmpeg_value = data.get("ffmpeg_path")
+        if isinstance(ffmpeg_value, str) and ffmpeg_value.strip():
+            ffmpeg_path = Path(ffmpeg_value).expanduser()
+        else:
+            ffmpeg_path = None
+
+        cell = _get_sequence("sheet_cell_px", 2) or (320, 180)
+        cell = (max(16, cell[0]), max(16, cell[1]))
+
+        background_value = data.get("sheet_background")
+        if (
+            isinstance(background_value, (list, tuple))
+            and len(background_value) == 3
+        ):
+            parsed: list[int] = []
+            for item in background_value:
+                try:
+                    parsed.append(max(0, min(255, int(item))))
+                except (TypeError, ValueError):
+                    parsed = []
+                    break
+            background: Tuple[int, int, int]
+            background = tuple(parsed) if len(parsed) == 3 else (16, 16, 16)
+        else:
+            background = (16, 16, 16)
+
+        max_rows_value = data.get("sheet_max_rows")
+        if max_rows_value is None:
+            max_rows: Optional[int] = None
+        else:
+            try:
+                max_rows = max(1, int(max_rows_value))
+            except (TypeError, ValueError):
+                max_rows = None
+
+        fallback = _get_percentages("fallback_percentages", cls().fallback_percentages)
+
+        return cls(
+            enable=_get_bool("enable", False),
+            frames_per_video=_get_int("frames_per_video", 9, minimum=1),
+            max_thumb_px=_get_int("max_thumb_px", 640, minimum=32),
+            thumbnail_format=str(data.get("thumbnail_format", "JPEG") or "JPEG"),
+            thumbnail_quality=_get_int("thumbnail_quality", 85, minimum=1),
+            max_thumbnail_bytes=_get_int("max_thumbnail_bytes", 600000, minimum=1),
+            max_contact_sheet_bytes=_get_int(
+                "max_contact_sheet_bytes", 2000000, minimum=1
+            ),
+            thumbnail_retention=_get_int("thumbnail_retention", 800, minimum=0),
+            sheet_retention=_get_int("sheet_retention", 400, minimum=0),
+            batch_size=_get_int("batch_size", 3, minimum=1),
+            sleep_seconds=_get_float("sleep_seconds", 1.0, minimum=0.0),
+            ffmpeg_path=ffmpeg_path,
+            prefer_pyav=_get_bool("prefer_pyav", False),
+            scene_threshold=_get_float("scene_threshold", 27.0, minimum=0.0),
+            min_scene_len=_get_float("min_scene_len", 24.0, minimum=0.0),
+            fallback_percentages=fallback,
+            cropdetect=_get_bool("cropdetect", False),
+            cropdetect_frames=_get_int("cropdetect_frames", 12, minimum=1),
+            cropdetect_skip_seconds=_get_float(
+                "cropdetect_skip_seconds", 1.0, minimum=0.0
+            ),
+            cropdetect_round=_get_int("cropdetect_round", 16, minimum=1),
+            allow_hwaccel=_get_bool("allow_hwaccel", True),
+            hwaccel_policy=str(data.get("hwaccel_policy", "AUTO") or "AUTO"),
+            sheet_columns=_get_int("sheet_columns", 4, minimum=1),
+            sheet_max_rows=max_rows,
+            sheet_cell_px=cell,
+            sheet_background=background,
+            sheet_margin=_get_int("sheet_margin", 24, minimum=0),
+            sheet_padding=_get_int("sheet_padding", 6, minimum=0),
+            sheet_format=str(data.get("sheet_format", "WEBP") or "WEBP"),
+            sheet_quality=_get_int("sheet_quality", 80, minimum=1),
+            sheet_optimize=_get_bool("sheet_optimize", True),
+        )
+
+    def to_runner_config(
+        self,
+        *,
+        working_dir: Optional[Path] = None,
+        mounts: Optional[Dict[str, Path]] = None,
+        shard_labels: Optional[Sequence[str]] = None,
+    ) -> "ReviewRunnerConfig":
+        sampler_config = FrameSamplerConfig(
+            ffmpeg_path=self.ffmpeg_path,
+            prefer_pyav=self.prefer_pyav,
+            max_frames=self.frames_per_video,
+            scene_threshold=self.scene_threshold,
+            min_scene_len=self.min_scene_len,
+            fallback_percentages=self.fallback_percentages,
+            cropdetect=self.cropdetect,
+            cropdetect_frames=self.cropdetect_frames,
+            cropdetect_skip_seconds=self.cropdetect_skip_seconds,
+            cropdetect_round=self.cropdetect_round,
+            hwaccel_policy=self.hwaccel_policy,
+            allow_hwaccel=self.allow_hwaccel,
+        )
+        contact_config = ContactSheetConfig(
+            columns=self.sheet_columns,
+            max_rows=self.sheet_max_rows,
+            cell_size=self.sheet_cell_px,
+            background=self.sheet_background,
+            margin=self.sheet_margin,
+            padding=self.sheet_padding,
+            format=self.sheet_format,
+            quality=self.sheet_quality,
+            optimize=self.sheet_optimize,
+        )
+        store_config = VisualReviewStoreConfig(
+            max_thumbnail_bytes=self.max_thumbnail_bytes,
+            max_contact_sheet_bytes=self.max_contact_sheet_bytes,
+            thumbnail_retention=self.thumbnail_retention,
+            sheet_retention=self.sheet_retention,
+        )
+        mounts_payload = dict(mounts or {})
+        if shard_labels is not None:
+            labels: Optional[Sequence[str]] = list(shard_labels)
+        else:
+            labels = None
+        thumbnail_limit = (self.max_thumb_px, self.max_thumb_px)
+        return ReviewRunnerConfig(
+            working_dir=working_dir or resolve_working_dir(),
+            mounts=mounts_payload,
+            shard_labels=labels,
+            batch_size=self.batch_size,
+            sleep_seconds=self.sleep_seconds,
+            thumbnail_format=self.thumbnail_format,
+            thumbnail_quality=max(1, min(self.thumbnail_quality, 100)),
+            thumbnail_max_size=thumbnail_limit,
+            frame_sampler=sampler_config,
+            contact_sheet=contact_config,
+            store=store_config,
+        )
+
+
+def load_visualreview_settings(data: Dict[str, object] | None) -> VisualReviewSettings:
+    """Extract the visual review settings section from the global mapping."""
+
+    section = None
+    if isinstance(data, dict):
+        candidate = data.get("visualreview")
+        if isinstance(candidate, dict):
+            section = candidate
+    return VisualReviewSettings.from_mapping(section)
 
 
 @dataclass(slots=True)
