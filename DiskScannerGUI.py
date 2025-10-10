@@ -15,6 +15,7 @@ import scan_drive
 from structure import load_structure_settings as load_structure_config
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
 from robust import CancellationToken
+from musicnames import parse_music_name, score_parse_result
 
 from db_maint import (
     MaintenanceOptions,
@@ -1803,11 +1804,51 @@ class App:
         self.docpreview_cancel: Optional[CancellationToken] = None
         self.docpreview_rows: Dict[str, dict] = {}
 
+        music_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_music = _SETTINGS.get("musicnames")
+            if isinstance(maybe_music, dict):
+                music_cfg = maybe_music
+        music_enabled_default = bool(music_cfg.get("from_filenames", False))
+        try:
+            music_conf_default = float(music_cfg.get("min_confidence", 0.65))
+        except (TypeError, ValueError):
+            music_conf_default = 0.65
+        music_conf_default = max(0.0, min(1.0, music_conf_default))
+        self.music_conf_default = music_conf_default
+        self.music_from_filenames_var = IntVar(value=1 if music_enabled_default else 0)
+        self.music_conf_value_var = StringVar(value=f"{music_conf_default:.2f}")
+        self.music_conf_display_var = StringVar(value=f"{music_conf_default:.2f}")
+        self.music_status_var = StringVar(value="Music parsing idle.")
+        self.music_progress_total = IntVar(value=0)
+        self.music_progress_done = IntVar(value=0)
+        self.music_worker: Optional[threading.Thread] = None
+        self.music_cancel: Optional[CancellationToken] = None
+        self.music_rows: Dict[str, dict] = {}
+        self.music_conf_filter_var = StringVar(value="all")
+        self.music_ext_filter_var = StringVar(value="all")
+        self.music_conf_filter_options = [
+            ("all", "All confidences"),
+            ("90+", "≥ 0.90"),
+            ("75-90", "0.75 – 0.90"),
+            ("50-75", "0.50 – 0.75"),
+            ("lt50", "< 0.50"),
+        ]
+        self.music_ext_options = [("all", "All extensions")]
+        for ext in sorted(AUDIO_EXTS):
+            label = ext.upper().lstrip(".") or ext.upper()
+            self.music_ext_options.append((ext, label))
+        self._music_review_window: Optional["MusicReviewDialog"] = None
+        self._music_refresh_after: Optional[str] = None
+        self._music_conf_updating = False
+
         # inputs
         self.path_var  = StringVar()
         self.label_var = StringVar()
         self.type_var  = StringVar()
         self.notes_var = StringVar()
+        self._drive_label_refresh_pending = False
+        self.label_var.trace_add("write", self._on_drive_label_changed)
         light_settings = {}
         if isinstance(_SETTINGS, dict):
             maybe_light = _SETTINGS.get("light_analysis")
@@ -2471,6 +2512,10 @@ class App:
         self.docpreview_tab.columnconfigure(0, weight=1)
         self.docpreview_tab.rowconfigure(1, weight=1)
         self.main_notebook.add(self.docpreview_tab, text="Docs")
+        self.music_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.music_tab.columnconfigure(0, weight=1)
+        self.music_tab.rowconfigure(2, weight=1)
+        self.main_notebook.add(self.music_tab, text="Music")
 
         self._build_dashboard_controls(self.dashboard_tab)
         self._build_search_tab(self.search_tab)
@@ -2478,6 +2523,7 @@ class App:
         self._build_reports_tab(self.reports_tab)
         self._build_structure_tab(self.structure_tab)
         self._build_docpreview_tab(self.docpreview_tab)
+        self._build_music_tab(self.music_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3610,6 +3656,621 @@ class App:
             messagebox.showerror("Doc Preview", f"Failed to export results: {exc}")
             return
         messagebox.showinfo("Doc Preview", f"Exported {len(rows)} rows to {destination}")
+
+    def _build_music_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        controls = ttk.LabelFrame(
+            parent,
+            text="Music metadata from filenames",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        controls.grid(row=0, column=0, sticky="ew")
+        for col in range(4):
+            controls.columnconfigure(col, weight=1 if col in (1, 2) else 0)
+
+        ttk.Checkbutton(
+            controls,
+            text="Parse Artist/Title from Filenames (no tags)",
+            variable=self.music_from_filenames_var,
+            command=self._on_music_toggle_changed,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+
+        ttk.Label(controls, text="Min confidence:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        self.music_conf_scale = ttk.Scale(
+            controls,
+            from_=0.0,
+            to=1.0,
+            orient="horizontal",
+            command=self._on_music_conf_scale,
+        )
+        self.music_conf_scale.grid(row=1, column=1, sticky="ew", padx=(12, 12), pady=(12, 0))
+        self.music_conf_spin = Spinbox(
+            controls,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.music_conf_value_var,
+            width=6,
+            justify="center",
+        )
+        self.music_conf_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        self.music_conf_spin.grid(row=1, column=2, sticky="w", pady=(12, 0))
+        self.music_conf_spin.bind("<FocusOut>", self._on_music_conf_spin_commit)
+        self.music_conf_spin.bind("<Return>", self._on_music_conf_spin_commit)
+        ttk.Label(
+            controls,
+            textvariable=self.music_conf_display_var,
+            style="Value.TLabel",
+        ).grid(row=1, column=3, sticky="w", pady=(12, 0))
+
+        actions = ttk.Frame(controls, style="Card.TFrame")
+        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        actions.columnconfigure(2, weight=1)
+        self.music_run_button = ttk.Button(
+            actions,
+            text="Run",
+            command=self.start_music_job,
+            style="Accent.TButton",
+        )
+        self.music_run_button.grid(row=0, column=0, sticky="w")
+        self.music_cancel_button = ttk.Button(
+            actions,
+            text="Cancel",
+            command=self.cancel_music_job,
+        )
+        self.music_cancel_button.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.music_review_button = ttk.Button(
+            actions,
+            text="Review low-confidence…",
+            command=self.open_music_review_dialog,
+        )
+        self.music_review_button.grid(row=0, column=2, sticky="e")
+
+        progress_frame = ttk.Frame(parent, style="Card.TFrame", padding=(16, 12))
+        progress_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        progress_frame.columnconfigure(0, weight=1)
+        self.music_progress_bar = ttk.Progressbar(
+            progress_frame,
+            mode="determinate",
+            maximum=1,
+            value=0,
+        )
+        self.music_progress_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            progress_frame,
+            textvariable=self.music_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.music_log = ScrolledText(progress_frame, height=6, wrap="word")
+        self.music_log.configure(
+            state="disabled",
+            background=self.colors["content"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+        )
+        self.music_log.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        results = ttk.LabelFrame(
+            parent,
+            text="Parsed music metadata",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        results.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(1, weight=1)
+
+        filters = ttk.Frame(results, style="Card.TFrame")
+        filters.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        filters.columnconfigure(3, weight=1)
+        ttk.Label(filters, text="Confidence:").grid(row=0, column=0, sticky="w")
+        self.music_conf_filter_combo = ttk.Combobox(
+            filters,
+            state="readonly",
+            values=[label for _, label in self.music_conf_filter_options],
+        )
+        self.music_conf_filter_combo.grid(row=0, column=1, sticky="w", padx=(8, 16))
+        ttk.Label(filters, text="Extension:").grid(row=0, column=2, sticky="w")
+        self.music_ext_filter_combo = ttk.Combobox(
+            filters,
+            state="readonly",
+            values=[label for _, label in self.music_ext_options],
+        )
+        self.music_ext_filter_combo.grid(row=0, column=3, sticky="w")
+        ttk.Button(filters, text="Refresh", command=self.refresh_music_results).grid(
+            row=0,
+            column=4,
+            sticky="e",
+            padx=(16, 0),
+        )
+
+        columns = ("artist", "title", "album", "track", "confidence", "path")
+        self.music_tree = ttk.Treeview(
+            results,
+            columns=columns,
+            show="headings",
+            style="Card.Treeview",
+        )
+        headings = {
+            "artist": "Artist",
+            "title": "Title",
+            "album": "Album",
+            "track": "Track #",
+            "confidence": "Confidence",
+            "path": "Path",
+        }
+        widths = {
+            "artist": 160,
+            "title": 220,
+            "album": 180,
+            "track": 90,
+            "confidence": 110,
+            "path": 360,
+        }
+        anchors = {
+            "artist": "w",
+            "title": "w",
+            "album": "w",
+            "track": "center",
+            "confidence": "e",
+            "path": "w",
+        }
+        for key in columns:
+            self.music_tree.heading(key, text=headings[key])
+            self.music_tree.column(key, width=widths[key], anchor=anchors[key], stretch=True)
+        self.music_tree.grid(row=1, column=0, sticky=(N, S, E, W))
+        music_scroll = ttk.Scrollbar(results, orient="vertical", command=self.music_tree.yview)
+        music_scroll.grid(row=1, column=1, sticky="ns")
+        self.music_tree.configure(yscrollcommand=music_scroll.set)
+        self.music_tree.tag_configure("music-low", foreground=self.colors.get("warning", "#f97316"))
+        self.music_tree.tag_configure(
+            "music-very-low",
+            foreground=self.colors.get("danger", "#ef4444"),
+        )
+
+        self._set_music_controls_running(False)
+        self._reset_music_progress()
+        self._update_music_confidence(self._get_music_confidence(), persist=False)
+        self._sync_music_filter_controls()
+        self.music_conf_filter_combo.bind("<<ComboboxSelected>>", self._on_music_filters_changed)
+        self.music_ext_filter_combo.bind("<<ComboboxSelected>>", self._on_music_filters_changed)
+        self.refresh_music_results()
+
+    def _sync_music_filter_controls(self) -> None:
+        if hasattr(self, "music_conf_filter_combo"):
+            key = (self.music_conf_filter_var.get() or "all")
+            label = next(
+                (label for value, label in self.music_conf_filter_options if value == key),
+                self.music_conf_filter_options[0][1],
+            )
+            self.music_conf_filter_combo.set(label)
+        if hasattr(self, "music_ext_filter_combo"):
+            key = (self.music_ext_filter_var.get() or "all")
+            label = next(
+                (label for value, label in self.music_ext_options if value == key),
+                self.music_ext_options[0][1],
+            )
+            self.music_ext_filter_combo.set(label)
+
+    def _music_settings_payload(self) -> Dict[str, object]:
+        return {
+            "from_filenames": bool(self.music_from_filenames_var.get()),
+            "min_confidence": round(self._get_music_confidence(), 2),
+        }
+
+    def _save_music_settings(self) -> None:
+        payload = self._music_settings_payload()
+        try:
+            update_settings(WORKING_DIR_PATH, musicnames=payload)
+        except Exception:
+            pass
+        if isinstance(_SETTINGS, dict):
+            _SETTINGS["musicnames"] = dict(payload)
+
+    def _get_music_confidence(self) -> float:
+        try:
+            value = float(self.music_conf_value_var.get())
+        except (TypeError, ValueError):
+            value = self.music_conf_default
+        return max(0.0, min(1.0, value))
+
+    def _update_music_confidence(self, value: float, *, persist: bool) -> None:
+        if self._music_conf_updating:
+            return
+        self._music_conf_updating = True
+        try:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = self.music_conf_default
+            numeric = max(0.0, min(1.0, numeric))
+            formatted = f"{numeric:.2f}"
+            if self.music_conf_value_var.get() != formatted:
+                self.music_conf_value_var.set(formatted)
+            self.music_conf_display_var.set(formatted)
+            if hasattr(self, "music_conf_scale"):
+                try:
+                    current_scale = float(self.music_conf_scale.get())
+                except Exception:
+                    current_scale = numeric
+                if abs(current_scale - numeric) > 1e-6:
+                    self.music_conf_scale.set(numeric)
+        finally:
+            self._music_conf_updating = False
+        if persist:
+            self._save_music_settings()
+
+    def _on_music_toggle_changed(self) -> None:
+        self._save_music_settings()
+        if self.music_worker and self.music_worker.is_alive():
+            return
+        if self.music_from_filenames_var.get():
+            self.music_status_var.set("Music parsing idle.")
+        else:
+            self.music_status_var.set("Music parsing disabled for future scans.")
+
+    def _on_music_conf_scale(self, raw_value: str) -> None:
+        if self._music_conf_updating:
+            return
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            value = self._get_music_confidence()
+        self._update_music_confidence(value, persist=True)
+
+    def _on_music_conf_spin_commit(self, _event=None) -> None:
+        try:
+            value = float(self.music_conf_value_var.get())
+        except (TypeError, ValueError):
+            value = self.music_conf_default
+        self._update_music_confidence(value, persist=True)
+
+    def _set_music_controls_running(self, running: bool) -> None:
+        if hasattr(self, "music_run_button"):
+            self.music_run_button.configure(state="disabled" if running else "normal")
+        if hasattr(self, "music_cancel_button"):
+            self.music_cancel_button.configure(state="normal" if running else "disabled")
+        if hasattr(self, "music_review_button"):
+            self.music_review_button.configure(state="disabled" if running else "normal")
+
+    def _reset_music_progress(self) -> None:
+        self.music_progress_total.set(0)
+        self.music_progress_done.set(0)
+        if hasattr(self, "music_progress_bar"):
+            self.music_progress_bar.configure(maximum=1, value=0)
+        if hasattr(self, "music_log"):
+            self.music_log.configure(state="normal")
+            self.music_log.delete("1.0", "end")
+            self.music_log.configure(state="disabled")
+
+    def _append_music_log(self, line: str) -> None:
+        if not hasattr(self, "music_log"):
+            return
+        self.music_log.configure(state="normal")
+        self.music_log.insert("end", line + "\n")
+        self.music_log.see("end")
+        self.music_log.configure(state="disabled")
+
+    def _schedule_music_refresh(self, delay_ms: int = 200) -> None:
+        if not hasattr(self, "root"):
+            return
+        if self._music_refresh_after:
+            try:
+                self.root.after_cancel(self._music_refresh_after)
+            except Exception:
+                pass
+        self._music_refresh_after = self.root.after(delay_ms, self._music_refresh_execute)
+
+    def _music_refresh_execute(self) -> None:
+        self._music_refresh_after = None
+        self.refresh_music_results()
+
+    def start_music_job(self) -> None:
+        if self.music_worker and self.music_worker.is_alive():
+            messagebox.showwarning("Music parsing", "A music parsing job is already running.")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showerror("Music parsing", "Fill the Disk Label field before running.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror(
+                "Music parsing",
+                f"Shard database not found for '{label}'. Run a scan before parsing music metadata.",
+            )
+            return
+        threshold = self._get_music_confidence()
+        self._save_music_settings()
+        self._set_music_controls_running(True)
+        self._reset_music_progress()
+        self.music_status_var.set("Music parsing running…")
+        log(
+            f"[Music] Starting filename parsing for {label} (threshold={threshold:.2f})"
+        )
+        self._append_music_log(f"Starting music parsing for {label}…")
+        cancel_token = CancellationToken()
+        self.music_cancel = cancel_token
+
+        def progress(payload: Dict[str, object]) -> None:
+            self.worker_queue.put({"type": "music-progress", "payload": payload})
+
+        def worker() -> None:
+            summary: Optional[Dict[str, object]] = None
+            error_message: Optional[str] = None
+            conn: Optional[sqlite3.Connection] = None
+            try:
+                conn = sqlite3.connect(str(shard))
+                summary = scan_drive._process_music_candidates(  # type: ignore[attr-defined]
+                    conn,
+                    drive_label=label,
+                    min_confidence=threshold,
+                    cancel_token=cancel_token,
+                    progress_callback=progress,
+                    start_time=time.monotonic(),
+                )
+            except Exception as exc:
+                error_message = str(exc)
+            finally:
+                if conn is not None:
+                    conn.close()
+                self.worker_queue.put(
+                    {
+                        "type": "music-complete",
+                        "summary": summary or {},
+                        "error": error_message,
+                        "label": label,
+                    }
+                )
+
+        self.music_worker = threading.Thread(target=worker, daemon=True)
+        self.music_worker.start()
+
+    def cancel_music_job(self) -> None:
+        if self.music_cancel:
+            self.music_cancel.set()
+            self.music_status_var.set("Cancelling music parsing…")
+            self._append_music_log("Cancellation requested.")
+
+    def _resolve_music_filters(self) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        choice = (self.music_conf_filter_var.get() or "all").lower()
+        bounds = {
+            "all": (None, None),
+            "90+": (0.9, None),
+            "75-90": (0.75, 0.9),
+            "50-75": (0.5, 0.75),
+            "lt50": (None, 0.5),
+        }
+        min_score, max_score = bounds.get(choice, (None, None))
+        ext_choice = self.music_ext_filter_var.get() or "all"
+        ext_value = None if ext_choice == "all" else ext_choice
+        return min_score, max_score, ext_value
+
+    def _on_music_filters_changed(self, _event=None) -> None:
+        if hasattr(self, "music_conf_filter_combo"):
+            selected = self.music_conf_filter_combo.get()
+            for value, label in self.music_conf_filter_options:
+                if label == selected:
+                    self.music_conf_filter_var.set(value)
+                    break
+        if hasattr(self, "music_ext_filter_combo"):
+            selected_ext = self.music_ext_filter_combo.get()
+            for value, label in self.music_ext_options:
+                if label == selected_ext:
+                    self.music_ext_filter_var.set(value)
+                    break
+        self.refresh_music_results()
+
+    def refresh_music_results(self) -> None:
+        self._music_refresh_after = None
+        if not hasattr(self, "music_tree"):
+            return
+        label = self.label_var.get().strip()
+        self.music_tree.delete(*self.music_tree.get_children())
+        self.music_rows.clear()
+        if not label:
+            self.music_status_var.set("Music parsing idle. Select a drive to view results.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            self.music_status_var.set("Music tables not found for this drive.")
+            return
+        try:
+            conn = sqlite3.connect(str(shard))
+        except sqlite3.Error as exc:
+            self.music_status_var.set(f"Music database error: {exc}")
+            return
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='music_minimal'")
+            if cur.fetchone() is None:
+                self.music_status_var.set("Music parsing has not been run yet for this drive.")
+                return
+            min_score, max_score, ext_filter = self._resolve_music_filters()
+            query_parts = [
+                "SELECT path, ext, artist, title, album, track, score, parsed_utc",
+                "FROM music_minimal",
+                "WHERE drive_label=?",
+            ]
+            params: list[object] = [label]
+            if ext_filter:
+                query_parts.append("AND ext=?")
+                params.append(ext_filter)
+            if min_score is not None:
+                query_parts.append("AND score >= ?")
+                params.append(min_score)
+            if max_score is not None:
+                query_parts.append("AND score < ?")
+                params.append(max_score)
+            query_parts.append("ORDER BY score DESC, path LIMIT 500")
+            sql = " ".join(query_parts)
+            rows = cur.execute(sql, params).fetchall()
+        except sqlite3.DatabaseError as exc:
+            self.music_status_var.set(f"Music query failed: {exc}")
+            return
+        finally:
+            conn.close()
+
+        if not rows:
+            self.music_status_var.set("No music metadata matched the current filters.")
+            return
+
+        for row in rows:
+            score_val = row["score"]
+            if isinstance(score_val, (int, float)):
+                confidence_text = f"{float(score_val):.2f}"
+            else:
+                confidence_text = "—"
+            values = (
+                row["artist"] or "",
+                row["title"] or "",
+                row["album"] or "",
+                row["track"] or "",
+                confidence_text,
+                row["path"] or "",
+            )
+            tags: Tuple[str, ...] = ()
+            if isinstance(score_val, (int, float)):
+                if score_val < 0.4:
+                    tags = ("music-very-low",)
+                elif score_val < 0.6:
+                    tags = ("music-low",)
+            item = self.music_tree.insert("", "end", values=values, tags=tags)
+            self.music_rows[item] = {
+                "path": row["path"],
+                "ext": row["ext"],
+                "artist": row["artist"],
+                "title": row["title"],
+                "album": row["album"],
+                "track": row["track"],
+                "score": score_val,
+                "parsed_utc": row["parsed_utc"],
+            }
+        self.music_status_var.set(f"Music entries: {len(rows)}")
+
+    def _on_drive_label_changed(self, *_args) -> None:
+        if self._drive_label_refresh_pending:
+            return
+        self._drive_label_refresh_pending = True
+        self._schedule_music_refresh(200)
+
+        def _refresh() -> None:
+            self._drive_label_refresh_pending = False
+            if hasattr(self, "docpreview_tree"):
+                self.refresh_docpreview_results()
+            if hasattr(self, "structure_tree"):
+                self.refresh_structure_view()
+
+        try:
+            self.root.after(200, _refresh)
+        except Exception:
+            self._drive_label_refresh_pending = False
+
+    def open_music_review_dialog(self) -> None:
+        if self.music_worker and self.music_worker.is_alive():
+            messagebox.showwarning(
+                "Music review",
+                "Finish or cancel the running music parsing job before reviewing entries.",
+            )
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showerror("Music review", "Fill the Disk Label field before reviewing.")
+            return
+        if self._music_review_window and self._music_review_window.winfo_exists():
+            try:
+                self._music_review_window.lift()
+                self._music_review_window.focus_set()
+            except Exception:
+                pass
+            return
+        self._music_review_window = MusicReviewDialog(self, label)
+
+    def _confirm_music_review_entry(self, drive_label: str, entry: Dict[str, object]) -> bool:
+        shard = shard_path_for(drive_label)
+        if not shard.exists():
+            messagebox.showerror(
+                "Music review",
+                f"Shard database not found for '{drive_label}'.",
+            )
+            return False
+        path = str(entry.get("path") or "").strip()
+        if not path:
+            messagebox.showerror("Music review", "Selected entry is missing a path.")
+            return False
+        parents = scan_drive._split_music_parents(path) if hasattr(scan_drive, "_split_music_parents") else []
+        result = parse_music_name(path, parents=parents)
+        score, score_reasons = score_parse_result(result, parents=parents)
+        score_reasons_json = json.dumps(score_reasons, ensure_ascii=False)
+        parse_reasons_json = json.dumps(result.reasons, ensure_ascii=False)
+        ext_value = entry.get("ext") or Path(path).suffix.lower() or None
+        payload = (
+            path,
+            drive_label,
+            ext_value,
+            result.artist,
+            result.title,
+            result.album,
+            result.track,
+            float(score),
+            score_reasons_json,
+            parse_reasons_json,
+            datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        try:
+            conn = sqlite3.connect(str(shard))
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO music_minimal(
+                        path, drive_label, ext, artist, title, album, track, score,
+                        score_reasons, parse_reasons, parsed_utc
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(path, drive_label) DO UPDATE SET
+                        ext=excluded.ext,
+                        artist=excluded.artist,
+                        title=excluded.title,
+                        album=excluded.album,
+                        track=excluded.track,
+                        score=excluded.score,
+                        score_reasons=excluded.score_reasons,
+                        parse_reasons=excluded.parse_reasons,
+                        parsed_utc=excluded.parsed_utc
+                    """,
+                    payload,
+                )
+                conn.execute(
+                    "DELETE FROM music_review_queue WHERE path=? AND drive_label=?",
+                    (path, drive_label),
+                )
+        except sqlite3.DatabaseError as exc:
+            messagebox.showerror("Music review", f"Failed to confirm metadata: {exc}")
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        log(f"[Music] Confirmed metadata for {path} (score={score:.2f})")
+        self._append_music_log(f"Confirmed metadata for {path} (score={score:.2f})")
+        self.music_status_var.set(
+            f"Confirmed metadata for {Path(path).name} (score {score:.2f})."
+        )
+        self.refresh_music_results()
+        return True
 
     def _build_tables(self):
         parent = getattr(self, "dashboard_tab", self.content)
@@ -6122,6 +6783,62 @@ class App:
             if hasattr(self, "docpreview_progress_bar"):
                 current_max = float(self.docpreview_progress_bar["maximum"] or 1)
                 self.docpreview_progress_bar.configure(value=current_max)
+        elif etype == "music-progress":
+            payload = event.get("payload") or {}
+            total = int(payload.get("music_total") or 0)
+            processed = int(payload.get("music_processed") or 0)
+            stored = int(payload.get("music_stored") or 0)
+            queued = int(payload.get("music_queued") or 0)
+            self.music_progress_total.set(total)
+            self.music_progress_done.set(processed)
+            if hasattr(self, "music_progress_bar"):
+                if total <= 0:
+                    self.music_progress_bar.configure(maximum=1, value=0)
+                else:
+                    self.music_progress_bar.configure(maximum=total, value=processed)
+            status = (
+                f"Music parsing • {processed}/{total} processed "
+                f"(stored={stored}, queued={queued})"
+            )
+            self.music_status_var.set(status)
+        elif etype == "music-log":
+            line = event.get("line")
+            if line:
+                self._append_music_log(str(line))
+        elif etype == "music-complete":
+            self.music_worker = None
+            self.music_cancel = None
+            summary = event.get("summary") or {}
+            error = event.get("error")
+            self._set_music_controls_running(False)
+            if hasattr(self, "music_progress_bar"):
+                current_max = float(self.music_progress_bar["maximum"] or 1)
+                self.music_progress_bar.configure(value=current_max)
+            if error:
+                message = f"Music parsing failed: {error}"
+                self.music_status_var.set(message)
+                self._append_music_log(message)
+                log(f"[Music] {message}")
+                messagebox.showerror("Music parsing", message)
+            else:
+                status = str(summary.get("status") or "").lower()
+                processed = int(summary.get("processed") or 0)
+                stored = int(summary.get("stored") or 0)
+                queued = int(summary.get("queued") or 0)
+                unchanged = int(summary.get("unchanged") or 0)
+                cleared_queue = int(summary.get("removed_queue") or 0)
+                if status == "cancelled":
+                    message = f"Music parsing cancelled after {processed} rows."
+                else:
+                    message = (
+                        "Music parsing complete — "
+                        f"processed={processed} stored={stored} queued={queued} "
+                        f"unchanged={unchanged} cleared_queue={cleared_queue}"
+                    )
+                self.music_status_var.set(message)
+                self._append_music_log(message)
+                log(f"[Music] {message}")
+                self.refresh_music_results()
         elif etype == "done":
             self._await_worker_completion()
             status = event.get("status", "Ready")
@@ -6334,6 +7051,14 @@ class App:
         if self._search_plus_thread and self._search_plus_thread.is_alive():
             if self._search_plus_cancel:
                 self._search_plus_cancel.set()
+        if self._music_review_window and self._music_review_window.winfo_exists():
+            try:
+                self._music_review_window.close()
+            except Exception:
+                pass
+        if self.music_worker and self.music_worker.is_alive():
+            if self.music_cancel:
+                self.music_cancel.set()
         if self.worker and self.worker.is_alive():
             if self.stop_evt:
                 self.stop_evt.set()
@@ -6350,6 +7075,284 @@ class App:
             self._try_finalize_worker()
             if on_complete:
                 on_complete()
+
+
+class MusicReviewDialog(Toplevel):
+    def __init__(self, app: "App", drive_label: str):
+        super().__init__(app.root)
+        self.app = app
+        self.drive_label = drive_label
+        self.title(f"Review music metadata — {drive_label}")
+        self.transient(app.root)
+        self.resizable(True, True)
+        self.configure(bg=app.colors["background"])
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        container = ttk.Frame(self, padding=(16, 16), style="Content.TFrame")
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(2, weight=1)
+
+        heading = ttk.Frame(container, style="Content.TFrame")
+        heading.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            heading,
+            text=f"Drive: {drive_label}",
+            style="HeaderSubtitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.status_var = StringVar(value="Loading review queue…")
+        ttk.Label(heading, textvariable=self.status_var, style="Subtle.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(4, 0)
+        )
+
+        tree_frame = ttk.Frame(container, style="Card.TFrame")
+        tree_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=("score", "ext", "path"),
+            show="headings",
+            style="Card.Treeview",
+            height=8,
+        )
+        self.tree.heading("score", text="Confidence")
+        self.tree.heading("ext", text="Ext")
+        self.tree.heading("path", text="Path")
+        self.tree.column("score", width=110, anchor="e")
+        self.tree.column("ext", width=70, anchor="center")
+        self.tree.column("path", width=420, anchor="w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        details = ttk.LabelFrame(
+            container,
+            text="Details",
+            padding=(12, 12),
+            style="Card.TLabelframe",
+        )
+        details.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        details.columnconfigure(1, weight=1)
+        details.rowconfigure(2, weight=1)
+        details.rowconfigure(3, weight=1)
+        ttk.Label(details, text="Path:").grid(row=0, column=0, sticky="nw")
+        self.detail_path_var = StringVar(value="")
+        ttk.Label(
+            details,
+            textvariable=self.detail_path_var,
+            style="Value.TLabel",
+            wraplength=520,
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Label(details, text="Confidence:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.detail_score_var = StringVar(value="")
+        ttk.Label(details, textvariable=self.detail_score_var, style="Value.TLabel").grid(
+            row=1, column=1, sticky="w", pady=(8, 0)
+        )
+
+        reasons_frame = ttk.LabelFrame(
+            details,
+            text="Reasons",
+            padding=(8, 8),
+            style="Card.TLabelframe",
+        )
+        reasons_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        reasons_frame.columnconfigure(0, weight=1)
+        reasons_frame.rowconfigure(0, weight=1)
+        self.reasons_text = ScrolledText(reasons_frame, height=4, wrap="word")
+        self.reasons_text.configure(
+            state="disabled",
+            background=app.colors["content"],
+            foreground=app.colors["text"],
+            insertbackground=app.colors["text"],
+            relief="flat",
+            borderwidth=0,
+        )
+        self.reasons_text.grid(row=0, column=0, sticky="nsew")
+
+        suggestions_frame = ttk.LabelFrame(
+            details,
+            text="Suggestions",
+            padding=(8, 8),
+            style="Card.TLabelframe",
+        )
+        suggestions_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        suggestions_frame.columnconfigure(0, weight=1)
+        suggestions_frame.rowconfigure(0, weight=1)
+        self.suggestions_text = ScrolledText(suggestions_frame, height=4, wrap="word")
+        self.suggestions_text.configure(
+            state="disabled",
+            background=app.colors["content"],
+            foreground=app.colors["text"],
+            insertbackground=app.colors["text"],
+            relief="flat",
+            borderwidth=0,
+        )
+        self.suggestions_text.grid(row=0, column=0, sticky="nsew")
+
+        buttons = ttk.Frame(container, style="Content.TFrame")
+        buttons.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(1, weight=1)
+        self.confirm_button = ttk.Button(
+            buttons,
+            text="Confirm metadata",
+            command=self._confirm_selected,
+            style="Accent.TButton",
+        )
+        self.confirm_button.grid(row=0, column=0, sticky="w")
+        ttk.Button(buttons, text="Refresh", command=self._load_rows).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(buttons, text="Close", command=self.close).grid(
+            row=0, column=2, sticky="e"
+        )
+
+        self._row_map: Dict[str, Dict[str, object]] = {}
+        self._load_rows()
+        self.focus_set()
+        self.grab_set()
+        self.bind("<Escape>", lambda _evt: self.close())
+
+    def _set_text(self, widget: ScrolledText, items: List[str]) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        if items:
+            for item in items:
+                widget.insert("end", f"• {item}\n")
+        else:
+            widget.insert("end", "None\n")
+        widget.configure(state="disabled")
+
+    def _on_tree_select(self, _event=None) -> None:
+        selection = self.tree.selection()
+        item = selection[0] if selection else None
+        self._update_details(item)
+
+    def _update_details(self, item: Optional[str]) -> None:
+        row = self._row_map.get(item) if item else None
+        if not row:
+            self.detail_path_var.set("")
+            self.detail_score_var.set("")
+            self._set_text(self.reasons_text, [])
+            self._set_text(self.suggestions_text, [])
+            self.confirm_button.configure(state="disabled")
+            return
+        self.detail_path_var.set(str(row.get("path") or ""))
+        score = row.get("score")
+        if isinstance(score, (int, float)):
+            self.detail_score_var.set(f"{float(score):.2f}")
+        else:
+            self.detail_score_var.set("—")
+        reasons = row.get("reasons") or []
+        suggestions = row.get("suggestions") or []
+        self._set_text(self.reasons_text, [str(r) for r in reasons])
+        self._set_text(self.suggestions_text, [str(s) for s in suggestions])
+        self.confirm_button.configure(state="normal")
+
+    def _load_rows(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self._row_map.clear()
+        shard = shard_path_for(self.drive_label)
+        if not shard.exists():
+            self.status_var.set("Shard database not found for this drive.")
+            self.confirm_button.configure(state="disabled")
+            return
+        conn = sqlite3.connect(str(shard))
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='music_review_queue'")
+            if cur.fetchone() is None:
+                self.status_var.set("No review queue present for this drive.")
+                self.confirm_button.configure(state="disabled")
+                return
+            rows = cur.execute(
+                """
+                SELECT path, ext, score, reasons_json, suggestions_json
+                FROM music_review_queue
+                WHERE drive_label=?
+                ORDER BY score ASC, path
+                LIMIT 200
+                """,
+                (self.drive_label,),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            self.status_var.set(f"Query failed: {exc}")
+            self.confirm_button.configure(state="disabled")
+            return
+        finally:
+            conn.close()
+
+        if not rows:
+            self.status_var.set("Review queue is empty.")
+            self.confirm_button.configure(state="disabled")
+            self._update_details(None)
+            return
+
+        for row in rows:
+            path = row["path"] or ""
+            score = row["score"]
+            score_text = f"{float(score):.2f}" if isinstance(score, (int, float)) else "—"
+            try:
+                reasons = json.loads(row["reasons_json"] or "[]")
+            except Exception:
+                reasons = []
+            try:
+                suggestions = json.loads(row["suggestions_json"] or "[]")
+            except Exception:
+                suggestions = []
+            item = self.tree.insert("", "end", values=(score_text, row["ext"] or "", path))
+            self._row_map[item] = {
+                "path": path,
+                "ext": row["ext"],
+                "score": score,
+                "reasons": reasons,
+                "suggestions": suggestions,
+            }
+        count = len(self._row_map)
+        self.status_var.set(f"{count} entries awaiting review.")
+        first = next(iter(self._row_map), None)
+        if first:
+            self.tree.selection_set(first)
+            self.tree.focus(first)
+            self._update_details(first)
+        else:
+            self._update_details(None)
+
+    def _confirm_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        item = selection[0]
+        row = self._row_map.get(item)
+        if not row:
+            return
+        if self.app._confirm_music_review_entry(self.drive_label, row):
+            self.tree.delete(item)
+            self._row_map.pop(item, None)
+            if self._row_map:
+                next_item = next(iter(self._row_map))
+                self.tree.selection_set(next_item)
+                self.tree.focus(next_item)
+                self._update_details(next_item)
+                self.status_var.set(f"{len(self._row_map)} entries remaining.")
+            else:
+                self._update_details(None)
+                self.status_var.set("Review queue is empty.")
+            self.app._schedule_music_refresh(150)
+
+    def close(self) -> None:
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.app._music_review_window = None
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 class GPUProvisioningDialog(Toplevel):
