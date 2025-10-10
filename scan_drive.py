@@ -1457,6 +1457,29 @@ def init_db(db_path: str):
     );
     CREATE INDEX IF NOT EXISTS idx_music_review_drive ON music_review_queue(drive_label);
     CREATE INDEX IF NOT EXISTS idx_music_review_queued ON music_review_queue(queued_utc);
+    CREATE TABLE IF NOT EXISTS video_thumbs(
+        drive_label TEXT NOT NULL,
+        path TEXT NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        format TEXT NOT NULL,
+        image_blob BLOB NOT NULL,
+        updated_utc TEXT NOT NULL,
+        PRIMARY KEY(drive_label, path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_video_thumbs_updated ON video_thumbs(updated_utc);
+    CREATE TABLE IF NOT EXISTS contact_sheets(
+        drive_label TEXT NOT NULL,
+        path TEXT NOT NULL,
+        format TEXT NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        frame_count INTEGER NOT NULL,
+        image_blob BLOB NOT NULL,
+        updated_utc TEXT NOT NULL,
+        PRIMARY KEY(drive_label, path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_sheets_updated ON contact_sheets(updated_utc);
     """)
     conn.commit()
     # Migrations for legacy shards
