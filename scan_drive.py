@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -59,7 +60,7 @@ from core.paths import (
     safe_label,
 )
 from core.ann import ANNIndexManager
-from core.db import connect
+from core.db import connect, transaction
 from core.settings import load_settings
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
@@ -110,6 +111,11 @@ from db_maint import (
 )
 from structure import StructureProfiler, load_structure_settings as load_structure_config
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
+from musicnames import (
+    generate_review_bundle,
+    parse_music_name,
+    score_parse_result,
+)
 
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
@@ -164,6 +170,8 @@ IMAGE_EXTS = {
     '.webp',
     '.heic',
 }
+
+MUSIC_FILENAME_EXTS = {"mp3", "wav", "flac"}
 
 
 @dataclass(slots=True)
@@ -1249,6 +1257,23 @@ def _is_av(path: str) -> bool:
     return Path(path).suffix.lower() in AV_EXTS
 
 
+def _split_music_parents(path: str) -> List[str]:
+    cleaned = path.rstrip("/\\")
+    if not cleaned:
+        return []
+    parts = re.split(r"[\\/]+", cleaned)
+    if not parts:
+        return []
+    # Drop the file segment and empty components.
+    return [segment for segment in parts[:-1] if segment]
+
+
+def _float_close(a: Optional[float], b: Optional[float], *, tolerance: float = 1e-6) -> bool:
+    if a is None or b is None:
+        return a == b
+    return abs(a - b) <= tolerance
+
+
 def _load_existing(
     conn: sqlite3.Connection, drive_label: str, *, casefold: bool
 ) -> Dict[str, dict]:
@@ -1405,6 +1430,33 @@ def init_db(db_path: str):
         value TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_drives_label_unique ON drives(label);
+    CREATE TABLE IF NOT EXISTS music_minimal(
+        path TEXT NOT NULL,
+        drive_label TEXT NOT NULL,
+        ext TEXT,
+        artist TEXT,
+        title TEXT,
+        album TEXT,
+        track TEXT,
+        score REAL NOT NULL,
+        score_reasons TEXT NOT NULL,
+        parse_reasons TEXT NOT NULL,
+        parsed_utc TEXT NOT NULL,
+        PRIMARY KEY(path, drive_label)
+    );
+    CREATE INDEX IF NOT EXISTS idx_music_minimal_drive ON music_minimal(drive_label);
+    CREATE TABLE IF NOT EXISTS music_review_queue(
+        path TEXT NOT NULL,
+        drive_label TEXT NOT NULL,
+        ext TEXT,
+        score REAL NOT NULL,
+        reasons_json TEXT NOT NULL,
+        suggestions_json TEXT NOT NULL,
+        queued_utc TEXT NOT NULL,
+        PRIMARY KEY(path, drive_label)
+    );
+    CREATE INDEX IF NOT EXISTS idx_music_review_drive ON music_review_queue(drive_label);
+    CREATE INDEX IF NOT EXISTS idx_music_review_queued ON music_review_queue(queued_utc);
     """)
     conn.commit()
     # Migrations for legacy shards
@@ -1714,6 +1766,320 @@ def _inventory_scan(
         "inventory_written": writer.total_written,
     }
 
+
+def _process_music_candidates(
+    conn: sqlite3.Connection,
+    *,
+    drive_label: str,
+    min_confidence: float,
+    cancel_token: CancellationToken,
+    progress_callback: Optional[Callable[[dict], None]],
+    start_time: float,
+    batch_size: int = 200,
+) -> Dict[str, object]:
+    phase_start = time.monotonic()
+    min_confidence = max(0.0, min(1.0, float(min_confidence)))
+    summary: Dict[str, object] = {
+        "status": "skipped",
+        "reason": "no_candidates",
+        "candidates": 0,
+        "processed": 0,
+        "stored": 0,
+        "queued": 0,
+        "unchanged": 0,
+        "removed_minimal": 0,
+        "removed_queue": 0,
+        "duration_seconds": 0.0,
+    }
+    if cancel_token.is_set():
+        summary.update({"status": "cancelled", "reason": "cancelled"})
+        return summary
+
+    exts = sorted(MUSIC_FILENAME_EXTS)
+    placeholders = ",".join("?" for _ in exts)
+    params = [drive_label, *exts]
+    cur = conn.cursor()
+    total_row = cur.execute(
+        f"""
+        SELECT COUNT(1)
+        FROM inventory
+        WHERE drive_label=? AND category='audio' AND ext IN ({placeholders})
+        """,
+        params,
+    ).fetchone()
+    total_candidates = int(total_row[0]) if total_row and total_row[0] is not None else 0
+    summary["candidates"] = total_candidates
+    if total_candidates == 0:
+        summary["duration_seconds"] = time.monotonic() - phase_start
+        return summary
+
+    processed = 0
+    stored = 0
+    queued = 0
+    unchanged = 0
+    removed_minimal = 0
+    removed_queue = 0
+
+    to_upsert_minimal: List[tuple] = []
+    to_delete_minimal: List[tuple[str, str]] = []
+    to_upsert_queue: List[tuple] = []
+    to_delete_queue: List[tuple[str, str]] = []
+    delete_minimal_keys: set[tuple[str, str]] = set()
+    delete_queue_keys: set[tuple[str, str]] = set()
+
+    progress_last_emit = 0.0
+
+    def emit_progress(force: bool = False) -> None:
+        nonlocal progress_last_emit
+        now = time.monotonic()
+        if not force and (now - progress_last_emit) < 5.0:
+            return
+        payload = {
+            "type": "progress",
+            "phase": "musicnames",
+            "elapsed_s": int(time.monotonic() - start_time),
+            "music_total": total_candidates,
+            "music_processed": processed,
+            "music_stored": stored,
+            "music_queued": queued,
+        }
+        if progress_callback is not None:
+            try:
+                progress_callback(payload)
+            except Exception:
+                pass
+        progress_last_emit = now
+
+    def flush_pending() -> None:
+        nonlocal to_upsert_minimal, to_delete_minimal, to_upsert_queue, to_delete_queue
+        if not (to_upsert_minimal or to_delete_minimal or to_upsert_queue or to_delete_queue):
+            return
+        with transaction(conn) as tx:
+            if to_delete_minimal:
+                tx.executemany(
+                    "DELETE FROM music_minimal WHERE path=? AND drive_label=?",
+                    to_delete_minimal,
+                )
+            if to_upsert_minimal:
+                tx.executemany(
+                    """
+                    INSERT INTO music_minimal(
+                        path, drive_label, ext, artist, title, album, track, score,
+                        score_reasons, parse_reasons, parsed_utc
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(path, drive_label) DO UPDATE SET
+                        ext=excluded.ext,
+                        artist=excluded.artist,
+                        title=excluded.title,
+                        album=excluded.album,
+                        track=excluded.track,
+                        score=excluded.score,
+                        score_reasons=excluded.score_reasons,
+                        parse_reasons=excluded.parse_reasons,
+                        parsed_utc=excluded.parsed_utc
+                    """,
+                    to_upsert_minimal,
+                )
+            if to_delete_queue:
+                tx.executemany(
+                    "DELETE FROM music_review_queue WHERE path=? AND drive_label=?",
+                    to_delete_queue,
+                )
+            if to_upsert_queue:
+                tx.executemany(
+                    """
+                    INSERT INTO music_review_queue(
+                        path, drive_label, ext, score, reasons_json, suggestions_json, queued_utc
+                    )
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(path, drive_label) DO UPDATE SET
+                        ext=excluded.ext,
+                        score=excluded.score,
+                        reasons_json=excluded.reasons_json,
+                        suggestions_json=excluded.suggestions_json,
+                        queued_utc=excluded.queued_utc
+                    """,
+                    to_upsert_queue,
+                )
+        to_upsert_minimal = []
+        to_delete_minimal = []
+        to_upsert_queue = []
+        to_delete_queue = []
+
+    select_sql = (
+        "SELECT path, drive_label, category, ext FROM inventory "
+        f"WHERE drive_label=? AND category='audio' AND ext IN ({placeholders}) ORDER BY path"
+    )
+    iter_cur = conn.cursor()
+    iter_cur.execute(select_sql, params)
+    emit_progress(force=True)
+
+    while not cancel_token.is_set():
+        batch = iter_cur.fetchmany(batch_size)
+        if not batch:
+            break
+        paths = [row[0] for row in batch if row and row[0]]
+        if not paths:
+            continue
+        path_placeholders = ",".join("?" for _ in paths)
+        existing_params = [drive_label, *paths]
+        minimal_existing: Dict[str, dict] = {}
+        queue_existing: Dict[str, dict] = {}
+        for row in conn.execute(
+            f"""
+            SELECT path, ext, artist, title, album, track, score, score_reasons, parse_reasons
+            FROM music_minimal
+            WHERE drive_label=? AND path IN ({path_placeholders})
+            """,
+            existing_params,
+        ):
+            minimal_existing[row[0]] = {
+                "ext": row[1],
+                "artist": row[2],
+                "title": row[3],
+                "album": row[4],
+                "track": row[5],
+                "score": float(row[6]) if row[6] is not None else None,
+                "score_reasons": row[7],
+                "parse_reasons": row[8],
+            }
+        for row in conn.execute(
+            f"""
+            SELECT path, ext, score, reasons_json, suggestions_json
+            FROM music_review_queue
+            WHERE drive_label=? AND path IN ({path_placeholders})
+            """,
+            existing_params,
+        ):
+            queue_existing[row[0]] = {
+                "ext": row[1],
+                "score": float(row[2]) if row[2] is not None else None,
+                "reasons_json": row[3],
+                "suggestions_json": row[4],
+            }
+
+        for entry in batch:
+            if cancel_token.is_set():
+                break
+            path, row_drive, category, ext = entry
+            if not path or row_drive != drive_label:
+                continue
+            ext_value = (ext or "").lower() or None
+            parents = _split_music_parents(path)
+            result = parse_music_name(path, parents=parents)
+            score, score_reasons = score_parse_result(result, parents=parents)
+            review_bundle = generate_review_bundle(
+                result,
+                score,
+                score_reasons,
+                threshold=min_confidence,
+            )
+            processed += 1
+            score_reasons_json = json.dumps(score_reasons, ensure_ascii=False)
+            parse_reasons_json = json.dumps(result.reasons, ensure_ascii=False)
+            now_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            minimal_existing_row = minimal_existing.get(path)
+            queue_existing_row = queue_existing.get(path)
+
+            if review_bundle.get("needs_review"):
+                reasons_json = json.dumps(review_bundle.get("reasons", []), ensure_ascii=False)
+                suggestions_json = json.dumps(review_bundle.get("suggestions", []), ensure_ascii=False)
+                payload = (
+                    path,
+                    drive_label,
+                    ext_value,
+                    float(score),
+                    reasons_json,
+                    suggestions_json,
+                    now_utc,
+                )
+                if queue_existing_row and (
+                    _float_close(queue_existing_row.get("score"), score)
+                    and queue_existing_row.get("reasons_json") == reasons_json
+                    and queue_existing_row.get("suggestions_json") == suggestions_json
+                    and queue_existing_row.get("ext") == ext_value
+                ):
+                    unchanged += 1
+                else:
+                    to_upsert_queue.append(payload)
+                    queued += 1
+                if minimal_existing_row:
+                    key = (path, drive_label)
+                    if key not in delete_minimal_keys:
+                        to_delete_minimal.append(key)
+                        delete_minimal_keys.add(key)
+                        removed_minimal += 1
+            else:
+                payload = (
+                    path,
+                    drive_label,
+                    ext_value,
+                    result.artist,
+                    result.title,
+                    result.album,
+                    result.track,
+                    float(score),
+                    score_reasons_json,
+                    parse_reasons_json,
+                    now_utc,
+                )
+                if minimal_existing_row and (
+                    minimal_existing_row.get("ext") == ext_value
+                    and minimal_existing_row.get("artist") == result.artist
+                    and minimal_existing_row.get("title") == result.title
+                    and minimal_existing_row.get("album") == result.album
+                    and minimal_existing_row.get("track") == result.track
+                    and _float_close(minimal_existing_row.get("score"), score)
+                    and minimal_existing_row.get("score_reasons") == score_reasons_json
+                    and minimal_existing_row.get("parse_reasons") == parse_reasons_json
+                ):
+                    unchanged += 1
+                else:
+                    to_upsert_minimal.append(payload)
+                    stored += 1
+                if queue_existing_row:
+                    key = (path, drive_label)
+                    if key not in delete_queue_keys:
+                        to_delete_queue.append(key)
+                        delete_queue_keys.add(key)
+                        removed_queue += 1
+
+            if (
+                len(to_upsert_minimal)
+                + len(to_delete_minimal)
+                + len(to_upsert_queue)
+                + len(to_delete_queue)
+            ) >= batch_size:
+                flush_pending()
+            emit_progress()
+
+        if cancel_token.is_set():
+            break
+
+    flush_pending()
+    emit_progress(force=True)
+
+    status = "cancelled" if cancel_token.is_set() else "ok"
+    summary.update(
+        {
+            "status": status,
+            "processed": processed,
+            "stored": stored,
+            "queued": queued,
+            "unchanged": unchanged,
+            "removed_minimal": removed_minimal,
+            "removed_queue": removed_queue,
+            "duration_seconds": time.monotonic() - phase_start,
+        }
+    )
+    if status == "cancelled":
+        summary["reason"] = "cancelled"
+    else:
+        summary.pop("reason", None)
+    return summary
+
+
 def try_smart_overview(executable: Optional[str]) -> Optional[str]:
     # Best-effort: capture smartctl --scan-open and a subset of PhysicalDrive outputs
     if not executable:
@@ -1745,6 +2111,8 @@ def scan_drive(
     robust_overrides: Optional[Dict[str, object]] = None,
     light_analysis: Optional[bool] = None,
     gpu_overrides: Optional[Dict[str, object]] = None,
+    music_from_filenames: Optional[bool] = None,
+    music_min_confidence: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     mount = Path(mount_path)
@@ -1755,6 +2123,25 @@ def scan_drive(
     shard_path = Path(shard_db_path) if shard_db_path else get_shard_db_path(WORKING_DIR_PATH, label)
 
     effective_settings = settings or load_settings(WORKING_DIR_PATH)
+    music_settings_raw: Dict[str, object] = {}
+    if isinstance(effective_settings, dict):
+        maybe_music = effective_settings.get("musicnames")
+        if isinstance(maybe_music, dict):
+            music_settings_raw = maybe_music
+    default_music_enabled = bool(music_settings_raw.get("from_filenames", False))
+    default_music_conf = float(music_settings_raw.get("min_confidence", 0.65))
+    if music_from_filenames is None:
+        music_enabled = default_music_enabled
+    else:
+        music_enabled = bool(music_from_filenames)
+    if music_min_confidence is None:
+        music_confidence = default_music_conf
+    else:
+        try:
+            music_confidence = float(music_min_confidence)
+        except (TypeError, ValueError):
+            music_confidence = default_music_conf
+    music_confidence = max(0.0, min(1.0, music_confidence))
     perf_overrides = perf_overrides or {}
     light_cfg = _resolve_light_analysis(effective_settings, light_analysis)
     fingerprint_cfg = _resolve_fingerprint_settings(effective_settings, fingerprint_overrides)
@@ -1771,6 +2158,11 @@ def scan_drive(
         perf_config.hash_chunk_bytes,
         perf_config.ffmpeg_parallel,
         str(bool(perf_config.gentle_io)).lower(),
+    )
+    LOGGER.info(
+        "Music filename parsing: enabled=%s min_conf=%.2f",
+        "true" if music_enabled else "false",
+        music_confidence,
     )
     try:
         print(
@@ -2440,11 +2832,46 @@ def scan_drive(
     )
     light_summary: Optional[Dict[str, object]] = None
     fingerprint_summary: Optional[Dict[str, object]] = None
+    music_summary: Dict[str, object]
+    if fingerprint_pipeline is not None:
+        fingerprint_pipeline.flush()
+    if inventory_only:
+        music_summary = {"status": "skipped", "reason": "inventory_only"}
+    elif not music_enabled:
+        music_summary = {"status": "skipped", "reason": "disabled"}
+    else:
+        try:
+            music_summary = _process_music_candidates(
+                conn,
+                drive_label=label,
+                min_confidence=music_confidence,
+                cancel_token=cancel_token,
+                progress_callback=progress_callback,
+                start_time=start_time,
+            )
+        except Exception as exc:
+            LOGGER.exception("Music filename parsing failed: %s", exc)
+            music_summary = {"status": "error", "message": str(exc)}
     if light_pipeline is not None:
         light_summary = light_pipeline.finalize()
     if fingerprint_pipeline is not None:
-        fingerprint_pipeline.flush()
         fingerprint_summary = fingerprint_pipeline.finalize()
+    if isinstance(music_summary, dict):
+        status = str(music_summary.get("status") or "").lower()
+        if status == "ok":
+            LOGGER.info(
+                "Music filenames — processed=%s stored=%s queued=%s unchanged=%s cleared=%s",
+                int(music_summary.get("processed") or 0),
+                int(music_summary.get("stored") or 0),
+                int(music_summary.get("queued") or 0),
+                int(music_summary.get("unchanged") or 0),
+                int(music_summary.get("removed_queue") or 0),
+            )
+        elif status == "cancelled":
+            LOGGER.info(
+                "Music filename parsing cancelled after %s rows.",
+                int(music_summary.get("processed") or 0),
+            )
     conn.close()
     return {
         "total_files": metrics["files_seen"],
@@ -2459,6 +2886,7 @@ def scan_drive(
         "skipped_ignored": metrics["skipped_ignored"],
         "light_analysis": light_summary,
         "fingerprints": fingerprint_summary,
+        "music_names": music_summary,
     }
 
 
@@ -2626,6 +3054,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--inventory-only",
         action="store_true",
         help="Enumerate files without hashing and populate the lightweight inventory table.",
+    )
+    parser.add_argument(
+        "--music-from-filenames",
+        dest="music_from_filenames",
+        action="store_true",
+        help="Infer music metadata from filenames and folder names during scans.",
+    )
+    parser.add_argument(
+        "--no-music-from-filenames",
+        dest="music_from_filenames",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(music_from_filenames=None)
+    parser.add_argument(
+        "--music-min-confidence",
+        type=float,
+        help="Override minimum confidence required to accept parsed music metadata (0-1).",
     )
     parser.add_argument(
         "--no-resume",
@@ -3300,6 +3746,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     settings_data = load_settings(WORKING_DIR_PATH)
+    music_settings_raw: Dict[str, object] = {}
+    if isinstance(settings_data, dict):
+        maybe_music = settings_data.get("musicnames")
+        if isinstance(maybe_music, dict):
+            music_settings_raw = maybe_music
+    default_music_enabled = bool(music_settings_raw.get("from_filenames", False))
+    default_music_conf = float(music_settings_raw.get("min_confidence", 0.65))
+    cli_music_flag = getattr(args, "music_from_filenames", None)
+    effective_music_from = (
+        default_music_enabled if cli_music_flag is None else bool(cli_music_flag)
+    )
+    cli_music_conf = getattr(args, "music_min_confidence", None)
+    if cli_music_conf is None:
+        effective_music_conf = default_music_conf
+    else:
+        try:
+            effective_music_conf = float(cli_music_conf)
+        except (TypeError, ValueError):
+            effective_music_conf = default_music_conf
+    effective_music_conf = max(0.0, min(1.0, effective_music_conf))
     semantic_exit = _run_cli_semantic(args, settings_data)
     if semantic_exit is not None:
         return semantic_exit
@@ -3430,6 +3896,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         robust_overrides=robust_cli_overrides,
         light_analysis=getattr(args, "light_analysis", None),
         gpu_overrides=gpu_cli_overrides,
+        music_from_filenames=effective_music_from,
+        music_min_confidence=effective_music_conf,
     )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
@@ -3451,6 +3919,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         light_line = None
         fingerprint_line = None
+        music_line = None
         light_info = result.get("light_analysis") if isinstance(result, dict) else None
         if isinstance(light_info, dict):
             status = str(light_info.get("status") or "").lower()
@@ -3492,6 +3961,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
             elif status == "skipped":
                 fingerprint_line = "Fingerprints skipped — disabled"
+        music_info = result.get("music_names") if isinstance(result, dict) else None
+        if isinstance(music_info, dict):
+            music_status = str(music_info.get("status") or "").lower()
+            if music_status == "ok":
+                processed_music = int(music_info.get("processed") or 0)
+                stored_music = int(music_info.get("stored") or 0)
+                queued_music = int(music_info.get("queued") or 0)
+                music_line = (
+                    "Music filenames — processed: "
+                    f"{processed_music:,}, stored: {stored_music:,}, queued: {queued_music:,}"
+                )
+                cleared_music = int(music_info.get("removed_queue") or 0)
+                if cleared_music:
+                    music_line += f" (cleared {cleared_music:,})"
+            elif music_status == "cancelled":
+                music_line = (
+                    "Music filenames — cancelled after "
+                    f"{int(music_info.get('processed') or 0):,} rows"
+                )
+            elif music_status == "error" and music_info.get("message"):
+                music_line = f"Music filenames — error: {music_info.get('message')}"
 
     export_requests: list[tuple[str, Optional[str]]] = []
     if getattr(args, "export_csv", None) is not None:
@@ -3536,6 +4026,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(light_line)
         if fingerprint_line:
             print(fingerprint_line)
+        if music_line:
+            print(music_line)
     if not getattr(args, "inventory_only", False):
         try:
             maintenance_options = resolve_options(settings_data)
