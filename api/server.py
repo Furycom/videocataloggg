@@ -24,6 +24,8 @@ from .models import (
     HeaviestFoldersReport,
     InventoryResponse,
     LargestFilesReport,
+    MusicResponse,
+    MusicReviewResponse,
     OverviewReport,
     RecentChangesReport,
     SemanticIndexRequest,
@@ -195,6 +197,69 @@ def create_app(config: APIServerConfig) -> FastAPI:
             offset=offset,
         )
         return DocPreviewResponse(
+            results=results,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/music", response_model=MusicResponse)
+    def music_metadata(
+        drive_label: str = Query(..., description="Drive label to query."),
+        q: Optional[str] = Query(
+            None,
+            description="Substring filter across path, artist, title, or album.",
+        ),
+        ext: Optional[str] = Query(
+            None, description="Filter by lowercase file extension (without dot)."
+        ),
+        min_confidence: Optional[float] = Query(
+            None,
+            ge=0.0,
+            le=1.0,
+            description="Minimum confidence (0..1) required to include a row.",
+        ),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        _: str = Depends(auth_dependency),
+    ) -> MusicResponse:
+        ensure_drive(drive_label)
+        try:
+            results, pagination, next_offset, total = data.music_page(
+                drive_label,
+                q=q,
+                ext=ext,
+                min_confidence=min_confidence,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return MusicResponse(
+            drive_label=drive_label,
+            results=results,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/music/review", response_model=MusicReviewResponse)
+    def music_review_queue(
+        drive_label: str = Query(..., description="Drive label to query."),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        _: str = Depends(auth_dependency),
+    ) -> MusicReviewResponse:
+        ensure_drive(drive_label)
+        results, pagination, next_offset, total = data.music_review_page(
+            drive_label,
+            limit=limit,
+            offset=offset,
+        )
+        return MusicReviewResponse(
+            drive_label=drive_label,
             results=results,
             limit=pagination.limit,
             offset=pagination.offset,

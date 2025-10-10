@@ -29,6 +29,25 @@ _MAX_PAGE_SIZE = 500
 _COUNT_GUARD = 10000
 
 
+def _load_json_list(value: Any) -> List[str]:
+    """Safely parse a JSON array into a list of strings."""
+
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    results: List[str] = []
+    for item in parsed:
+        if item is None:
+            continue
+        results.append(str(item))
+    return results
+
+
 @dataclass(slots=True)
 class Pagination:
     """Resolved pagination values after clamping settings and user input."""
@@ -150,6 +169,24 @@ class DataAccess:
         try:
             cursor = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='docs_preview'"
+            )
+            return cursor.fetchone() is not None
+        except sqlite3.DatabaseError:
+            return False
+
+    def _music_tables_present(self, conn: sqlite3.Connection) -> bool:
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='music_minimal'"
+            )
+            return cursor.fetchone() is not None
+        except sqlite3.DatabaseError:
+            return False
+
+    def _music_review_table_present(self, conn: sqlite3.Connection) -> bool:
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='music_review_queue'"
             )
             return cursor.fetchone() is not None
         except sqlite3.DatabaseError:
@@ -338,6 +375,132 @@ class DataAccess:
         if pagination.offset + len(rows) < int(total or 0):
             next_offset = pagination.offset + len(rows)
         return rows, pagination, next_offset, int(total or 0)
+
+    def music_page(
+        self,
+        drive_label: str,
+        *,
+        q: Optional[str] = None,
+        ext: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], Pagination, Optional[int], Optional[int]]:
+        pagination = self.resolve_pagination(limit, offset)
+        clauses: List[str] = ["drive_label = ?"]
+        params: List[Any] = [drive_label]
+        if q:
+            lowered = str(q).lower()
+            pattern = f"%{lowered}%"
+            clauses.append(
+                (
+                    "(LOWER(path) LIKE ? OR BASENAME(path) LIKE ? OR "
+                    "LOWER(COALESCE(artist,'')) LIKE ? OR "
+                    "LOWER(COALESCE(title,'')) LIKE ? OR "
+                    "LOWER(COALESCE(album,'')) LIKE ?)"
+                )
+            )
+            params.extend([pattern, pattern, pattern, pattern, pattern])
+        if ext:
+            clauses.append("LOWER(COALESCE(ext,'')) = ?")
+            params.append(str(ext).lower())
+        if min_confidence is not None:
+            try:
+                conf = float(min_confidence)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("min_confidence must be a number") from exc
+            conf = max(0.0, min(1.0, conf))
+            clauses.append("score >= ?")
+            params.append(conf)
+        where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+        results: List[Dict[str, Any]] = []
+        next_offset: Optional[int] = None
+        total_estimate: Optional[int] = None
+        with self._shard(drive_label) as conn:
+            if not self._music_tables_present(conn):
+                return [], pagination, None, 0
+            limit_plus = pagination.limit + 1
+            cursor = conn.execute(
+                f"""
+                SELECT path, drive_label, ext, artist, title, album, track, score,
+                       score_reasons, parse_reasons, parsed_utc
+                FROM music_minimal
+                {where_sql}
+                ORDER BY score DESC, path COLLATE NOCASE ASC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, limit_plus, pagination.offset),
+            )
+            fetched = cursor.fetchall()
+            if len(fetched) > pagination.limit:
+                fetched = fetched[: pagination.limit]
+                next_offset = pagination.offset + pagination.limit
+            for row in fetched:
+                results.append(
+                    {
+                        "path": row["path"],
+                        "drive_label": row["drive_label"],
+                        "ext": row["ext"],
+                        "artist": row["artist"],
+                        "title": row["title"],
+                        "album": row["album"],
+                        "track_no": row["track"],
+                        "confidence": float(row["score"] or 0.0),
+                        "reasons": _load_json_list(row["score_reasons"]),
+                        "suggestions": _load_json_list(row["parse_reasons"]),
+                        "parsed_utc": row["parsed_utc"],
+                    }
+                )
+            total_estimate = self._estimate_total(conn, "music_minimal", clauses, params)
+        return results, pagination, next_offset, total_estimate
+
+    def music_review_page(
+        self,
+        drive_label: str,
+        *,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], Pagination, Optional[int], Optional[int]]:
+        pagination = self.resolve_pagination(limit, offset)
+        results: List[Dict[str, Any]] = []
+        next_offset: Optional[int] = None
+        total_estimate: Optional[int] = None
+        clauses = ["drive_label = ?"]
+        params: List[Any] = [drive_label]
+        with self._shard(drive_label) as conn:
+            if not self._music_review_table_present(conn):
+                return [], pagination, None, 0
+            limit_plus = pagination.limit + 1
+            cursor = conn.execute(
+                """
+                SELECT path, drive_label, ext, score, reasons_json, suggestions_json, queued_utc
+                FROM music_review_queue
+                WHERE drive_label = ?
+                ORDER BY score ASC, queued_utc ASC, path COLLATE NOCASE ASC
+                LIMIT ? OFFSET ?
+                """,
+                (drive_label, limit_plus, pagination.offset),
+            )
+            fetched = cursor.fetchall()
+            if len(fetched) > pagination.limit:
+                fetched = fetched[: pagination.limit]
+                next_offset = pagination.offset + pagination.limit
+            for row in fetched:
+                results.append(
+                    {
+                        "path": row["path"],
+                        "drive_label": row["drive_label"],
+                        "ext": row["ext"],
+                        "confidence": float(row["score"] or 0.0),
+                        "reasons": _load_json_list(row["reasons_json"]),
+                        "suggestions": _load_json_list(row["suggestions_json"]),
+                        "queued_utc": row["queued_utc"],
+                    }
+                )
+            total_estimate = self._estimate_total(
+                conn, "music_review_queue", clauses, params
+            )
+        return results, pagination, next_offset, total_estimate
 
     def structure_details(
         self, drive_label: str, folder_path: str

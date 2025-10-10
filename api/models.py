@@ -203,6 +203,67 @@ class DocPreviewResponse(PaginatedResponse):
     results: List[DocPreviewRow] = Field(..., description="Preview rows for this page.")
 
 
+class MusicRow(BaseModel):
+    """Single inferred music metadata row."""
+
+    path: str = Field(..., description="Inventory path for the audio file.")
+    drive_label: str = Field(..., description="Drive label owning the shard entry.")
+    ext: Optional[str] = Field(None, description="Lowercase file extension cached during the scan.")
+    artist: Optional[str] = Field(None, description="Best-effort artist parsed from the filename or folders.")
+    title: Optional[str] = Field(None, description="Best-effort track title parsed from the filename or folders.")
+    album: Optional[str] = Field(None, description="Album inferred from surrounding folders when available.")
+    track_no: Optional[str] = Field(None, description="Track number token detected in the filename or folders.")
+    confidence: float = Field(..., description="Confidence score produced by the music parser (0..1).")
+    reasons: List[str] = Field(
+        default_factory=list,
+        description="Reasons contributing to the confidence score, already sorted by relevance.",
+    )
+    suggestions: List[str] = Field(
+        default_factory=list,
+        description="Parser follow-up notes such as alternate splits or missing metadata.",
+    )
+    parsed_utc: Optional[str] = Field(
+        None, description="Timestamp (UTC) when the metadata row was generated."
+    )
+
+
+class MusicResponse(PaginatedResponse):
+    """Paginated response containing inferred music metadata."""
+
+    drive_label: str = Field(..., description="Drive label referenced by the query.")
+    results: List[MusicRow] = Field(
+        ..., description="Music metadata rows ordered by confidence then path."
+    )
+
+
+class MusicReviewEntry(BaseModel):
+    """Row queued for manual music metadata review."""
+
+    path: str = Field(..., description="Inventory path pending manual review.")
+    drive_label: str = Field(..., description="Drive label owning this queued row.")
+    ext: Optional[str] = Field(None, description="Lowercase file extension cached during the scan.")
+    confidence: float = Field(..., description="Current parser confidence score (0..1).")
+    reasons: List[str] = Field(
+        default_factory=list, description="Reasons explaining why the entry needs review."
+    )
+    suggestions: List[str] = Field(
+        default_factory=list,
+        description="Actionable suggestions to resolve the review entry.",
+    )
+    queued_utc: Optional[str] = Field(
+        None, description="Timestamp (UTC) when the entry was enqueued for review."
+    )
+
+
+class MusicReviewResponse(PaginatedResponse):
+    """Paginated response exposing the manual music review queue."""
+
+    drive_label: str = Field(..., description="Drive label referenced by the review query.")
+    results: List[MusicReviewEntry] = Field(
+        ..., description="Queued entries ordered by ascending confidence and enqueue time."
+    )
+
+
 class DrivesResponse(BaseModel):
     """Wrapper around drive list payload."""
 

@@ -38,6 +38,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - All endpoints are GET-only, paginate with `limit`/`offset`, and require an `X-API-Key` header. Missing or empty keys return `401 Unauthorized`. Defaults bind to `127.0.0.1:8756`; expanding beyond localhost or exposing the API externally is at your own risk.
 - `/v1/reports/*` mirrors the GUI summaries (`overview`, `top-extensions`, `largest-files`, `heaviest-folders`, `recent`) and clamps `limit` parameters to the configured API maximum.
 - `/v1/semantic/search` exposes the same ANN/FTS hybrid search used by the CLI. Supply `q`, optional `mode=ann|text|hybrid`, `limit`, `offset`, `drive_label`, and `hybrid=true` to tweak scoring. New maintenance routes—`GET /v1/semantic/index`, `POST /v1/semantic/index` (mode=`build|rebuild`), and `POST /v1/semantic/transcribe`—wrap the underlying pipeline with authentication and respect the `semantic.*_phase` toggles in `settings.json`.
+- `/v1/music` returns inferred music metadata for a shard with optional filters (`q`, `ext`, `min_confidence`). Responses include parsed artist/title/album/track fields plus JSON-decoded reasons and suggestions arrays. `GET /v1/music/review` exposes the manual review queue ordered by lowest confidence first.
 - Example requests:
 
   ```bash
@@ -46,6 +47,8 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
        "http://127.0.0.1:8756/v1/inventory?drive_label=MyDrive&limit=25&q=hdr"
   curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" \
        "http://127.0.0.1:8756/v1/features/vector?drive_label=MyDrive&path=movies/clip.mp4&raw=true"
+  curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" \
+       "http://127.0.0.1:8756/v1/music?drive_label=MyDrive&min_confidence=0.75&limit=25"
   ```
 
 - Configure behaviour under the `"api"` section of `settings.json` (host, port, API key, allowed CORS origins, default page size). Pagination caps at `max_page_size`, and `/v1/features/vector` enforces a dimensionality guard unless `?raw=true` is supplied to download large vectors explicitly.
