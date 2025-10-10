@@ -24,6 +24,7 @@ class VisualReviewStoreConfig:
     max_contact_sheet_bytes: int = 2_000_000
     thumbnail_retention: int = 800
     sheet_retention: int = 400
+    max_db_blob_mb: int = 256
 
 
 class VisualReviewStore:
@@ -83,7 +84,7 @@ class VisualReviewStore:
         with self._conn:
             self._conn.execute(
                 """
-                INSERT INTO review_thumbnails (
+                INSERT INTO video_thumbs (
                     item_type, item_key, width, height, format, image_blob, updated_utc
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_type, item_key) DO UPDATE SET
@@ -103,7 +104,8 @@ class VisualReviewStore:
                     now,
                 ),
             )
-        self._trim_table("review_thumbnails", self._config.thumbnail_retention)
+        self._trim_table_by_count("video_thumbs", self._config.thumbnail_retention)
+        self._trim_table_by_blob_budget("video_thumbs", "image_blob")
         return True
 
     def upsert_contact_sheet(
@@ -132,7 +134,7 @@ class VisualReviewStore:
         with self._conn:
             self._conn.execute(
                 """
-                INSERT INTO review_contact_sheets (
+                INSERT INTO contact_sheets (
                     item_type, item_key, format, width, height, frame_count, image_blob, updated_utc
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_type, item_key) DO UPDATE SET
@@ -154,12 +156,15 @@ class VisualReviewStore:
                     now,
                 ),
             )
-        self._trim_table("review_contact_sheets", self._config.sheet_retention)
+        self._trim_table_by_count("contact_sheets", self._config.sheet_retention)
+        self._trim_table_by_blob_budget("contact_sheets", "image_blob")
         return True
 
     def cleanup(self) -> None:
-        self._trim_table("review_thumbnails", self._config.thumbnail_retention)
-        self._trim_table("review_contact_sheets", self._config.sheet_retention)
+        self._trim_table_by_count("video_thumbs", self._config.thumbnail_retention)
+        self._trim_table_by_count("contact_sheets", self._config.sheet_retention)
+        self._trim_table_by_blob_budget("video_thumbs", "image_blob")
+        self._trim_table_by_blob_budget("contact_sheets", "image_blob")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -168,7 +173,7 @@ class VisualReviewStore:
         with self._conn:
             self._conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS review_thumbnails (
+                CREATE TABLE IF NOT EXISTS video_thumbs (
                     item_type TEXT NOT NULL,
                     item_key TEXT NOT NULL,
                     width INTEGER NOT NULL,
@@ -182,13 +187,13 @@ class VisualReviewStore:
             )
             self._conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_review_thumbnails_updated
-                ON review_thumbnails(updated_utc)
+                CREATE INDEX IF NOT EXISTS idx_video_thumbs_updated
+                ON video_thumbs(updated_utc)
                 """
             )
             self._conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS review_contact_sheets (
+                CREATE TABLE IF NOT EXISTS contact_sheets (
                     item_type TEXT NOT NULL,
                     item_key TEXT NOT NULL,
                     format TEXT NOT NULL,
@@ -203,12 +208,14 @@ class VisualReviewStore:
             )
             self._conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_review_contact_sheets_updated
-                ON review_contact_sheets(updated_utc)
+                CREATE INDEX IF NOT EXISTS idx_contact_sheets_updated
+                ON contact_sheets(updated_utc)
                 """
             )
 
-    def _trim_table(self, table: str, retain: int) -> None:
+    def _trim_table_by_count(self, table: str, retain: int) -> None:
+        if table not in {"video_thumbs", "contact_sheets"}:
+            return
         if retain <= 0:
             return
         try:
@@ -233,6 +240,59 @@ class VisualReviewStore:
                 """,
                 (overflow,),
             )
+
+    def _trim_table_by_blob_budget(self, table: str, blob_column: str) -> None:
+        if table not in {"video_thumbs", "contact_sheets"}:
+            return
+        limit_mb = max(0, int(getattr(self._config, "max_db_blob_mb", 0)))
+        if limit_mb <= 0:
+            return
+        try:
+            cursor = self._conn.execute(
+                f"SELECT COALESCE(SUM(LENGTH({blob_column})), 0) FROM {table}"
+            )
+        except sqlite3.DatabaseError:
+            return
+        row = cursor.fetchone()
+        total_bytes = int(row[0]) if row else 0
+        limit_bytes = limit_mb * 1024 * 1024
+        overflow = total_bytes - limit_bytes
+        if overflow <= 0:
+            return
+        LOGGER.debug(
+            "Blob budget exceeded for %s (total=%s, limit=%s) — trimming",
+            table,
+            total_bytes,
+            limit_bytes,
+        )
+        with self._conn:
+            remaining = overflow
+            while remaining > 0:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT rowid, COALESCE(LENGTH({blob_column}), 0) AS blob_size
+                    FROM {table}
+                    ORDER BY updated_utc ASC, rowid ASC
+                    LIMIT 50
+                    """
+                ).fetchall()
+                if not rows:
+                    break
+                rowids: list[int] = []
+                reclaimed = 0
+                for rowid, blob_size in rows:
+                    rowids.append(int(rowid))
+                    reclaimed += int(blob_size or 0)
+                    if reclaimed >= remaining:
+                        break
+                if not rowids:
+                    break
+                placeholders = ",".join("?" for _ in rowids)
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE rowid IN ({placeholders})",
+                    rowids,
+                )
+                remaining = max(0, remaining - reclaimed)
 
     def _encode_image(self, image: Image.Image, *, format: str, quality: int) -> Optional[bytes]:
         fmt = (format or "JPEG").upper()

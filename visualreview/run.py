@@ -37,6 +37,7 @@ class VisualReviewSettings:
     max_contact_sheet_bytes: int = 2_000_000
     thumbnail_retention: int = 800
     sheet_retention: int = 400
+    max_db_blob_mb: int = 256
     batch_size: int = 3
     sleep_seconds: float = 1.0
     ffmpeg_path: Optional[Path] = None
@@ -177,6 +178,7 @@ class VisualReviewSettings:
             ),
             thumbnail_retention=_get_int("thumbnail_retention", 800, minimum=0),
             sheet_retention=_get_int("sheet_retention", 400, minimum=0),
+            max_db_blob_mb=_get_int("max_db_blob_mb", 256, minimum=0),
             batch_size=_get_int("batch_size", 3, minimum=1),
             sleep_seconds=_get_float("sleep_seconds", 1.0, minimum=0.0),
             ffmpeg_path=ffmpeg_path,
@@ -240,6 +242,7 @@ class VisualReviewSettings:
             max_contact_sheet_bytes=self.max_contact_sheet_bytes,
             thumbnail_retention=self.thumbnail_retention,
             sheet_retention=self.sheet_retention,
+            max_db_blob_mb=self.max_db_blob_mb,
         )
         mounts_payload = dict(mounts or {})
         if shard_labels is not None:

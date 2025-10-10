@@ -12,6 +12,7 @@ def test_visualreview_settings_defaults_to_runner_config() -> None:
     assert tuple(config.thumbnail_max_size) == (settings.max_thumb_px, settings.max_thumb_px)
     assert config.contact_sheet.columns == settings.sheet_columns
     assert config.store.thumbnail_retention == settings.thumbnail_retention
+    assert config.store.max_db_blob_mb == settings.max_db_blob_mb
 
 
 def test_load_visualreview_settings_overrides() -> None:
@@ -32,6 +33,7 @@ def test_load_visualreview_settings_overrides() -> None:
             "max_contact_sheet_bytes": 54321,
             "thumbnail_retention": 42,
             "sheet_retention": 24,
+            "max_db_blob_mb": 5,
             "prefer_pyav": True,
             "allow_hwaccel": False,
             "hwaccel_policy": "CPU_ONLY",
@@ -53,6 +55,7 @@ def test_load_visualreview_settings_overrides() -> None:
     assert config.frame_sampler.hwaccel_policy == "CPU_ONLY"
     assert tuple(config.thumbnail_max_size) == (320, 320)
     assert config.store.max_thumbnail_bytes == 12345
+    assert config.store.max_db_blob_mb == 5
     assert config.contact_sheet.columns == 5
     assert config.contact_sheet.max_rows == 2
     assert list(config.shard_labels or []) == ["alpha", "beta"]
