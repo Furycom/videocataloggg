@@ -10,6 +10,8 @@ from .run import (
     ReviewProgress,
     ReviewRunner,
     ReviewRunnerConfig,
+    VisualReviewSettings,
+    load_visualreview_settings,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "ReviewProgress",
     "ReviewRunner",
     "ReviewRunnerConfig",
+    "VisualReviewSettings",
+    "load_visualreview_settings",
 ]
