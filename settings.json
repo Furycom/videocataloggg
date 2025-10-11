@@ -85,6 +85,23 @@
       "refresh_on_start": false
     }
   },
+  "assistant_dashboard": {
+    "enable": true,
+    "flush_every_s": 10,
+    "latency_buckets_ms": [
+      50,
+      100,
+      200,
+      300,
+      500,
+      1000,
+      2000,
+      5000
+    ],
+    "warmup": {
+      "tmdb_limit": 100
+    }
+  },
   "structure": {
     "enable": true,
     "weights": {

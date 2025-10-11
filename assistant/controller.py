@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, List, TypedDict
+import time
+from typing import Dict, List, Optional, TypedDict, TYPE_CHECKING
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
@@ -13,6 +14,10 @@ from .tools import AssistantTooling, ToolBudgetExceeded
 LOGGER = logging.getLogger("videocatalog.assistant.controller")
 
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from assistant_monitor import AssistantDashboard
+
+
 class AssistantState(TypedDict):
     messages: List[object]
     remaining_budget: int
@@ -20,10 +25,18 @@ class AssistantState(TypedDict):
 
 
 class AssistantController:
-    def __init__(self, client: LLMClient, tooling: AssistantTooling, *, system_prompt: str) -> None:
+    def __init__(
+        self,
+        client: LLMClient,
+        tooling: AssistantTooling,
+        *,
+        system_prompt: str,
+        dashboard: Optional["AssistantDashboard"] = None,
+    ) -> None:
         self.client = client
         self.tooling = tooling
         self.system_prompt = system_prompt
+        self.dashboard = dashboard
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -51,7 +64,33 @@ class AssistantController:
     def _call_model(self, state: AssistantState) -> AssistantState:
         messages = state["messages"]
         tool_defs = self._tool_schema() if self.tooling.settings.tools_enabled else []
-        response = self.client.chat(messages, tool_defs)
+        start = time.perf_counter()
+        try:
+            response = self.client.chat(messages, tool_defs)
+        except Exception:
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            if self.dashboard:
+                try:
+                    self.dashboard.record_llm_latency(
+                        duration_ms,
+                        runtime=self.client.runtime.name,
+                        model=self.client.model,
+                        ok=False,
+                    )
+                except Exception:
+                    LOGGER.debug("Failed to record LLM metrics on failure")
+            raise
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        if self.dashboard:
+            try:
+                self.dashboard.record_llm_latency(
+                    duration_ms,
+                    runtime=self.client.runtime.name,
+                    model=self.client.model,
+                    ok=True,
+                )
+            except Exception:
+                LOGGER.debug("Failed to record LLM metrics")
         messages = messages + [response]
         tool_calls = response.additional_kwargs.get("tool_calls") or []
         LOGGER.debug("Assistant model returned %d tool calls", len(tool_calls))
@@ -88,6 +127,12 @@ class AssistantController:
                 content = json.dumps({"error": str(exc)})
                 messages = messages + [ToolMessage(content=content, tool_call_id=call.get("id", name), name=name)]
                 remaining_budget = 0
+                if self.dashboard:
+                    try:
+                        self.dashboard.record_tool_call(name or "budget", 0.0, success=False)
+                        self.dashboard.update_tool_budget(self.tooling.budget, self.tooling.calls, remaining_budget)
+                    except Exception:
+                        LOGGER.debug("Failed to record tool metrics for budget exhaustion")
                 break
             except Exception as exc:
                 LOGGER.exception("Tool %s failed", name)
