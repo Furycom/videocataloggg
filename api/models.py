@@ -24,6 +24,29 @@ class DriveInfo(BaseModel):
         None, description="Timestamp (UTC) of the last completed scan for this drive."
     )
     shard_path: str = Field(..., description="Absolute path to the shard SQLite database file.")
+    volume_guid: Optional[str] = Field(
+        None,
+        description="Volume GUID path (\\\\?\\Volume{GUID}\\) bound to the drive when known.",
+    )
+    volume_serial_hex: Optional[str] = Field(
+        None,
+        description="Volume serial number in hexadecimal when reported by Windows.",
+    )
+    filesystem: Optional[str] = Field(
+        None, description="Filesystem reported for the volume during the last scan."
+    )
+    marker_seen: bool = Field(
+        False,
+        description="True when a root Disk Marker was observed during the last scan.",
+    )
+    marker_last_scan_utc: Optional[str] = Field(
+        None,
+        description="Timestamp captured from the Disk Marker for the last completed scan.",
+    )
+    last_scan_usn: Optional[int] = Field(
+        None,
+        description="NTFS USN Change Journal checkpoint persisted after the last scan.",
+    )
 
 
 class PaginatedResponse(BaseModel):

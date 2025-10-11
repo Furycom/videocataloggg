@@ -6,6 +6,17 @@
     "max_video_frames": 2,
     "prefer_ffmpeg": true
   },
+  "disk_marker": {
+    "enable": false,
+    "filename": ".videocatalog.id",
+    "write_hidden": true,
+    "write_readonly": true,
+    "use_hmac": true
+  },
+  "delta_scan": {
+    "use_ntfs_usn": true,
+    "fallback_sampling": true
+  },
   "gpu": {
     "policy": "AUTO",
     "allow_hwaccel_video": true,
