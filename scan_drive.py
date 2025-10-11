@@ -116,6 +116,8 @@ from structure import (
 )
 from textverify import TextVerifySettings, run_for_shard as run_textverify_for_shard
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
+from quality import QualitySettings, run_for_shard as run_quality_for_shard
+from quality.ffprobe import ffprobe_available as quality_ffprobe_available
 from visualreview import load_visualreview_settings
 from diskmark.marker import MarkerRuntime, MarkerWriteResult, load_marker, prepare_runtime, write_marker
 from diskmark.winvol import get_volume_info, query_usn_journal
@@ -3277,6 +3279,34 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Process at most this many candidate documents.",
     )
     parser.add_argument(
+        "--quality",
+        action="store_true",
+        help="Run the video quality report for videos in the shard.",
+    )
+    parser.add_argument(
+        "--quality-expect-subs",
+        dest="quality_expect_subs",
+        action="store_true",
+        help="Expect local subtitles when scoring videos during this run.",
+    )
+    parser.add_argument(
+        "--no-quality-expect-subs",
+        dest="quality_expect_subs",
+        action="store_false",
+        help="Do not expect subtitles when scoring videos during this run.",
+    )
+    parser.set_defaults(quality_expect_subs=None)
+    parser.add_argument(
+        "--quality-timeout",
+        type=int,
+        help="Override ffprobe timeout in seconds for the quality report.",
+    )
+    parser.add_argument(
+        "--quality-limit",
+        type=int,
+        help="Process at most this many videos when running the quality report.",
+    )
+    parser.add_argument(
         "--visual-review",
         action="store_true",
         help="Generate thumbnails and contact sheets for the visual review queue.",
@@ -4238,6 +4268,89 @@ def _run_textverify_cli(
     return 0
 
 
+def _run_quality_cli(
+    args: argparse.Namespace,
+    settings_data: Dict[str, object],
+    shard_db_path: Path,
+) -> int:
+    if not args.label:
+        LOGGER.error("Quality report requires --label to resolve shard database.")
+        print("[ERROR] --label is required for quality runs.", file=sys.stderr)
+        return 2
+    base_settings = settings_data.get("quality") if isinstance(settings_data.get("quality"), dict) else {}
+    quality_settings = QualitySettings.from_mapping(base_settings)
+    enabled = bool(quality_settings.enable or getattr(args, "quality", False))
+    if getattr(args, "quality", False):
+        enabled = True
+        quality_settings.enable = True
+    if not enabled:
+        LOGGER.info("Quality report disabled via settings.json (quality.enable=false)")
+        print("Quality report disabled in settings; nothing to do.")
+        return 0
+    if getattr(args, "quality_timeout", None) is not None:
+        try:
+            timeout_val = float(args.quality_timeout)
+        except (TypeError, ValueError):
+            LOGGER.error("Invalid value for --quality-timeout: %s", args.quality_timeout)
+            print("[ERROR] --quality-timeout must be numeric.", file=sys.stderr)
+            return 2
+        quality_settings.timeout_s = max(1.0, timeout_val)
+    if getattr(args, "quality_expect_subs", None) is not None:
+        quality_settings.thresholds.expect_subs = bool(args.quality_expect_subs)
+    limit: Optional[int] = None
+    if getattr(args, "quality_limit", None) is not None:
+        try:
+            limit_val = int(args.quality_limit)
+            if limit_val > 0:
+                limit = limit_val
+        except (TypeError, ValueError):
+            LOGGER.error("Invalid value for --quality-limit: %s", args.quality_limit)
+            print("[ERROR] --quality-limit must be an integer.", file=sys.stderr)
+            return 2
+    if not quality_ffprobe_available():
+        LOGGER.error("ffprobe not available; quality report cannot run.")
+        print("[ERROR] ffprobe not found on PATH; install FFmpeg to enable quality reports.", file=sys.stderr)
+        return 3
+    base_sleep = max(0.0, quality_settings.gentle_sleep_ms / 1000.0)
+    mount_hint = args.mount_path or str(Path(shard_db_path).parent)
+    gentle_sleep = base_sleep
+    try:
+        perf_config = resolve_performance_config(mount_hint, settings=settings_data)
+        if getattr(perf_config, "gentle_io", False):
+            gentle_sleep = max(gentle_sleep, 0.05)
+    except Exception:
+        gentle_sleep = base_sleep
+
+    def progress_callback(payload: Dict[str, object]) -> None:
+        try:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+    LOGGER.info("Running video quality pipeline for %s", shard_db_path)
+    summary = run_quality_for_shard(
+        shard_db_path,
+        settings=quality_settings,
+        progress_callback=progress_callback,
+        gentle_sleep=gentle_sleep,
+        mount_path=Path(mount_hint) if mount_hint else None,
+        long_path_mode=args.long_paths or "auto",
+        limit=limit,
+    )
+    if summary.ffprobe_missing:
+        print("Quality report skipped — ffprobe not found on PATH.")
+        return 3
+    print(
+        "Quality report complete — processed={processed} updated={updated} errors={errors} elapsed={elapsed:.1f}s".format(
+            processed=summary.processed,
+            updated=summary.updated,
+            errors=summary.errors,
+            elapsed=summary.elapsed_s,
+        )
+    )
+    return 0
+
+
 def _run_docpreview_cli(
     args: argparse.Namespace,
     settings_data: Dict[str, object],
@@ -4425,6 +4538,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     if getattr(args, "textverify", False) or getattr(args, "textverify_all", False):
         return _run_textverify_cli(args, settings_data, Path(shard_db_path))
+    if getattr(args, "quality", False):
+        return _run_quality_cli(args, settings_data, Path(shard_db_path))
     if getattr(args, "docpreview", False):
         return _run_docpreview_cli(args, settings_data, Path(shard_db_path))
     if structure_requested:
