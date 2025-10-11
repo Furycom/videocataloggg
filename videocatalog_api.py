@@ -12,6 +12,7 @@ import uvicorn
 from api import __version__ as API_VERSION
 from api.db import DataAccess
 from api.server import APIServerConfig, create_app
+from catalog.exporter import export_catalog
 from core.paths import resolve_working_dir
 from core.settings import load_settings
 
@@ -31,6 +32,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         dest="cors",
         default=None,
         help="Additional allowed CORS origin (repeatable).",
+    )
+    parser.add_argument(
+        "--export-catalog",
+        action="store_true",
+        help="Export catalog data instead of starting the API server.",
+    )
+    parser.add_argument(
+        "--export-format",
+        default="jsonl",
+        choices=["jsonl", "csv", "nfozip"],
+        help="Export format when --export-catalog is used.",
+    )
+    parser.add_argument(
+        "--export-scope",
+        default="all",
+        choices=["movies", "tv", "all"],
+        help="Catalog scope to export when --export-catalog is used.",
     )
     return parser.parse_args(argv)
 
@@ -62,6 +80,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     args = parse_args(argv)
     host, port, api_key, cors, data_access = resolve_api_settings(args)
+
+    if args.export_catalog:
+        logging.info(
+            "Exporting catalog in %s format (scope=%s)...",
+            args.export_format,
+            args.export_scope,
+        )
+        paths = export_catalog(
+            data_access,
+            format=str(args.export_format),
+            scope=str(args.export_scope),
+        )
+        for path in paths:
+            logging.info("Wrote %s", path)
+        if not paths:
+            logging.warning("No catalog entries were exported (library may be empty).")
+        return 0
 
     if not api_key:
         logging.warning("API key is not configured; all requests will be rejected with 401.")

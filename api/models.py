@@ -2,7 +2,7 @@
 """Pydantic schemas for the VideoCatalog local API."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -198,6 +198,205 @@ class FeaturesResponse(PaginatedResponse):
     results: List[FeatureMetadata] = Field(..., description="Feature metadata rows for this page.")
 
 
+class CatalogMovieRow(BaseModel):
+    id: str = Field(..., description="Opaque identifier for the movie folder.")
+    path: str = Field(..., description="Folder path relative to the drive.")
+    title: Optional[str] = Field(None, description="Resolved title when available.")
+    year: Optional[int] = Field(None, description="Release year when detected.")
+    poster_thumb: Optional[str] = Field(
+        None, description="Media token used to fetch the cached thumbnail via /thumb."
+    )
+    contact_sheet: Optional[str] = Field(
+        None, description="Media token for a contact sheet when available."
+    )
+    confidence: float = Field(..., description="Confidence score assigned by the structure pipeline.")
+    quality: Optional[int] = Field(None, description="Quality score when evaluated by the quality pipeline.")
+    langs_audio: List[str] = Field(default_factory=list, description="Audio languages detected in the main video.")
+    langs_subs: List[str] = Field(default_factory=list, description="Subtitle languages detected in the main video.")
+    drive: Optional[str] = Field(None, description="Drive label owning this movie folder.")
+
+
+class CatalogMoviesResponse(PaginatedResponse):
+    results: List[CatalogMovieRow] = Field(..., description="Movie rows for the requested page.")
+
+
+class CatalogSeriesRow(BaseModel):
+    id: str = Field(..., description="Series identifier used across the catalog endpoints.")
+    series_root: str = Field(..., description="Series root folder path relative to the drive.")
+    title: Optional[str] = Field(None, description="Series title when resolved.")
+    year: Optional[int] = Field(None, description="First air year when available.")
+    confidence: float = Field(..., description="Series level confidence score.")
+    seasons_found: int = Field(..., description="Number of seasons detected for this series.")
+    poster_thumb: Optional[str] = Field(
+        None, description="Media token that can be passed to /thumb for a cached series thumbnail."
+    )
+    drive: Optional[str] = Field(None, description="Drive label owning the series root folder.")
+
+
+class CatalogSeriesResponse(PaginatedResponse):
+    results: List[CatalogSeriesRow] = Field(..., description="TV series rows for the requested page.")
+
+
+class CatalogSeasonRow(BaseModel):
+    id: str = Field(..., description="Season identifier for navigation.")
+    season_path: str = Field(..., description="Season folder path relative to the drive.")
+    season_number: Optional[int] = Field(None, description="Season number (1-based) when parsed.")
+    episodes_found: Optional[int] = Field(None, description="Number of episode files detected in the season folder.")
+    expected: Optional[int] = Field(None, description="Expected episode count when matched from metadata.")
+    confidence: float = Field(..., description="Season level confidence score.")
+    drive: Optional[str] = Field(None, description="Drive label owning the season folder.")
+
+
+class CatalogSeasonsResponse(BaseModel):
+    series: Dict[str, Any] = Field(default_factory=dict, description="Series metadata context.")
+    seasons: List[CatalogSeasonRow] = Field(
+        default_factory=list, description="Season rows associated with the requested series."
+    )
+
+
+class CatalogEpisodeRow(BaseModel):
+    id: str = Field(..., description="Episode identifier for the catalog endpoints.")
+    episode_path: str = Field(..., description="Episode file path relative to the drive.")
+    season_number: Optional[int] = Field(None, description="Season number for the episode.")
+    episode_numbers: List[str] = Field(
+        default_factory=list,
+        description="Episode numbers parsed from filenames or metadata (SxxExx).",
+    )
+    air_date: Optional[str] = Field(None, description="Air date captured for the episode when available.")
+    title: Optional[str] = Field(None, description="Episode title when resolved.")
+    confidence: float = Field(..., description="Episode confidence score from the TV pipeline.")
+    quality: Optional[int] = Field(None, description="Quality score when evaluated.")
+    poster_thumb: Optional[str] = Field(
+        None, description="Media token for a cached episode thumbnail."
+    )
+    drive: Optional[str] = Field(None, description="Drive label owning the episode file.")
+
+
+class CatalogEpisodesResponse(BaseModel):
+    season: Dict[str, Any] = Field(default_factory=dict, description="Season metadata context.")
+    episodes: List[CatalogEpisodeRow] = Field(
+        default_factory=list, description="Episode rows for the requested series/season."
+    )
+
+
+class CatalogItemCandidate(BaseModel):
+    source: Optional[str] = Field(None, description="Metadata provider or signal that produced the candidate.")
+    candidate_id: Optional[str] = Field(None, description="External identifier when present.")
+    title: Optional[str] = Field(None, description="Candidate title.")
+    year: Optional[int] = Field(None, description="Candidate year.")
+    score: float = Field(..., description="Score assigned to the candidate by the pipeline.")
+    extra: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the candidate.")
+
+
+class CatalogConfidenceComponent(BaseModel):
+    label: str = Field(..., description="Human readable component name.")
+    score: float = Field(..., description="Contribution score for the component (0..1).")
+
+
+class CatalogResolution(BaseModel):
+    width: Optional[int] = Field(None, description="Video width in pixels when measured.")
+    height: Optional[int] = Field(None, description="Video height in pixels when measured.")
+
+
+class CatalogMovieDetail(BaseModel):
+    id: str
+    title: Optional[str]
+    year: Optional[int]
+    drive: Optional[str]
+    folder_path: str
+    main_video_path: Optional[str]
+    runtime_minutes: Optional[int]
+    overview: Optional[str]
+    confidence: float
+    confidence_components: List[CatalogConfidenceComponent] = Field(default_factory=list)
+    quality_score: Optional[int]
+    quality_reasons: List[str] = Field(default_factory=list)
+    audio_langs: List[str] = Field(default_factory=list)
+    subs_langs: List[str] = Field(default_factory=list)
+    subs_present: bool = False
+    video_codec: Optional[str]
+    resolution: CatalogResolution
+    container: Optional[str] = None
+    ids: Dict[str, Any] = Field(default_factory=dict)
+    issues: List[str] = Field(default_factory=list)
+    candidates: List[CatalogItemCandidate] = Field(default_factory=list)
+    review_reasons: List[str] = Field(default_factory=list)
+    review_questions: List[str] = Field(default_factory=list)
+    assets: Dict[str, Any] = Field(default_factory=dict)
+    signals: Dict[str, Any] = Field(default_factory=dict)
+    poster_thumb: Optional[str] = None
+    contact_sheet: Optional[str] = None
+    open_plan: Dict[str, Any]
+
+
+class CatalogEpisodeDetail(BaseModel):
+    id: str
+    title: Optional[str]
+    drive: Optional[str]
+    episode_path: str
+    series_root: Optional[str]
+    season_number: Optional[int]
+    episode_numbers: List[str] = Field(default_factory=list)
+    air_date: Optional[str]
+    ids: Dict[str, Any] = Field(default_factory=dict)
+    confidence: float
+    audio_langs: List[str] = Field(default_factory=list)
+    subs_langs: List[str] = Field(default_factory=list)
+    subs_present: bool = False
+    quality_score: Optional[int]
+    quality_reasons: List[str] = Field(default_factory=list)
+    runtime_minutes: Optional[int]
+    video_codec: Optional[str]
+    resolution: CatalogResolution
+    series: Dict[str, Any] = Field(default_factory=dict)
+    season: Dict[str, Any] = Field(default_factory=dict)
+    poster_thumb: Optional[str] = None
+    open_plan: Dict[str, Any]
+
+
+class CatalogItemDetailResponse(BaseModel):
+    kind: str = Field(..., description="Item kind: movie, episode, or series.")
+    movie: Optional[CatalogMovieDetail] = None
+    episode: Optional[CatalogEpisodeDetail] = None
+    series: Optional[Dict[str, Any]] = None
+
+
+class CatalogSummaryQueue(BaseModel):
+    movies: List[Dict[str, Any]] = Field(default_factory=list)
+    episodes: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class CatalogSummaryResponse(BaseModel):
+    totals: Dict[str, int] = Field(..., description="Aggregate counts for movies, series, and episodes.")
+    review_queue: CatalogSummaryQueue = Field(
+        ..., description="Low confidence buckets for quick review continuation."
+    )
+
+
+class CatalogOpenFolderRequest(BaseModel):
+    path: str = Field(..., description="Path that should be opened by the caller.")
+
+
+class CatalogOpenFolderResponse(BaseModel):
+    plan: str = Field(..., description="Plan identifier the client should execute.")
+    path: str = Field(..., description="Path that should be opened.")
+
+
+class CatalogSearchHit(BaseModel):
+    id: str = Field(..., description="Identifier returned by catalog listings.")
+    kind: str = Field(..., description="Item kind associated with the hit.")
+    title: Optional[str] = Field(None, description="Display title for the hit.")
+    drive: Optional[str] = Field(None, description="Drive label owning the hit.")
+    confidence: Optional[float] = Field(None, description="Confidence score associated with the item.")
+    context: Dict[str, Any] = Field(default_factory=dict, description="Additional context payload.")
+
+
+class CatalogSearchResponse(BaseModel):
+    mode: str = Field(..., description="Search mode that was executed (fts or semantic).")
+    query: str = Field(..., description="Original query string submitted by the client.")
+    results: List[CatalogSearchHit] = Field(
+        default_factory=list, description="Combined movie/episode hits ordered by relevance."
+    )
 class FeatureVectorResponse(BaseModel):
     """Single feature vector payload."""
 

@@ -5,16 +5,28 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .auth import APIKeyAuth
 from .db import DataAccess
 from .models import (
+    CatalogEpisodesResponse,
+    CatalogItemDetailResponse,
+    CatalogMoviesResponse,
+    CatalogOpenFolderRequest,
+    CatalogOpenFolderResponse,
+    CatalogSearchResponse,
+    CatalogSeasonRow,
+    CatalogSeasonsResponse,
+    CatalogSeriesResponse,
+    CatalogSummaryResponse,
     DriveStatsResponse,
     DrivesResponse,
     FeatureVectorResponse,
@@ -127,6 +139,16 @@ def create_app(config: APIServerConfig) -> FastAPI:
             parsed = int(default)
         parsed = max(1, parsed)
         return min(parsed, data.max_page_size)
+
+    def parse_langs(value: Optional[str]) -> List[str]:
+        if not value:
+            return []
+        return [token.strip() for token in str(value).split(",") if token.strip()]
+
+    def media_url(token: Optional[str]) -> Optional[str]:
+        if not token:
+            return None
+        return f"/v1/catalog/thumb?id={token}"
 
     @app.get("/v1/health", response_model=HealthResponse)
     def health_check(_: str = Depends(auth_dependency)) -> HealthResponse:
@@ -335,6 +357,175 @@ def create_app(config: APIServerConfig) -> FastAPI:
             next_offset=next_offset,
             total_estimate=total,
         )
+
+    @app.get("/v1/catalog/movies", response_model=CatalogMoviesResponse)
+    def catalog_movies(
+        query: Optional[str] = Query(None, description="Free text query against title/path."),
+        year_min: Optional[int] = Query(None, ge=1800),
+        year_max: Optional[int] = Query(None, ge=1800),
+        conf_min: Optional[float] = Query(None, ge=0.0, le=1.0),
+        quality_min: Optional[int] = Query(None),
+        lang_audio: Optional[str] = Query(None, description="Comma separated audio language codes."),
+        lang_sub: Optional[str] = Query(None, description="Comma separated subtitle language codes."),
+        drive: Optional[str] = Query(None, description="Restrict to a single drive label."),
+        sort: str = Query("title", description="Sort field: title, year, confidence, quality."),
+        order: str = Query("asc", description="Sort order asc|desc."),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        only_low_confidence: bool = Query(False, description="Return only low-confidence rows."),
+        _: str = Depends(auth_dependency),
+    ) -> CatalogMoviesResponse:
+        results, pagination, next_offset, total = data.catalog_movies_page(
+            query=query,
+            year_min=year_min,
+            year_max=year_max,
+            confidence_min=conf_min,
+            quality_min=quality_min,
+            audio_langs=parse_langs(lang_audio),
+            subs_langs=parse_langs(lang_sub),
+            drive=drive,
+            only_low_confidence=only_low_confidence,
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
+        payload = [
+            {
+                **row,
+                "poster_thumb": media_url(row.get("poster_thumb")),
+                "contact_sheet": media_url(row.get("contact_sheet")),
+            }
+            for row in results
+        ]
+        return CatalogMoviesResponse(
+            results=payload,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/catalog/tv/series", response_model=CatalogSeriesResponse)
+    def catalog_series(
+        query: Optional[str] = Query(None, description="Free text query against title/path."),
+        conf_min: Optional[float] = Query(None, ge=0.0, le=1.0),
+        drive: Optional[str] = Query(None, description="Restrict to a single drive label."),
+        sort: str = Query("title", description="Sort field: title, confidence, seasons."),
+        order: str = Query("asc", description="Sort order asc|desc."),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        only_low_confidence: bool = Query(False, description="Return only low confidence entries."),
+        _: str = Depends(auth_dependency),
+    ) -> CatalogSeriesResponse:
+        results, pagination, next_offset, total = data.catalog_tv_series_page(
+            query=query,
+            confidence_min=conf_min,
+            drive=drive,
+            only_low_confidence=only_low_confidence,
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
+        payload = [
+            {
+                **row,
+                "poster_thumb": media_url(row.get("poster_thumb")),
+            }
+            for row in results
+        ]
+        return CatalogSeriesResponse(
+            results=payload,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/catalog/tv/seasons", response_model=CatalogSeasonsResponse)
+    def catalog_seasons(
+        series_id: str = Query(..., description="Series identifier returned by /tv/series."),
+        _: str = Depends(auth_dependency),
+    ) -> CatalogSeasonsResponse:
+        seasons, meta = data.catalog_tv_seasons(series_id)
+        payload = [CatalogSeasonRow(**season) for season in seasons]
+        return CatalogSeasonsResponse(series=meta, seasons=payload)
+
+    @app.get("/v1/catalog/tv/episodes", response_model=CatalogEpisodesResponse)
+    def catalog_episodes(
+        series_id: str = Query(..., description="Series identifier returned by /tv/series."),
+        season: Optional[int] = Query(None, description="Optional season number filter."),
+        _: str = Depends(auth_dependency),
+    ) -> CatalogEpisodesResponse:
+        episodes, season_meta = data.catalog_tv_episodes(series_id, season_number=season)
+        payload = [
+            {
+                **row,
+                "poster_thumb": media_url(row.get("poster_thumb")),
+                "quality": row.get("quality_score"),
+            }
+            for row in episodes
+        ]
+        return CatalogEpisodesResponse(season=season_meta or {}, episodes=payload)
+
+    @app.get("/v1/catalog/item", response_model=CatalogItemDetailResponse)
+    def catalog_item_detail(
+        id: str = Query(..., description="Item identifier returned by the catalog endpoints."),
+        _: str = Depends(auth_dependency),
+    ) -> CatalogItemDetailResponse:
+        detail = data.catalog_item_detail(id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="catalog item not found")
+        kind, _, _ = data._parse_item_id(id) or (None, None, None)
+        if kind == "movie":
+            movie_payload = dict(detail)
+            movie_payload["poster_thumb"] = media_url(movie_payload.get("poster_thumb"))
+            movie_payload["contact_sheet"] = media_url(movie_payload.get("contact_sheet"))
+            return CatalogItemDetailResponse(kind="movie", movie=movie_payload)
+        if kind == "episode":
+            episode_payload = dict(detail)
+            episode_payload["poster_thumb"] = media_url(episode_payload.get("poster_thumb"))
+            return CatalogItemDetailResponse(kind="episode", episode=episode_payload)
+        return CatalogItemDetailResponse(kind="series", series=detail)
+
+    @app.get("/v1/catalog/thumb")
+    def catalog_thumb(
+        id: str = Query(..., description="Media token returned by the catalog listing endpoints."),
+        _: str = Depends(auth_dependency),
+    ) -> Response:
+        blob = data.catalog_fetch_media_blob(id)
+        if blob is None:
+            raise HTTPException(status_code=404, detail="thumbnail not found")
+        payload, mime = blob
+        return Response(content=payload, media_type=mime, headers={"Cache-Control": "max-age=3600"})
+
+    @app.post("/v1/catalog/open-folder", response_model=CatalogOpenFolderResponse)
+    def catalog_open_folder(
+        request: CatalogOpenFolderRequest,
+        _: str = Depends(auth_dependency),
+    ) -> CatalogOpenFolderResponse:
+        path = request.path.strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="path is required")
+        return CatalogOpenFolderResponse(plan="shell_open", path=path)
+
+    @app.get("/v1/catalog/summary", response_model=CatalogSummaryResponse)
+    def catalog_summary(
+        _: str = Depends(auth_dependency),
+    ) -> CatalogSummaryResponse:
+        summary = data.catalog_summary()
+        return CatalogSummaryResponse(**summary)
+
+    @app.get("/v1/catalog/search", response_model=CatalogSearchResponse)
+    def catalog_search(
+        q: str = Query(..., min_length=1, description="Query string to execute."),
+        mode: str = Query("fts", description="Search mode: fts or semantic."),
+        top_k: int = Query(20, ge=1, le=100),
+        _: str = Depends(auth_dependency),
+    ) -> CatalogSearchResponse:
+        hits = data.catalog_search(q, mode=mode, top_k=top_k)
+        return CatalogSearchResponse(mode=mode, query=q, results=hits)
 
     @app.get("/v1/stats", response_model=DriveStatsResponse)
     def stats(
@@ -627,6 +818,12 @@ def create_app(config: APIServerConfig) -> FastAPI:
         except SemanticPhaseError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return SemanticOperationResponse(ok=True, action="transcribe", stats=stats)
+
+    dist_dir = (
+        Path(__file__).resolve().parent.parent / "web" / "catalog-ui" / "dist"
+    )
+    if dist_dir.is_dir():
+        app.mount("/", StaticFiles(directory=dist_dir, html=True), name="catalog-ui")
 
     return app
 
