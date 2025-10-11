@@ -21,3 +21,9 @@ pytesseract
 transformers
 yake
 langdetect
+langgraph
+langchain-core
+langchain-community
+sentence-transformers
+hnswlib
+llama-cpp-python

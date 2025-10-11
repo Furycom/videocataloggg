@@ -123,6 +123,23 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "default_limit": 100,
         "max_page_size": 500,
     },
+    "assistant": {
+        "enable": False,
+        "runtime": "auto",
+        "model": "qwen2.5:7b-instruct",
+        "ctx": 8192,
+        "temperature": 0.3,
+        "tools_enabled": True,
+        "tool_budget": 20,
+        "rag": {
+            "enable": True,
+            "top_k": 8,
+            "min_score": 0.25,
+            "embed_model": "bge-small-en",
+            "index": "faiss",
+            "refresh_on_start": False,
+        },
+    },
     "structure": {
         "enable": True,
         "weights": {
