@@ -174,6 +174,15 @@ class DataAccess:
         except sqlite3.DatabaseError:
             return False
 
+    def _textlite_tables_present(self, conn: sqlite3.Connection) -> bool:
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='textlite_preview'"
+            )
+            return cursor.fetchone() is not None
+        except sqlite3.DatabaseError:
+            return False
+
     def _textverify_tables_present(self, conn: sqlite3.Connection) -> bool:
         try:
             cursor = conn.execute(
@@ -311,6 +320,55 @@ class DataAccess:
                 params = [pagination.limit, pagination.offset]
                 rows = conn.execute(query, params).fetchall()
                 total = conn.execute("SELECT COUNT(*) FROM docs_preview").fetchone()[0]
+        results = [dict(row) for row in rows]
+        next_offset: Optional[int] = None
+        consumed = pagination.offset + len(results)
+        if total is not None and consumed < total:
+            next_offset = consumed
+        return results, pagination, next_offset, int(total)
+
+    def textlite_page(
+        self,
+        drive_label: str,
+        *,
+        q: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], Pagination, Optional[int], Optional[int]]:
+        pagination = self.resolve_pagination(limit, offset)
+        with self._shard(drive_label) as conn:
+            if not self._textlite_tables_present(conn):
+                return [], pagination, None, 0
+            params: List[object]
+            if q:
+                query = (
+                    """
+                    SELECT prev.path, prev.kind, prev.bytes_sampled, prev.lines_sampled,
+                           prev.summary, prev.keywords, prev.schema_json, prev.updated_utc
+                    FROM textlite_fts AS ft
+                    JOIN textlite_preview AS prev ON prev.path = ft.path
+                    WHERE textlite_fts MATCH ?
+                    ORDER BY bm25(textlite_fts)
+                    LIMIT ? OFFSET ?
+                    """
+                )
+                params = [q, pagination.limit, pagination.offset]
+                rows = conn.execute(query, params).fetchall()
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM textlite_fts WHERE textlite_fts MATCH ?", (q,)
+                ).fetchone()[0]
+            else:
+                query = (
+                    """
+                    SELECT path, kind, bytes_sampled, lines_sampled, summary, keywords, schema_json, updated_utc
+                    FROM textlite_preview
+                    ORDER BY updated_utc DESC
+                    LIMIT ? OFFSET ?
+                    """
+                )
+                params = [pagination.limit, pagination.offset]
+                rows = conn.execute(query, params).fetchall()
+                total = conn.execute("SELECT COUNT(*) FROM textlite_preview").fetchone()[0]
         results = [dict(row) for row in rows]
         next_offset: Optional[int] = None
         consumed = pagination.offset + len(results)

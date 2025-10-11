@@ -41,21 +41,21 @@
     "min_free_vram_mb": 512,
     "max_gpu_workers": 2
   },
-    "fingerprints": {
-      "enable_video_tmk": false,
-      "enable_audio_chroma": false,
-      "enable_video_vhash_prefilter": true,
-      "batch_size": 50,
-      "max_concurrency": 2,
-      "io_gentle_ms": 120,
-      "phase_mode": "post-scan",
-      "tmk_bin_path": null,
-      "fpcalc_path": null,
-      "tmk_similarity_threshold": 0.75,
-      "chroma_match_threshold": 0.15,
-      "consensus_enabled": true,
-      "consensus_video_weight": 0.7
-    },
+  "fingerprints": {
+    "enable_video_tmk": false,
+    "enable_audio_chroma": false,
+    "enable_video_vhash_prefilter": true,
+    "batch_size": 50,
+    "max_concurrency": 2,
+    "io_gentle_ms": 120,
+    "phase_mode": "post-scan",
+    "tmk_bin_path": null,
+    "fpcalc_path": null,
+    "tmk_similarity_threshold": 0.75,
+    "chroma_match_threshold": 0.15,
+    "consensus_enabled": true,
+    "consensus_video_weight": 0.7
+  },
   "api": {
     "enabled_default": false,
     "host": "127.0.0.1",
@@ -182,5 +182,23 @@
     "sheet_format": "WEBP",
     "sheet_quality": 80,
     "sheet_optimize": true
+  },
+  "textlite": {
+    "enable": true,
+    "max_bytes": 32768,
+    "max_lines": 400,
+    "head_lines": 150,
+    "mid_lines": 100,
+    "tail_lines": 150,
+    "summary_tokens": 80,
+    "keywords_topk": 8,
+    "schema": {
+      "csv_headers": true,
+      "json_keys": true,
+      "yaml_keys": true
+    },
+    "skip_if_gt_mb": 50,
+    "gentle_sleep_ms": 2,
+    "gpu_allowed": true
   }
 }

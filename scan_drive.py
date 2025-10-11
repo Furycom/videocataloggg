@@ -117,6 +117,7 @@ from structure import (
 )
 from textverify import TextVerifySettings, run_for_shard as run_textverify_for_shard
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
+from textlite import TextLiteSettings, run_for_shard as run_textlite_for_shard
 from quality import QualitySettings, run_for_shard as run_quality_for_shard
 from quality.ffprobe import ffprobe_available as quality_ffprobe_available
 from visualreview import load_visualreview_settings
@@ -3280,6 +3281,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Process at most this many candidate documents.",
     )
     parser.add_argument(
+        "--textlite",
+        action="store_true",
+        help="Run the TextLite preview pipeline for plain text files.",
+    )
+    parser.add_argument(
+        "--textlite-max-bytes",
+        type=int,
+        help="Override maximum bytes sampled per file for TextLite.",
+    )
+    parser.add_argument(
+        "--textlite-max-lines",
+        type=int,
+        help="Override maximum lines sampled per file for TextLite.",
+    )
+    parser.add_argument(
         "--audit",
         action="store_true",
         help="Run the catalog audit summary without exports.",
@@ -4449,6 +4465,65 @@ def _run_docpreview_cli(
     return 0
 
 
+def _run_textlite_cli(
+    args: argparse.Namespace,
+    settings_data: Dict[str, object],
+    shard_db_path: Path,
+) -> int:
+    if not args.label:
+        LOGGER.error("TextLite requires --label to resolve shard database.")
+        print("[ERROR] --label is required for TextLite runs.", file=sys.stderr)
+        return 2
+    base_settings = settings_data.get("textlite") if isinstance(settings_data.get("textlite"), dict) else {}
+    text_settings = TextLiteSettings.from_mapping(base_settings)
+    enabled = bool(text_settings.enable or getattr(args, "textlite", False))
+    overrides: Dict[str, object] = {}
+    if getattr(args, "textlite_max_bytes", None) is not None:
+        overrides["max_bytes"] = max(4096, int(args.textlite_max_bytes))
+    if getattr(args, "textlite_max_lines", None) is not None:
+        overrides["max_lines"] = max(40, int(args.textlite_max_lines))
+    if overrides:
+        text_settings = text_settings.with_overrides(**overrides)
+    if getattr(args, "textlite", False):
+        enabled = True
+    if not enabled:
+        LOGGER.info("TextLite disabled via settings.json (textlite.enable=false)")
+        print("TextLite disabled in settings; nothing to do.")
+        return 0
+    text_settings = text_settings.with_overrides(enable=True)
+    mount_hint = args.mount_path or str(Path(shard_db_path).parent)
+    try:
+        perf_config = resolve_performance_config(mount_hint, settings=settings_data)
+        perf_sleep = 0.05 if perf_config.gentle_io else 0.0
+    except Exception:
+        perf_sleep = 0.0
+    gentle_sleep = max(perf_sleep, (text_settings.gentle_sleep_ms or 0) / 1000.0)
+
+    def progress_callback(payload: Dict[str, object]) -> None:
+        try:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+    LOGGER.info("Running TextLite pipeline for %s", shard_db_path)
+    summary = run_textlite_for_shard(
+        shard_db_path,
+        settings=text_settings,
+        gpu_settings=settings_data.get("gpu") if isinstance(settings_data.get("gpu"), dict) else {},
+        progress_callback=progress_callback,
+        gentle_sleep=gentle_sleep,
+    )
+    print(
+        "TextLite complete — processed={processed} skipped={skipped} errors={errors} elapsed={elapsed:.1f}s".format(
+            processed=summary.processed,
+            skipped=summary.skipped,
+            errors=summary.errors,
+            elapsed=summary.elapsed_s,
+        )
+    )
+    return 0
+
+
 def _run_audit_cli(
     args: argparse.Namespace,
     catalog_db_path: Path,
@@ -4680,6 +4755,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _run_quality_cli(args, settings_data, Path(shard_db_path))
     if getattr(args, "docpreview", False):
         return _run_docpreview_cli(args, settings_data, Path(shard_db_path))
+    if getattr(args, "textlite", False):
+        return _run_textlite_cli(args, settings_data, Path(shard_db_path))
     if structure_requested:
         mount_path = _expand_user_path(args.mount_path) if args.mount_path else None
         return _run_structure_cli(

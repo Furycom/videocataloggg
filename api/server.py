@@ -40,6 +40,7 @@ from .models import (
     DocPreviewResponse,
     TextVerifyDetailsResponse,
     TextVerifyResponse,
+    TextLiteResponse,
 )
 from semantic import SemanticPhaseError
 
@@ -199,6 +200,29 @@ def create_app(config: APIServerConfig) -> FastAPI:
             offset=offset,
         )
         return DocPreviewResponse(
+            results=results,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/textlite/preview", response_model=TextLiteResponse)
+    def textlite_previews(
+        drive_label: str = Query(..., description="Drive label to query."),
+        q: Optional[str] = Query(None, description="Optional FTS query across TextLite summaries and keywords."),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        _: str = Depends(auth_dependency),
+    ) -> TextLiteResponse:
+        ensure_drive(drive_label)
+        results, pagination, next_offset, total = data.textlite_page(
+            drive_label,
+            q=q,
+            limit=limit,
+            offset=offset,
+        )
+        return TextLiteResponse(
             results=results,
             limit=pagination.limit,
             offset=pagination.offset,
