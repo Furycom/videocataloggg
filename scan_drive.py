@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
@@ -111,6 +111,8 @@ from db_maint import (
 )
 from structure import StructureProfiler, load_structure_settings as load_structure_config
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
+from visualreview import load_visualreview_settings
+from visualreview.run import process_queue
 from musicnames import (
     generate_review_bundle,
     parse_music_name,
@@ -2998,6 +3000,25 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Process at most this many candidate documents.",
     )
     parser.add_argument(
+        "--visual-review",
+        action="store_true",
+        help="Generate thumbnails and contact sheets for the visual review queue.",
+    )
+    parser.add_argument(
+        "--visual-frames",
+        type=int,
+        help="Override number of frames sampled per video for visual review.",
+    )
+    parser.add_argument(
+        "--visual-size",
+        type=int,
+        help="Override maximum thumbnail dimension in pixels for visual review.",
+    )
+    parser.add_argument(
+        "--visual-format",
+        help="Override thumbnail image format for visual review (e.g. JPEG, PNG).",
+    )
+    parser.add_argument(
         "--maint-target",
         dest="maint_target",
         help="Maintenance target: catalog, shard:<label>, or all-shards.",
@@ -3644,6 +3665,193 @@ def _run_structure_cli(
         conn.close()
 
 
+def _storage_allows_visual_writes(
+    settings_data: Dict[str, object], label: Optional[str]
+) -> bool:
+    storage = settings_data.get("storage") if isinstance(settings_data, dict) else None
+    if not isinstance(storage, dict):
+        return True
+
+    def _as_bool(value: object) -> bool:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    for key in ("read_only", "readonly", "visualreview_read_only", "visual_review_read_only"):
+        if key in storage and _as_bool(storage[key]):
+            return False
+
+    target = (label or "").strip().lower()
+    if not target:
+        return True
+
+    for key in (
+        "read_only_labels",
+        "readonly_labels",
+        "visualreview_read_only_labels",
+        "visual_review_read_only_labels",
+    ):
+        candidates = storage.get(key)
+        if not isinstance(candidates, (list, tuple, set)):
+            continue
+        for candidate in candidates:
+            if str(candidate).strip().lower() == target:
+                return False
+    return True
+
+
+def _lookup_visual_mount(label: str, shard_db_path: Path) -> Optional[Path]:
+    try:
+        conn = connect(shard_db_path, read_only=True, check_same_thread=False)
+    except Exception:
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                """
+                SELECT mount_path
+                FROM drives
+                WHERE label = ?
+                ORDER BY scanned_at DESC
+                LIMIT 1
+                """,
+                (label,),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        if not row:
+            return None
+        mount_value = row["mount_path"] if isinstance(row, sqlite3.Row) else row[0]
+        if not mount_value:
+            return None
+        try:
+            return Path(str(mount_value))
+        except Exception:
+            return None
+    finally:
+        conn.close()
+
+
+def _run_visualreview_cli(
+    args: argparse.Namespace,
+    settings_data: Dict[str, object],
+    shard_db_path: Path,
+    mount_override: Optional[Path],
+) -> int:
+    if not args.label:
+        LOGGER.error("Visual review requires --label to resolve shard database.")
+        print("[ERROR] --label is required for visual review runs.", file=sys.stderr)
+        return 2
+
+    if not _storage_allows_visual_writes(settings_data, args.label):
+        LOGGER.error("Visual review storage is read-only per settings; aborting.")
+        print(
+            "[ERROR] Visual review storage is read-only according to settings.",
+            file=sys.stderr,
+        )
+        return 4
+
+    visual_settings = load_visualreview_settings(settings_data)
+    enabled = bool(visual_settings.enable or getattr(args, "visual_review", False))
+    overrides: Dict[str, object] = {}
+    if getattr(args, "visual_frames", None) is not None:
+        try:
+            overrides["frames_per_video"] = max(1, int(args.visual_frames))
+        except (TypeError, ValueError):
+            LOGGER.error("Invalid value for --visual-frames: %s", args.visual_frames)
+            print("[ERROR] --visual-frames must be a positive integer.", file=sys.stderr)
+            return 2
+    if getattr(args, "visual_size", None) is not None:
+        try:
+            overrides["max_thumb_px"] = max(32, int(args.visual_size))
+        except (TypeError, ValueError):
+            LOGGER.error("Invalid value for --visual-size: %s", args.visual_size)
+            print("[ERROR] --visual-size must be a positive integer.", file=sys.stderr)
+            return 2
+    if getattr(args, "visual_format", None):
+        overrides["thumbnail_format"] = str(args.visual_format).strip().upper()
+
+    if overrides:
+        visual_settings = replace(visual_settings, **overrides)
+    if getattr(args, "visual_review", False):
+        enabled = True
+    if not enabled:
+        LOGGER.info("Visual review disabled via settings.json (visualreview.enable=false)")
+        print("Visual review disabled in settings; nothing to do.")
+        return 0
+    visual_settings = replace(visual_settings, enable=True)
+
+    gpu_overrides: Dict[str, object] = {}
+    if getattr(args, "gpu_policy", None):
+        gpu_overrides["policy"] = args.gpu_policy
+    if getattr(args, "gpu_hwaccel", None) is not None:
+        gpu_overrides["allow_hwaccel_video"] = bool(args.gpu_hwaccel)
+    gpu_cfg = _resolve_gpu_settings(settings_data, gpu_overrides)
+    allow_hwaccel = (
+        bool(visual_settings.allow_hwaccel)
+        and bool(gpu_cfg.allow_hwaccel_video)
+        and gpu_cfg.policy != "CPU_ONLY"
+    )
+    hwaccel_policy = gpu_cfg.policy if allow_hwaccel else "CPU_ONLY"
+    visual_settings = replace(
+        visual_settings,
+        allow_hwaccel=allow_hwaccel,
+        hwaccel_policy=hwaccel_policy,
+    )
+
+    mount_path = mount_override or _lookup_visual_mount(args.label, shard_db_path)
+    if mount_path is None:
+        LOGGER.error("Mount path required for visual review but not provided.")
+        print(
+            "[ERROR] --mount is required for visual review runs.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        perf_config = resolve_performance_config(str(mount_path), settings=settings_data)
+        gentle_sleep = 0.05 if perf_config.gentle_io else 0.0
+    except Exception:
+        gentle_sleep = 0.0
+    if gentle_sleep > 0 and gentle_sleep > float(getattr(visual_settings, "sleep_seconds", 0.0)):
+        visual_settings = replace(visual_settings, sleep_seconds=gentle_sleep)
+
+    LOGGER.info("Running visual review pipeline for %s", shard_db_path)
+    try:
+        summary = process_queue(
+            shard_db_path,
+            drive_label=args.label,
+            mount_path=mount_path,
+            settings=visual_settings,
+            working_dir=WORKING_DIR_PATH,
+            progress=None,
+            cancel=None,
+        )
+    except Exception as exc:
+        LOGGER.error("Visual review failed: %s", exc)
+        print(f"[ERROR] Visual review failed: {exc}", file=sys.stderr)
+        return 4
+
+    processed = summary.processed_videos
+    frames = summary.extracted_frames
+    bytes_written = summary.bytes_written
+    errors = summary.errors
+    skipped = summary.skipped
+
+    line = (
+        "Visual review complete — processed="
+        f"{processed} frames={frames} bytes={_format_bytes(bytes_written)} errors={errors}"
+    )
+    print(line)
+    if skipped:
+        print(f"Skipped entries: {skipped}")
+    if gentle_sleep > 0:
+        LOGGER.debug("Gentle I/O mode applied during visual review (sleep=%.2fs)", gentle_sleep)
+    return 0
+
+
 def _run_docpreview_cli(
     args: argparse.Namespace,
     settings_data: Dict[str, object],
@@ -3816,6 +4024,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     structure_requested = bool(
         args.structure_scan or args.structure_verify or args.structure_export_review
     )
+    if getattr(args, "visual_review", False):
+        mount_override = _expand_user_path(args.mount_path) if args.mount_path else None
+        return _run_visualreview_cli(
+            args,
+            settings_data,
+            Path(shard_db_path),
+            mount_override,
+        )
     if getattr(args, "docpreview", False):
         return _run_docpreview_cli(args, settings_data, Path(shard_db_path))
     if structure_requested:

@@ -579,3 +579,92 @@ def _resolve_media_path(base: Path, candidate: str) -> Path:
     if path.is_absolute():
         return path
     return base / path
+
+
+@dataclass(slots=True)
+class QueueProcessSummary:
+    """Aggregated metrics for a visual review queue run."""
+
+    processed_videos: int = 0
+    extracted_frames: int = 0
+    bytes_written: int = 0
+    errors: int = 0
+    skipped: int = 0
+
+
+def _sum_blob_bytes(conn: sqlite3.Connection, table: str) -> int:
+    try:
+        cursor = conn.execute(
+            f"SELECT COALESCE(SUM(LENGTH(image_blob)), 0) FROM {table}"
+        )
+        row = cursor.fetchone()
+    except sqlite3.DatabaseError:
+        return 0
+    if not row:
+        return 0
+    value = row[0]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sum_frame_count(conn: sqlite3.Connection) -> int:
+    try:
+        cursor = conn.execute(
+            "SELECT COALESCE(SUM(frame_count), 0) FROM contact_sheets"
+        )
+        row = cursor.fetchone()
+    except sqlite3.DatabaseError:
+        return 0
+    if not row:
+        return 0
+    value = row[0]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _measure_store_totals(shard_path: Path) -> Tuple[int, int]:
+    conn = connect(shard_path, read_only=True, check_same_thread=False)
+    try:
+        thumbs = _sum_blob_bytes(conn, "video_thumbs")
+        sheets = _sum_blob_bytes(conn, "contact_sheets")
+        frames = _sum_frame_count(conn)
+        return thumbs + sheets, frames
+    finally:
+        conn.close()
+
+
+def process_queue(
+    shard_path: Path,
+    *,
+    drive_label: str,
+    mount_path: Path,
+    settings: VisualReviewSettings,
+    working_dir: Optional[Path] = None,
+    progress: Optional[ProgressCallback] = None,
+    cancel: Optional[CancelCallback] = None,
+) -> QueueProcessSummary:
+    """Process a shard review queue and return aggregated metrics."""
+
+    base = Path(mount_path)
+    totals_before = _measure_store_totals(shard_path)
+    config = settings.to_runner_config(
+        working_dir=working_dir or resolve_working_dir(),
+        mounts={drive_label: base},
+        shard_labels=[drive_label],
+    )
+    runner = ReviewRunner(config)
+    result = runner.run(progress=progress, cancel=cancel)
+    totals_after = _measure_store_totals(shard_path)
+    bytes_written = max(0, totals_after[0] - totals_before[0])
+    frames_written = max(0, totals_after[1] - totals_before[1])
+    return QueueProcessSummary(
+        processed_videos=result.processed,
+        extracted_frames=frames_written,
+        bytes_written=bytes_written,
+        errors=result.failed,
+        skipped=result.skipped,
+    )
