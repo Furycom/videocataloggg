@@ -203,6 +203,36 @@ class DocPreviewResponse(PaginatedResponse):
     results: List[DocPreviewRow] = Field(..., description="Preview rows for this page.")
 
 
+class TextVerifyRow(BaseModel):
+    """Row describing a subtitle/plot cross-check summary."""
+
+    path: str = Field(..., description="Relative media path associated with the cross-check.")
+    has_local_subs: bool = Field(..., description="True when local subtitles were sampled.")
+    subs_lang: Optional[str] = Field(None, description="Detected subtitle language code.")
+    subs_lines_used: Optional[int] = Field(None, description="Number of subtitle lines sampled.")
+    summary: Optional[str] = Field(None, description="Short summary produced from the subtitles.")
+    keywords: List[str] = Field(default_factory=list, description="Keywords extracted from the subtitles.")
+    plot_source: Optional[str] = Field(None, description="Source of the official plot synopsis.")
+    plot_excerpt: Optional[str] = Field(None, description="Excerpt of the official plot used for comparison.")
+    semantic_sim: float = Field(..., description="Semantic similarity score (0..1).")
+    ner_overlap: float = Field(..., description="Named entity overlap score (0..1).")
+    keyword_overlap: float = Field(..., description="Keyword overlap score (0..1).")
+    aggregated_score: float = Field(..., description="Weighted aggregate score (0..1).")
+    updated_utc: Optional[str] = Field(None, description="Last update timestamp in UTC.")
+
+
+class TextVerifyResponse(PaginatedResponse):
+    """Paginated subtitle/plot cross-check listing."""
+
+    results: List[TextVerifyRow] = Field(..., description="Cross-check rows for this page.")
+
+
+class TextVerifyDetailsResponse(TextVerifyRow):
+    """Detailed subtitle/plot cross-check payload."""
+
+    pass
+
+
 class MusicRow(BaseModel):
     """Single inferred music metadata row."""
 

@@ -174,6 +174,15 @@ class DataAccess:
         except sqlite3.DatabaseError:
             return False
 
+    def _textverify_tables_present(self, conn: sqlite3.Connection) -> bool:
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='textverify_artifacts'"
+            )
+            return cursor.fetchone() is not None
+        except sqlite3.DatabaseError:
+            return False
+
     def _music_tables_present(self, conn: sqlite3.Connection) -> bool:
         try:
             cursor = conn.execute(
@@ -900,6 +909,68 @@ class DataAccess:
             else None
         )
         return results, pagination, next_offset, total
+
+    def textverify_page(
+        self,
+        drive_label: str,
+        *,
+        min_score: Optional[float] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], Pagination, Optional[int], Optional[int]]:
+        with self._shard(drive_label) as conn:
+            if not self._textverify_tables_present(conn):
+                pagination = self.resolve_pagination(limit, offset)
+                return [], pagination, None, None
+            pagination = self.resolve_pagination(limit, offset)
+            params: List[Any] = []
+            sql = "SELECT * FROM textverify_artifacts"
+            if min_score is not None:
+                sql += " WHERE aggregated_score >= ?"
+                params.append(float(min_score))
+            sql += " ORDER BY updated_utc DESC LIMIT ? OFFSET ?"
+            params.extend([pagination.limit, pagination.offset])
+            rows = conn.execute(sql, params).fetchall()
+            results: List[Dict[str, Any]] = []
+            for row in rows:
+                payload = dict(row)
+                payload["has_local_subs"] = bool(payload.get("has_local_subs"))
+                payload["keywords"] = self._parse_keywords(payload.get("keywords"))
+                results.append(payload)
+            next_offset = (
+                pagination.offset + pagination.limit if len(results) == pagination.limit else None
+            )
+            return results, pagination, next_offset, None
+
+    def textverify_details(self, drive_label: str, path: str) -> Optional[Dict[str, Any]]:
+        with self._shard(drive_label) as conn:
+            if not self._textverify_tables_present(conn):
+                return None
+            row = conn.execute(
+                "SELECT * FROM textverify_artifacts WHERE path = ?",
+                (path,),
+            ).fetchone()
+            if not row:
+                return None
+            payload = dict(row)
+            payload["has_local_subs"] = bool(payload.get("has_local_subs"))
+            payload["keywords"] = self._parse_keywords(payload.get("keywords"))
+            return payload
+
+    def _parse_keywords(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return [str(item) for item in parsed if str(item).strip()]
+            except Exception:
+                pass
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return []
 
     def semantic_index(self, *, rebuild: bool = False) -> Dict[str, int]:
         config = self._semantic_config()

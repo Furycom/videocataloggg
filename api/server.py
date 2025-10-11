@@ -38,6 +38,8 @@ from .models import (
     StructureSummaryResponse,
     TopExtensionsReport,
     DocPreviewResponse,
+    TextVerifyDetailsResponse,
+    TextVerifyResponse,
 )
 from semantic import SemanticPhaseError
 
@@ -203,6 +205,49 @@ def create_app(config: APIServerConfig) -> FastAPI:
             next_offset=next_offset,
             total_estimate=total,
         )
+
+    @app.get("/v1/textverify/summary", response_model=TextVerifyResponse)
+    def textverify_summary(
+        drive_label: str = Query(..., description="Drive label to query."),
+        min_score: Optional[float] = Query(
+            None,
+            ge=0.0,
+            le=1.0,
+            description="Optional minimum aggregated score (0..1) required for inclusion.",
+        ),
+        limit: Optional[int] = Query(None, ge=1),
+        offset: Optional[int] = Query(None, ge=0),
+        _: str = Depends(auth_dependency),
+    ) -> TextVerifyResponse:
+        ensure_drive(drive_label)
+        try:
+            results, pagination, next_offset, total = data.textverify_page(
+                drive_label,
+                min_score=min_score,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return TextVerifyResponse(
+            results=results,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            next_offset=next_offset,
+            total_estimate=total,
+        )
+
+    @app.get("/v1/textverify/details", response_model=TextVerifyDetailsResponse)
+    def textverify_details(
+        drive_label: str = Query(..., description="Drive label to query."),
+        path: str = Query(..., description="Relative media path for the artifact."),
+        _: str = Depends(auth_dependency),
+    ) -> TextVerifyDetailsResponse:
+        ensure_drive(drive_label)
+        row = data.textverify_details(drive_label, path)
+        if row is None:
+            raise HTTPException(status_code=404, detail="text verification artifact not found")
+        return TextVerifyDetailsResponse(**row)
 
     @app.get("/v1/music", response_model=MusicResponse)
     def music_metadata(

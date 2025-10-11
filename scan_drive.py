@@ -109,7 +109,12 @@ from db_maint import (
     update_maintenance_metadata,
     vacuum_if_needed,
 )
-from structure import StructureProfiler, load_structure_settings as load_structure_config
+from structure import (
+    StructureProfiler,
+    load_structure_settings as load_structure_config,
+    load_tv_settings,
+)
+from textverify import TextVerifySettings, run_for_shard as run_textverify_for_shard
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
 from visualreview import load_visualreview_settings
 from visualreview.run import process_queue
@@ -2952,6 +2957,34 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Export low-confidence review queue to the given JSON path.",
     )
     parser.add_argument(
+        "--textverify",
+        action="store_true",
+        help="Run subtitle/plot cross-check for low and medium confidence items.",
+    )
+    parser.add_argument(
+        "--textverify-all",
+        action="store_true",
+        help="Run subtitle/plot cross-check for all items regardless of confidence.",
+    )
+    parser.add_argument(
+        "--textverify-max-items",
+        type=int,
+        help="Limit the number of items processed during text verification.",
+    )
+    parser.add_argument(
+        "--textverify-gpu",
+        dest="textverify_gpu",
+        action="store_true",
+        help="Allow GPU usage for text verification models (overrides settings).",
+    )
+    parser.add_argument(
+        "--no-textverify-gpu",
+        dest="textverify_gpu",
+        action="store_false",
+        help="Force text verification to run on CPU only.",
+    )
+    parser.set_defaults(textverify_gpu=None)
+    parser.add_argument(
         "--docpreview",
         action="store_true",
         help="Run the lightweight document preview pipeline for PDFs and EPUBs.",
@@ -3852,6 +3885,100 @@ def _run_visualreview_cli(
     return 0
 
 
+def _run_textverify_cli(
+    args: argparse.Namespace,
+    settings_data: Dict[str, object],
+    shard_db_path: Path,
+) -> int:
+    if not args.label:
+        LOGGER.error("Text verification requires --label to resolve shard database.")
+        print("[ERROR] --label is required for text verification runs.", file=sys.stderr)
+        return 2
+    base_settings = settings_data.get("textverify") if isinstance(settings_data.get("textverify"), dict) else {}
+    verify_settings = TextVerifySettings.from_mapping(base_settings)
+    enabled = bool(verify_settings.enable)
+    overrides: Dict[str, object] = {}
+    if getattr(args, "textverify", False):
+        enabled = True
+    if getattr(args, "textverify_all", False):
+        enabled = True
+        overrides["targets"] = "all"
+    if getattr(args, "textverify_max_items", None) is not None:
+        try:
+            max_items = int(args.textverify_max_items)
+        except (TypeError, ValueError):
+            LOGGER.error("Invalid value for --textverify-max-items: %s", args.textverify_max_items)
+            print("[ERROR] --textverify-max-items must be an integer.", file=sys.stderr)
+            return 2
+        if max_items > 0:
+            overrides["max_items_per_run"] = max_items
+    limit: Optional[int] = None
+    if getattr(args, "textverify_max_items", None) is not None:
+        try:
+            limit_candidate = int(args.textverify_max_items)
+            if limit_candidate > 0:
+                limit = limit_candidate
+        except (TypeError, ValueError):
+            limit = None
+    if getattr(args, "textverify_gpu", None) is not None:
+        overrides["gpu_allowed"] = bool(args.textverify_gpu)
+    if not enabled:
+        LOGGER.info("Text verification disabled via settings.json (textverify.enable=false)")
+        print("Text verification disabled in settings; nothing to do.")
+        return 0
+    overrides["enable"] = True
+    if overrides:
+        verify_settings = verify_settings.with_overrides(**overrides)
+    mount_path = _expand_user_path(args.mount_path) if args.mount_path else None
+    if mount_path is None:
+        mount_path = _lookup_visual_mount(args.label, shard_db_path)
+    if mount_path is None:
+        LOGGER.error("Mount path required for text verification but not provided.")
+        print("[ERROR] --mount is required or drive must have been scanned with a mount path.", file=sys.stderr)
+        return 2
+    mount_path = Path(mount_path)
+    try:
+        perf_config = resolve_performance_config(str(mount_path), settings=settings_data)
+        gentle_sleep = verify_settings.gentle_sleep_ms / 1000.0
+        if getattr(perf_config, "gentle_io", False):
+            gentle_sleep = max(gentle_sleep, 0.01)
+    except Exception:
+        gentle_sleep = verify_settings.gentle_sleep_ms / 1000.0
+
+    def progress_callback(payload: Dict[str, object]) -> None:
+        try:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+    structure_cfg = load_structure_config(settings_data)
+    tv_cfg = load_tv_settings(settings_data)
+    LOGGER.info("Running text verification for %s", shard_db_path)
+    summary = run_textverify_for_shard(
+        shard_db_path,
+        settings=verify_settings,
+        mount_path=mount_path,
+        structure_settings=structure_cfg,
+        tv_settings=tv_cfg,
+        progress_callback=progress_callback,
+        gentle_sleep=gentle_sleep,
+        limit=limit,
+    )
+    print(
+        "Text verification complete — processed={processed} boosted_strong={strong} boosted_medium={medium} "
+        "flagged={flagged} skipped_no_subs={no_subs} skipped_no_plot={no_plot} elapsed={elapsed:.1f}s".format(
+            processed=summary.processed,
+            strong=summary.boosted_strong,
+            medium=summary.boosted_medium,
+            flagged=summary.flagged,
+            no_subs=summary.skipped_no_subs,
+            no_plot=summary.skipped_no_plot,
+            elapsed=summary.elapsed_s,
+        )
+    )
+    return 0
+
+
 def _run_docpreview_cli(
     args: argparse.Namespace,
     settings_data: Dict[str, object],
@@ -4032,6 +4159,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             Path(shard_db_path),
             mount_override,
         )
+    if getattr(args, "textverify", False) or getattr(args, "textverify_all", False):
+        return _run_textverify_cli(args, settings_data, Path(shard_db_path))
     if getattr(args, "docpreview", False):
         return _run_docpreview_cli(args, settings_data, Path(shard_db_path))
     if structure_requested:
