@@ -164,6 +164,7 @@ from tkinter import (
     Toplevel,
     StringVar,
     IntVar,
+    DoubleVar,
     END,
     N,
     S,
@@ -183,6 +184,14 @@ from gpu.capabilities import probe_gpu
 from gpu.runtime import get_hwaccel_args, select_provider
 from PIL import Image, ImageTk
 from visualreview import ReviewRunner, VisualReviewStore, load_visualreview_settings
+
+try:
+    from assistant import AssistantService, AssistantStatus
+    _ASSISTANT_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - optional dependency
+    AssistantService = None  # type: ignore[assignment]
+    AssistantStatus = None  # type: ignore[assignment]
+    _ASSISTANT_IMPORT_ERROR = exc
 
 # ---------------- Config & constantes ----------------
 WORKING_DIR_PATH = resolve_working_dir()
@@ -2254,6 +2263,56 @@ class App:
         self._quality_ffprobe_missing = not quality_ffprobe_available()
         self.quality_run_button: Optional[ttk.Button] = None
 
+        assistant_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_assistant = _SETTINGS.get("assistant")
+            if isinstance(maybe_assistant, dict):
+                assistant_cfg = maybe_assistant
+        rag_cfg = assistant_cfg.get("rag") if isinstance(assistant_cfg.get("rag"), dict) else {}
+        default_enable = bool(assistant_cfg.get("enable", False))
+        self.assistant_enabled_var = IntVar(value=1 if default_enable else 0)
+        self.assistant_use_rag_var = IntVar(value=1 if rag_cfg.get("enable", True) else 0)
+        self.assistant_tools_enabled_var = IntVar(value=1 if assistant_cfg.get("tools_enabled", True) else 0)
+        try:
+            default_budget = int(assistant_cfg.get("tool_budget", 20))
+        except (TypeError, ValueError):
+            default_budget = 20
+        self.assistant_budget_var = IntVar(value=default_budget)
+        self.assistant_runtime_var = StringVar(value=str(assistant_cfg.get("runtime", "auto")))
+        self.assistant_model_var = StringVar(value=str(assistant_cfg.get("model", "qwen2.5:7b-instruct")))
+        try:
+            default_temp = float(assistant_cfg.get("temperature", 0.3))
+        except (TypeError, ValueError):
+            default_temp = 0.3
+        self.assistant_temperature_var = DoubleVar(value=default_temp)
+        self.assistant_status_var = StringVar(value="Assistant disabled." if not default_enable else "Assistant idle.")
+        self.assistant_runtime_status_var = StringVar(value="Runtime: —")
+        self.assistant_budget_status_var = StringVar(value="Budget: —")
+        self.assistant_tool_log: List[Dict[str, object]] = []
+        self.assistant_last_answer: str = ""
+        self.assistant_service: Optional[AssistantService] = None
+        self.assistant_executor = ThreadPoolExecutor(max_workers=1)
+        self.assistant_tool_tree: Optional[ttk.Treeview] = None
+        self.assistant_chat_widget: Optional[ScrolledText] = None
+        self.assistant_input_var = StringVar(value="")
+        self.assistant_selected_payload: Optional[Dict[str, object]] = None
+        self.assistant_error_message: Optional[str] = None
+        self.assistant_send_button: Optional[ttk.Button] = None
+        self.assistant_create_task_button: Optional[ttk.Button] = None
+        self.assistant_open_button: Optional[ttk.Button] = None
+        self.assistant_copy_sql_button: Optional[ttk.Button] = None
+        self.assistant_enable_checkbox: Optional[ttk.Checkbutton] = None
+        self._assistant_controls: List[ttk.Widget] = []
+        self.assistant_tool_rows: Dict[str, Dict[str, object]] = {}
+        try:
+            self.assistant_default_top_k = int(rag_cfg.get("top_k", 8))
+        except (TypeError, ValueError):
+            self.assistant_default_top_k = 8
+        try:
+            self.assistant_default_min_score = float(rag_cfg.get("min_score", 0.25))
+        except (TypeError, ValueError):
+            self.assistant_default_min_score = 0.25
+
         self.audit_status_var = StringVar(value="Audit idle.")
         self.audit_summary_var = StringVar(value="Audit has not been run yet.")
         self.audit_baseline_var = StringVar(value="No baseline recorded.")
@@ -3069,6 +3128,11 @@ class App:
         self.music_tab.columnconfigure(0, weight=1)
         self.music_tab.rowconfigure(2, weight=1)
         self.main_notebook.add(self.music_tab, text="Music")
+        self.assistant_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.assistant_tab.columnconfigure(0, weight=1)
+        self.assistant_tab.rowconfigure(1, weight=1)
+        self.assistant_tab.rowconfigure(2, weight=1)
+        self.main_notebook.add(self.assistant_tab, text="Assistant")
 
         self._build_dashboard_controls(self.dashboard_tab)
         self._build_search_tab(self.search_tab)
@@ -3080,6 +3144,7 @@ class App:
         self._build_textlite_tab(self.textlite_tab)
         self._build_docpreview_tab(self.docpreview_tab)
         self._build_music_tab(self.music_tab)
+        self._build_assistant_tab(self.assistant_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -5979,6 +6044,450 @@ class App:
         self.music_conf_filter_combo.bind("<<ComboboxSelected>>", self._on_music_filters_changed)
         self.music_ext_filter_combo.bind("<<ComboboxSelected>>", self._on_music_filters_changed)
         self.refresh_music_results()
+
+    def _build_assistant_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        if AssistantService is None:
+            message = (
+                "Assistant dependencies unavailable. Install langgraph, langchain-core, sentence-transformers, llama-cpp-python."
+            )
+            if _ASSISTANT_IMPORT_ERROR:
+                message += f"\nReason: {_ASSISTANT_IMPORT_ERROR}"
+            ttk.Label(parent, text=message, style="StatusDanger.TLabel", wraplength=640, justify="left").grid(
+                row=0, column=0, sticky="nw", pady=16, padx=12
+            )
+            return
+
+        controls = ttk.LabelFrame(parent, text="Configuration", padding=(16, 12), style="Card.TLabelframe")
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(5, weight=1)
+
+        enable_chk = ttk.Checkbutton(
+            controls,
+            text="Enable assistant",
+            variable=self.assistant_enabled_var,
+            command=self._on_assistant_toggle,
+        )
+        enable_chk.grid(row=0, column=0, sticky="w")
+        self.assistant_enable_checkbox = enable_chk
+
+        rag_chk = ttk.Checkbutton(
+            controls,
+            text="Use RAG",
+            variable=self.assistant_use_rag_var,
+            command=self._on_assistant_settings_changed,
+        )
+        rag_chk.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self._assistant_controls.append(rag_chk)
+
+        tools_chk = ttk.Checkbutton(
+            controls,
+            text="Tools enabled",
+            variable=self.assistant_tools_enabled_var,
+            command=self._on_assistant_settings_changed,
+        )
+        tools_chk.grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self._assistant_controls.append(tools_chk)
+
+        ttk.Label(controls, text="Runtime:").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        runtime_combo = ttk.Combobox(
+            controls,
+            textvariable=self.assistant_runtime_var,
+            state="readonly",
+            values=("auto", "ollama", "llama_cpp", "mlc"),
+        )
+        runtime_combo.grid(row=1, column=1, sticky="w", pady=(10, 0))
+        runtime_combo.bind("<<ComboboxSelected>>", lambda _evt: self._on_assistant_settings_changed())
+        self._assistant_controls.append(runtime_combo)
+
+        ttk.Label(controls, text="Model:").grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(10, 0))
+        model_entry = ttk.Entry(controls, textvariable=self.assistant_model_var, width=26)
+        model_entry.grid(row=1, column=3, sticky="w", pady=(10, 0))
+        model_entry.bind("<FocusOut>", lambda _evt: self._on_assistant_settings_changed())
+        self._assistant_controls.append(model_entry)
+
+        ttk.Label(controls, text="Temperature:").grid(row=1, column=4, sticky="e", padx=(12, 0), pady=(10, 0))
+        temp_spin = Spinbox(
+            controls,
+            from_=0.0,
+            to=1.5,
+            increment=0.05,
+            textvariable=self.assistant_temperature_var,
+            width=6,
+            command=self._on_assistant_settings_changed,
+        )
+        temp_spin.grid(row=1, column=5, sticky="w", pady=(10, 0))
+        temp_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        temp_spin.bind("<FocusOut>", lambda _evt: self._on_assistant_settings_changed())
+        self._assistant_controls.append(temp_spin)
+
+        ttk.Label(controls, text="Budget per session:").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        budget_spin = Spinbox(
+            controls,
+            from_=1,
+            to=40,
+            textvariable=self.assistant_budget_var,
+            width=6,
+            command=self._on_assistant_settings_changed,
+        )
+        budget_spin.grid(row=2, column=1, sticky="w", pady=(12, 0))
+        budget_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        budget_spin.bind("<FocusOut>", lambda _evt: self._on_assistant_settings_changed())
+        self._assistant_controls.append(budget_spin)
+
+        ttk.Button(controls, text="Refresh index", command=self._refresh_assistant_index).grid(
+            row=2, column=2, sticky="w", padx=(12, 0), pady=(12, 0)
+        )
+
+        ttk.Label(controls, textvariable=self.assistant_status_var, style="Subtle.TLabel").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(12, 0)
+        )
+        ttk.Label(controls, textvariable=self.assistant_runtime_status_var, style="Subtle.TLabel").grid(
+            row=3, column=3, columnspan=2, sticky="w", pady=(12, 0)
+        )
+        ttk.Label(controls, textvariable=self.assistant_budget_status_var, style="Subtle.TLabel").grid(
+            row=3, column=5, sticky="e", pady=(12, 0)
+        )
+
+        chat_frame = ttk.LabelFrame(parent, text="Chat", padding=(16, 12), style="Card.TLabelframe")
+        chat_frame.grid(row=1, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        chat_frame.columnconfigure(0, weight=1)
+        chat_frame.rowconfigure(0, weight=1)
+        self.assistant_chat_widget = ScrolledText(chat_frame, height=12, wrap="word", state="disabled")
+        self.assistant_chat_widget.grid(row=0, column=0, sticky=(N, S, E, W))
+
+        tool_frame = ttk.LabelFrame(parent, text="Tool calls", padding=(16, 12), style="Card.TLabelframe")
+        tool_frame.grid(row=2, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        tool_frame.columnconfigure(0, weight=1)
+        tool_frame.rowconfigure(0, weight=1)
+        columns = ("tool", "summary")
+        self.assistant_tool_tree = ttk.Treeview(tool_frame, columns=columns, show="headings", height=6, style="Card.Treeview")
+        self.assistant_tool_tree.heading("tool", text="Tool")
+        self.assistant_tool_tree.heading("summary", text="Summary")
+        self.assistant_tool_tree.column("tool", width=140, anchor="w", stretch=False)
+        self.assistant_tool_tree.column("summary", width=520, anchor="w", stretch=True)
+        self.assistant_tool_tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        self.assistant_tool_tree.bind("<<TreeviewSelect>>", self._on_assistant_tool_select)
+        tool_scroll = ttk.Scrollbar(tool_frame, orient="vertical", command=self.assistant_tool_tree.yview)
+        tool_scroll.grid(row=0, column=1, sticky=(N, S))
+        self.assistant_tool_tree.configure(yscrollcommand=tool_scroll.set)
+
+        input_frame = ttk.Frame(parent, padding=(0, 12, 0, 0), style="Card.TFrame")
+        input_frame.grid(row=3, column=0, sticky="ew")
+        input_frame.columnconfigure(1, weight=1)
+        ttk.Label(input_frame, text="Ask:").grid(row=0, column=0, sticky="w", padx=(0, 12))
+        entry = ttk.Entry(input_frame, textvariable=self.assistant_input_var)
+        entry.grid(row=0, column=1, sticky="ew")
+        entry.bind("<Return>", lambda _evt: self._ask_assistant())
+        self.assistant_send_button = ttk.Button(input_frame, text="Send", command=self._ask_assistant, style="Accent.TButton")
+        self.assistant_send_button.grid(row=0, column=2, sticky="ew", padx=(12, 0))
+
+        buttons_frame = ttk.Frame(parent, padding=(0, 8, 0, 12), style="Card.TFrame")
+        buttons_frame.grid(row=4, column=0, sticky="ew")
+        buttons_frame.columnconfigure(3, weight=1)
+        self.assistant_create_task_button = ttk.Button(
+            buttons_frame, text="Create task from answer", command=self._assistant_create_task_from_answer
+        )
+        self.assistant_create_task_button.grid(row=0, column=0, sticky="w")
+        self.assistant_open_button = ttk.Button(
+            buttons_frame, text="Open folder", command=self._assistant_open_folder
+        )
+        self.assistant_open_button.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.assistant_copy_sql_button = ttk.Button(
+            buttons_frame, text="Copy SQL", command=self._assistant_copy_sql
+        )
+        self.assistant_copy_sql_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
+
+        self._assistant_controls.extend(
+            [
+                entry,
+                self.assistant_send_button,
+                self.assistant_create_task_button,
+                self.assistant_open_button,
+                self.assistant_copy_sql_button,
+            ]
+        )
+        self._update_assistant_controls_state()
+
+    def _update_assistant_controls_state(self) -> None:
+        enabled = bool(self.assistant_enabled_var.get())
+        state = "normal" if enabled else "disabled"
+        for widget in list(self._assistant_controls):
+            try:
+                widget.configure(state=state)
+            except Exception:
+                continue
+        if self.assistant_enable_checkbox is not None:
+            try:
+                self.assistant_enable_checkbox.configure(state="normal")
+            except Exception:
+                pass
+        if not enabled:
+            self.assistant_status_var.set("Assistant disabled.")
+        elif not self.assistant_status_var.get().strip():
+            self.assistant_status_var.set("Assistant idle.")
+
+    def _assistant_settings_payload(self) -> Dict[str, object]:
+        temperature = float(self.assistant_temperature_var.get() or 0.3)
+        temperature = max(0.0, min(1.5, temperature))
+        try:
+            budget = int(self.assistant_budget_var.get())
+        except (TypeError, ValueError):
+            budget = 20
+        budget = max(1, min(40, budget))
+        rag_enabled = bool(self.assistant_use_rag_var.get())
+        return {
+            "enable": bool(self.assistant_enabled_var.get()),
+            "runtime": (self.assistant_runtime_var.get() or "auto").strip() or "auto",
+            "model": (self.assistant_model_var.get() or "qwen2.5:7b-instruct").strip(),
+            "ctx": 8192,
+            "temperature": temperature,
+            "tools_enabled": bool(self.assistant_tools_enabled_var.get()),
+            "tool_budget": budget,
+            "rag": {
+                "enable": rag_enabled,
+                "top_k": self.assistant_default_top_k,
+                "min_score": self.assistant_default_min_score,
+                "embed_model": "bge-small-en",
+                "index": "faiss",
+                "refresh_on_start": False,
+            },
+        }
+
+    def _save_assistant_settings(self) -> None:
+        payload = self._assistant_settings_payload()
+        update_settings(WORKING_DIR_PATH, assistant=payload)
+        self._invalidate_assistant_service()
+
+    def _on_assistant_toggle(self) -> None:
+        self._save_assistant_settings()
+        if not self.assistant_enabled_var.get():
+            self.assistant_status_var.set("Assistant disabled.")
+        self._update_assistant_controls_state()
+
+    def _on_assistant_settings_changed(self, *_evt) -> None:
+        self._save_assistant_settings()
+        self._update_assistant_controls_state()
+
+    def _invalidate_assistant_service(self) -> None:
+        if self.assistant_service is not None:
+            try:
+                self.assistant_service.shutdown()
+            except Exception:
+                pass
+        self.assistant_service = None
+
+    def _ensure_assistant_service(self) -> AssistantService:
+        if AssistantService is None:
+            raise RuntimeError("Assistant dependencies are not installed.")
+        if not self.assistant_enabled_var.get():
+            raise RuntimeError("Assistant is disabled in settings.")
+        if self.assistant_service is None:
+            settings_payload = load_settings(WORKING_DIR_PATH)
+            db_path = Path(self.db_path.get())
+            self.assistant_service = AssistantService(settings_payload, WORKING_DIR_PATH, db_path)
+            status = self.assistant_service.ensure_ready()
+            self._update_assistant_status(status)
+        return self.assistant_service
+
+    def _refresh_assistant_index(self) -> None:
+        if not self.assistant_enabled_var.get():
+            messagebox.showinfo("Assistant", "Enable the assistant before refreshing the index.")
+            return
+        self.assistant_status_var.set("Refreshing index…")
+
+        def _task():
+            try:
+                service = self._ensure_assistant_service()
+                service.refresh_index()
+                status = service.status()
+            except Exception as exc:
+                self.root.after(0, lambda: self._on_assistant_error(f"Index refresh failed: {exc}"))
+            else:
+                self.root.after(0, lambda: self._on_assistant_result({"answer": "Index refreshed.", "tool_log": [], "status": status}))
+
+        self.assistant_executor.submit(_task)
+
+    def _ask_assistant(self) -> None:
+        if not self.assistant_enabled_var.get():
+            messagebox.showinfo("Assistant", "Enable the assistant to start chatting.")
+            return
+        text = self.assistant_input_var.get().strip()
+        if not text:
+            return
+        self.assistant_input_var.set("")
+        self._append_assistant_chat("You", text)
+        self.assistant_status_var.set("Assistant thinking…")
+        if self.assistant_send_button is not None:
+            self.assistant_send_button.configure(state="disabled")
+
+        def _task() -> None:
+            try:
+                service = self._ensure_assistant_service()
+                result = service.ask(text, use_rag=bool(self.assistant_use_rag_var.get()))
+            except Exception as exc:
+                self.root.after(0, lambda: self._on_assistant_error(str(exc)))
+            else:
+                self.root.after(0, lambda: self._on_assistant_result(result))
+
+        self.assistant_executor.submit(_task)
+
+    def _append_assistant_chat(self, speaker: str, content: str) -> None:
+        if not self.assistant_chat_widget:
+            return
+        widget = self.assistant_chat_widget
+        widget.configure(state="normal")
+        widget.insert("end", f"{speaker}: {content}\n\n")
+        widget.configure(state="disabled")
+        widget.see("end")
+
+    def _on_assistant_result(self, result: Dict[str, object]) -> None:
+        answer = result.get("answer") if isinstance(result, dict) else None
+        if isinstance(answer, str) and answer.strip():
+            self.assistant_last_answer = answer.strip()
+            self._append_assistant_chat("Assistant", self.assistant_last_answer)
+        status_payload = result.get("status") if isinstance(result, dict) else None
+        if isinstance(status_payload, AssistantStatus):
+            self._update_assistant_status(status_payload)
+        elif isinstance(status_payload, dict):
+            try:
+                status_obj = AssistantStatus(**status_payload)
+            except Exception:
+                status_obj = None
+            if status_obj:
+                self._update_assistant_status(status_obj)
+        tool_log = result.get("tool_log") if isinstance(result, dict) else None
+        self.assistant_tool_rows.clear()
+        if self.assistant_tool_tree is not None:
+            tree = self.assistant_tool_tree
+            for item in tree.get_children():
+                tree.delete(item)
+            if isinstance(tool_log, list):
+                for idx, entry in enumerate(tool_log):
+                    tool_name = entry.get("tool") if isinstance(entry, dict) else None
+                    payload = entry.get("payload") if isinstance(entry, dict) else None
+                    summary = json.dumps(payload, ensure_ascii=False) if payload is not None else ""
+                    if len(summary) > 160:
+                        summary = summary[:157] + "…"
+                    item_id = tree.insert("", "end", values=(tool_name or "?", summary))
+                    if isinstance(entry, dict):
+                        self.assistant_tool_rows[item_id] = entry
+        self.assistant_selected_payload = None
+        if self.assistant_send_button is not None:
+            self.assistant_send_button.configure(state="normal")
+        if not answer:
+            self.assistant_status_var.set("Assistant ready.")
+
+    def _on_assistant_error(self, message: str) -> None:
+        self.assistant_status_var.set(f"Assistant error: {message}")
+        self._append_assistant_chat("System", message)
+        if self.assistant_send_button is not None:
+            self.assistant_send_button.configure(state="normal")
+
+    def _on_assistant_tool_select(self, _event) -> None:
+        if not self.assistant_tool_tree:
+            return
+        selection = self.assistant_tool_tree.selection()
+        if not selection:
+            self.assistant_selected_payload = None
+            return
+        self.assistant_selected_payload = self.assistant_tool_rows.get(selection[0])
+
+    def _assistant_create_task_from_answer(self) -> None:
+        if not self.assistant_last_answer.strip():
+            messagebox.showinfo("Assistant", "Ask a question first to generate an answer.")
+            return
+        try:
+            service = self._ensure_assistant_service()
+            title = self.assistant_last_answer.strip().splitlines()[0][:120]
+            service.tooling.execute(
+                "create_task",
+                {"title": title or "Assistant follow-up", "details": self.assistant_last_answer, "priority": "normal"},
+            )
+            messagebox.showinfo("Assistant", "Task created in catalog.")
+        except Exception as exc:
+            messagebox.showerror("Assistant", f"Unable to create task: {exc}")
+
+    def _assistant_open_folder(self) -> None:
+        entry = self.assistant_selected_payload or {}
+        payload = entry.get("payload") if isinstance(entry, dict) else entry
+        path = None
+        if isinstance(payload, dict):
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+            if isinstance(result, dict):
+                path = result.get("path")
+                if not path:
+                    paths = result.get("paths")
+                    if isinstance(paths, list) and paths:
+                        first = paths[0]
+                        if isinstance(first, dict):
+                            path = first.get("path")
+                        elif isinstance(first, str):
+                            path = first
+            if not path:
+                arguments = payload.get("arguments")
+                if isinstance(arguments, dict):
+                    path = arguments.get("path")
+        if not path:
+            messagebox.showinfo("Assistant", "Select a tool result that includes a path.")
+            return
+        try:
+            service = self._ensure_assistant_service()
+            plan = service.tooling.execute("help_open_folder", {"path": path})
+            resolved = None
+            result = plan.get("result") if isinstance(plan, dict) else None
+            if isinstance(result, dict):
+                resolved = result.get("path") or result.get("plan", {}).get("path")
+            if not resolved:
+                resolved = path
+            if os.name == "nt":
+                os.startfile(resolved)
+            else:
+                subprocess.Popen(["xdg-open", resolved])
+        except Exception as exc:
+            messagebox.showerror("Assistant", f"Unable to open folder: {exc}")
+
+    def _assistant_copy_sql(self) -> None:
+        entry = self.assistant_selected_payload or {}
+        payload = entry.get("payload") if isinstance(entry, dict) else entry
+        sql = None
+        if isinstance(payload, dict):
+            arguments = payload.get("arguments")
+            if isinstance(arguments, dict):
+                sql = arguments.get("sql")
+        if not sql:
+            messagebox.showinfo("Assistant", "Select a database tool call with SQL to copy.")
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(sql)
+            self._show_toast("SQL copied to clipboard", "info")
+        except Exception as exc:
+            messagebox.showerror("Assistant", f"Unable to copy SQL: {exc}")
+
+    def _update_assistant_status(self, status: AssistantStatus) -> None:
+        gpu_flag = "GPU" if status.uses_gpu else "CPU"
+        self.assistant_runtime_status_var.set(f"Runtime: {status.runtime} ({gpu_flag})")
+        self.assistant_budget_status_var.set(
+            f"Budget: {status.remaining_budget}/{status.tool_budget}"
+        )
+        if status.rag_enabled:
+            self.assistant_status_var.set("Assistant ready. RAG enabled.")
+        else:
+            self.assistant_status_var.set("Assistant ready. RAG disabled.")
+
 
     def _sync_music_filter_controls(self) -> None:
         if hasattr(self, "music_conf_filter_combo"):
@@ -10116,6 +10625,15 @@ class App:
         if self.audit_worker and self.audit_worker.is_alive():
             if self.audit_cancel:
                 self.audit_cancel.set()
+        try:
+            self.assistant_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        if self.assistant_service is not None:
+            try:
+                self.assistant_service.shutdown()
+            except Exception:
+                pass
         if self.worker and self.worker.is_alive():
             if self.stop_evt:
                 self.stop_evt.set()

@@ -27,6 +27,7 @@ _ALLOWED_STRUCTURE: Dict[str, Any] = {
     "delta_scan": "*",
     "gpu": "*",
     "api": "*",
+    "assistant": "*",
     "structure": "*",
     "docpreview": "*",
     "textlite": "*",
