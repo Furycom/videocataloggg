@@ -1,0 +1,173 @@
+.container {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 1.5rem;
+}
+
+.sidebar {
+  background: rgba(16, 20, 28, 0.85);
+  border-radius: 18px;
+  padding: 1rem 1.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  position: sticky;
+  top: 5.5rem;
+  max-height: calc(100vh - 6rem);
+  overflow-y: auto;
+}
+
+.filterGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.8rem;
+}
+
+.filterGroup input,
+.sidebar input {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 0.35rem 0.55rem;
+  border-radius: 8px;
+  color: #fff;
+}
+
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  margin-bottom: 0.9rem;
+}
+
+.seriesList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.seriesList button {
+  width: 100%;
+  border: none;
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  padding: 0.5rem 0.65rem;
+  border-radius: 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+}
+
+.seriesList button:hover,
+.seriesActive {
+  background: rgba(59, 130, 246, 0.2);
+}
+
+.seriesMeta {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.main {
+  background: rgba(17, 24, 33, 0.82);
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 1.5rem 1.75rem;
+}
+
+.seriesHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.seriesSubtitle {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.seasonsRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.seasonPill {
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 999px;
+  padding: 0.4rem 0.8rem;
+  color: #fff;
+  cursor: pointer;
+}
+
+.episodeGrid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+
+.episodeCard {
+  background: rgba(15, 19, 26, 0.88);
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.episodeCard button {
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  cursor: pointer;
+}
+
+.episodePoster {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: rgba(255, 255, 255, 0.05);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.episodePoster img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.posterFallback {
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.episodeBody {
+  padding: 0.75rem 0.85rem 1rem;
+}
+
+.episodeBody h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+
+.episodeMeta {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.85rem;
+}
+
+.placeholder {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.error {
+  color: #f87171;
+}
