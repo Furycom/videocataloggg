@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 from .apiguard import ApiGuard
 from .config import AssistantSettings
 from .rag import VectorIndex
+from diagnostics.tools import DiagnosticsTools
 
 LOGGER = logging.getLogger("videocatalog.assistant.tools")
 
@@ -55,6 +56,7 @@ class AssistantTooling:
         self.dashboard = dashboard
         self.api_guard = ApiGuard(working_dir, tmdb_api_key, dashboard=dashboard)
         self._ensure_views()
+        self.diagnostics = DiagnosticsTools(working_dir)
 
     # ------------------------------------------------------------------
     def reset_budget(self, budget: Optional[int] = None) -> None:
@@ -158,6 +160,59 @@ class AssistantTooling:
                     "type": "object",
                     "properties": {"path": {"type": "string"}},
                     "required": ["path"],
+                },
+            ),
+            ToolDefinition(
+                name="diag_run_preflight",
+                description="Run diagnostics preflight checks (GPU, tools, settings).",
+                parameters={"type": "object", "properties": {}, "required": []},
+            ),
+            ToolDefinition(
+                name="diag_run_smoke",
+                description="Run lightweight smoke tests for selected subsystems.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "subsystems": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "budget": {"type": "integer", "minimum": 1, "maximum": 6},
+                    },
+                },
+            ),
+            ToolDefinition(
+                name="diag_get_logs",
+                description="Fetch recent diagnostics log lines.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "object"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200},
+                    },
+                },
+            ),
+            ToolDefinition(
+                name="diag_get_metrics",
+                description="Compute latency and cache metrics from diagnostics logs.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "window_min": {"type": "integer", "minimum": 1, "maximum": 720, "default": 60},
+                    },
+                },
+            ),
+            ToolDefinition(
+                name="diag_sql",
+                description="Run a read-only SELECT against diagnostics views (preflight_checks, smoke_checks, log_events).",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "view": {"type": "string", "enum": ["preflight_checks", "smoke_checks", "log_events"]},
+                        "where": {"type": "object"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                    },
+                    "required": ["view"],
                 },
             ),
         ]
@@ -581,6 +636,34 @@ class AssistantTooling:
     def _tool_help_open_folder(self, path: str) -> Dict[str, Any]:
         resolved = str(Path(path))
         return {"action": "open", "path": resolved}
+
+    def _tool_diag_run_preflight(self) -> Dict[str, Any]:
+        return self.diagnostics.diag_run_preflight()
+
+    def _tool_diag_run_smoke(
+        self,
+        subsystems: Optional[List[str]] = None,
+        budget: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self.diagnostics.diag_run_smoke(subsystems, budget=budget)
+
+    def _tool_diag_get_logs(
+        self,
+        query: Optional[Dict[str, Any]] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        return self.diagnostics.diag_get_logs(query=query, limit=limit)
+
+    def _tool_diag_get_metrics(self, window_min: int = 60) -> Dict[str, Any]:
+        return self.diagnostics.diag_get_metrics(window_min=window_min)
+
+    def _tool_diag_sql(
+        self,
+        view: str,
+        where: Optional[Dict[str, Any]] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        return self.diagnostics.diag_sql(view, where=where, limit=limit)
 
     # ------------------------------------------------------------------
     def _ensure_db(self) -> None:

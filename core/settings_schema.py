@@ -33,6 +33,7 @@ _ALLOWED_STRUCTURE: Dict[str, Any] = {
     "docpreview": "*",
     "textlite": "*",
     "textverify": "*",
+    "diagnostics": "*",
     "working_dir": None,
     "catalog_db": None,
     "version": None,

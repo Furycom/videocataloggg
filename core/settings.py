@@ -277,6 +277,24 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "sheet_quality": 80,
         "sheet_optimize": True,
     },
+    "diagnostics": {
+        "enable": True,
+        "gpu_hard_requirement": True,
+        "smoke_timeouts_s": {
+            "movies": 10,
+            "tv": 10,
+            "apiguard": 10,
+            "visual": 10,
+            "docs": 10,
+            "assistant": 10,
+        },
+        "sample_sizes": {
+            "movies": 5,
+            "tv": 5,
+            "docs": 3,
+        },
+        "logs_keep_days": 14,
+    },
 }
 
 
