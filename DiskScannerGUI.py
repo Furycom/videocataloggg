@@ -20,6 +20,7 @@ from quality.ffprobe import ffprobe_available as quality_ffprobe_available
 from textverify import TextVerifySettings
 from robust import CancellationToken
 from musicnames import parse_music_name, score_parse_result
+from audit.run import AuditRequest, AuditCancelledError, run_audit_pack
 
 from db_maint import (
     MaintenanceOptions,
@@ -2127,6 +2128,25 @@ class App:
         self._quality_ffprobe_missing = not quality_ffprobe_available()
         self.quality_run_button: Optional[ttk.Button] = None
 
+        self.audit_status_var = StringVar(value="Audit idle.")
+        self.audit_summary_var = StringVar(value="Audit has not been run yet.")
+        self.audit_baseline_var = StringVar(value="No baseline recorded.")
+        self.audit_delta_var = StringVar(value="")
+        self.audit_movies_var = StringVar(value="Videos: 0 high=0 medium=0 low=0")
+        self.audit_episodes_var = StringVar(value="Episodes: 0 high=0 medium=0 low=0")
+        self.audit_queue_var = StringVar(value="Review queue movies=0 episodes=0")
+        self.audit_duplicates_var = StringVar(value="Duplicates=0")
+        self.audit_unresolved_var = StringVar(value="Unresolved movies=0 episodes=0")
+        self.audit_quality_flags_var = StringVar(value="Quality flags: —")
+        self.audit_export_dir: Optional[Path] = None
+        self.audit_worker: Optional[threading.Thread] = None
+        self.audit_cancel: Optional[CancellationToken] = None
+        self.audit_last_result: Optional[dict] = None
+        self.audit_run_button: Optional[ttk.Button] = None
+        self.audit_export_button: Optional[ttk.Button] = None
+        self.audit_open_button: Optional[ttk.Button] = None
+        self.audit_update_baseline_var = IntVar(value=0)
+
         music_cfg: Dict[str, object] = {}
         if isinstance(_SETTINGS, dict):
             maybe_music = _SETTINGS.get("musicnames")
@@ -2907,6 +2927,10 @@ class App:
         self.quality_tab.columnconfigure(0, weight=1)
         self.quality_tab.rowconfigure(2, weight=1)
         self.main_notebook.add(self.quality_tab, text="Quality")
+        self.audit_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.audit_tab.columnconfigure(0, weight=1)
+        self.audit_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.audit_tab, text="Audit")
         self.docpreview_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
         self.docpreview_tab.columnconfigure(0, weight=1)
         self.docpreview_tab.rowconfigure(1, weight=1)
@@ -2922,6 +2946,7 @@ class App:
         self._build_reports_tab(self.reports_tab)
         self._build_structure_tab(self.structure_tab)
         self._build_quality_tab(self.quality_tab)
+        self._build_audit_tab(self.audit_tab)
         self._build_docpreview_tab(self.docpreview_tab)
         self._build_music_tab(self.music_tab)
 
@@ -3834,6 +3859,293 @@ class App:
             style="Subtle.TLabel",
         ).grid(row=0, column=0, sticky="w")
         self._clear_structure_preview()
+
+    def _build_audit_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        controls = ttk.LabelFrame(parent, text="Controls", padding=(16, 12), style="Card.TLabelframe")
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        controls.columnconfigure(0, weight=1)
+        ttk.Label(controls, textvariable=self.audit_status_var, style="HeaderSubtitle.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w"
+        )
+        button_bar = ttk.Frame(controls, style="Card.TFrame")
+        button_bar.grid(row=1, column=0, sticky="w", pady=(12, 0))
+        self.audit_run_button = ttk.Button(
+            button_bar,
+            text="Run Audit",
+            command=self.request_audit_summary,
+            style="Accent.TButton",
+        )
+        self.audit_run_button.grid(row=0, column=0, padx=(0, 8))
+        self.audit_export_button = ttk.Button(
+            button_bar,
+            text="Export…",
+            command=self.request_audit_export,
+        )
+        self.audit_export_button.grid(row=0, column=1, padx=(0, 8))
+        self.audit_open_button = ttk.Button(
+            button_bar,
+            text="Open exports folder",
+            command=self.open_audit_export_folder,
+            state="disabled",
+        )
+        self.audit_open_button.grid(row=0, column=2)
+        ttk.Checkbutton(
+            controls,
+            text="Update baseline after run",
+            variable=self.audit_update_baseline_var,
+        ).grid(row=2, column=0, sticky="w", pady=(12, 0))
+
+        totals = ttk.LabelFrame(parent, text="Metrics", padding=(16, 12), style="Card.TLabelframe")
+        totals.grid(row=1, column=0, sticky="nsew")
+        totals.columnconfigure(0, weight=1)
+        ttk.Label(totals, textvariable=self.audit_movies_var, style="Value.TLabel").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(totals, textvariable=self.audit_episodes_var, style="Value.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(totals, textvariable=self.audit_queue_var, style="Value.TLabel").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(totals, textvariable=self.audit_duplicates_var, style="Value.TLabel").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(totals, textvariable=self.audit_unresolved_var, style="Value.TLabel").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(totals, textvariable=self.audit_quality_flags_var, style="Value.TLabel").grid(
+            row=5, column=0, sticky="w", pady=2
+        )
+
+        baseline = ttk.LabelFrame(parent, text="Baseline & Delta", padding=(16, 12), style="Card.TLabelframe")
+        baseline.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        baseline.columnconfigure(0, weight=1)
+        ttk.Label(baseline, textvariable=self.audit_baseline_var, style="Value.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(baseline, textvariable=self.audit_delta_var, style="Value.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+
+    def request_audit_summary(self) -> None:
+        self._start_audit_job(
+            AuditRequest(
+                export=False,
+                create_baseline=bool(self.audit_update_baseline_var.get()),
+                compare_delta=True,
+            )
+        )
+
+    def request_audit_export(self) -> None:
+        self._start_audit_job(
+            AuditRequest(
+                export=True,
+                create_baseline=bool(self.audit_update_baseline_var.get()),
+                compare_delta=True,
+            )
+        )
+
+    def _start_audit_job(self, request: AuditRequest) -> None:
+        if self.audit_worker and self.audit_worker.is_alive():
+            self.show_banner("Audit already running.", "INFO")
+            return
+        db_path = (self.db_path.get() or "").strip()
+        if not db_path:
+            messagebox.showerror("Audit", "Select a catalog database first.")
+            return
+        self.audit_status_var.set("Audit running…")
+        if self.audit_run_button:
+            self.audit_run_button.configure(state="disabled")
+        if self.audit_export_button:
+            self.audit_export_button.configure(state="disabled")
+        if self.audit_open_button:
+            self.audit_open_button.configure(state="disabled")
+        self.audit_cancel = CancellationToken()
+        self.audit_export_dir = None
+        self.audit_last_result = None
+
+        def progress(stage: str, payload: dict) -> None:
+            try:
+                self.worker_queue.put({"type": "audit-progress", "stage": stage, "payload": payload})
+            except Exception:
+                pass
+
+        def heartbeat(message: str) -> None:
+            try:
+                self.worker_queue.put({"type": "audit-heartbeat", "message": message})
+            except Exception:
+                pass
+
+        def worker() -> None:
+            try:
+                result = run_audit_pack(
+                    db_path,
+                    WORKING_DIR_PATH,
+                    request,
+                    progress_cb=progress,
+                    heartbeat_cb=heartbeat,
+                    cancellation=self.audit_cancel,
+                )
+            except AuditCancelledError:
+                self.worker_queue.put({"type": "audit-complete", "cancelled": True})
+                return
+            except Exception as exc:
+                self.worker_queue.put({"type": "audit-complete", "error": str(exc)})
+                return
+            payload = {"summary": result.summary.as_dict()}
+            if result.export:
+                payload["export_dir"] = str(result.export.directory)
+                payload["export_files"] = [str(path) for path in result.export.files]
+            if result.created_baseline:
+                payload["created_baseline"] = result.created_baseline.as_dict()
+            if result.latest_baseline:
+                payload["latest_baseline"] = result.latest_baseline.as_dict()
+            if result.delta:
+                payload["delta"] = result.delta.as_dict()
+            self.worker_queue.put({"type": "audit-complete", "result": payload})
+
+        self.audit_worker = threading.Thread(target=worker, daemon=True)
+        self.audit_worker.start()
+
+    def open_audit_export_folder(self) -> None:
+        if not self.audit_export_dir or not self.audit_export_dir.exists():
+            messagebox.showinfo("Audit", "No audit exports available yet.")
+            return
+        self._open_path_in_explorer(str(self.audit_export_dir))
+
+    def _apply_audit_summary(self, summary: dict) -> None:
+        if not summary:
+            return
+        generated = summary.get("generated_utc")
+        if generated:
+            self.audit_summary_var.set(f"Summary generated at {generated}")
+        movies = summary.get("movies", {})
+        self.audit_movies_var.set(
+            "Videos: {total} high={high} medium={medium} low={low}".format(
+                total=int(movies.get("total", 0)),
+                high=int(movies.get("high", 0)),
+                medium=int(movies.get("medium", 0)),
+                low=int(movies.get("low", 0)),
+            )
+        )
+        episodes = summary.get("episodes", {})
+        self.audit_episodes_var.set(
+            "Episodes: {total} high={high} medium={medium} low={low}".format(
+                total=int(episodes.get("total", 0)),
+                high=int(episodes.get("high", 0)),
+                medium=int(episodes.get("medium", 0)),
+                low=int(episodes.get("low", 0)),
+            )
+        )
+        queue = summary.get("review_queue", {})
+        self.audit_queue_var.set(
+            "Review queue movies={movies} episodes={episodes}".format(
+                movies=int(queue.get("movies", 0)),
+                episodes=int(queue.get("episodes", 0)),
+            )
+        )
+        duplicates = int(summary.get("duplicate_pairs", 0))
+        self.audit_duplicates_var.set(f"Duplicates={duplicates}")
+        unresolved_movies = int(summary.get("unresolved_movies", 0))
+        unresolved_episodes = int(summary.get("unresolved_episodes", 0))
+        self.audit_unresolved_var.set(
+            f"Unresolved movies={unresolved_movies} episodes={unresolved_episodes}"
+        )
+        quality_flags = summary.get("quality_flags")
+        if quality_flags is None:
+            self.audit_quality_flags_var.set("Quality flags: table unavailable")
+        else:
+            self.audit_quality_flags_var.set(f"Quality flags={int(quality_flags)}")
+
+    def _apply_audit_baseline(self, result: dict) -> None:
+        baseline = result.get("created_baseline") or result.get("latest_baseline")
+        if baseline:
+            created = baseline.get("created_utc")
+            self.audit_baseline_var.set(f"Latest baseline: {created}")
+        else:
+            self.audit_baseline_var.set("No baseline recorded.")
+        delta = result.get("delta")
+        if delta:
+            self.audit_delta_var.set(
+                "Δ videos +{add_v}/-{rem_v} • episodes +{add_e}/-{rem_e} • dupes +{add_d}/-{rem_d}".format(
+                    add_v=int(delta.get("added_videos", 0)),
+                    rem_v=int(delta.get("removed_videos", 0)),
+                    add_e=int(delta.get("added_episodes", 0)),
+                    rem_e=int(delta.get("removed_episodes", 0)),
+                    add_d=int(delta.get("new_duplicates", 0)),
+                    rem_d=int(delta.get("resolved_duplicates", 0)),
+                )
+            )
+        else:
+            self.audit_delta_var.set("")
+
+    def _handle_audit_complete(self, event: dict) -> None:
+        self.audit_worker = None
+        self.audit_cancel = None
+        if self.audit_run_button:
+            self.audit_run_button.configure(state="normal")
+        if self.audit_export_button:
+            self.audit_export_button.configure(state="normal")
+        cancelled = bool(event.get("cancelled"))
+        error = event.get("error")
+        data = event.get("result") or {}
+        if cancelled:
+            self.audit_status_var.set("Audit cancelled.")
+            return
+        if error:
+            self.audit_status_var.set("Audit failed.")
+            messagebox.showerror("Audit", error)
+            return
+        self.audit_status_var.set("Audit complete.")
+        self.audit_last_result = data
+        summary = data.get("summary") or {}
+        self._apply_audit_summary(summary)
+        self._apply_audit_baseline(data)
+        export_dir = data.get("export_dir")
+        if export_dir:
+            try:
+                self.audit_export_dir = Path(export_dir)
+            except Exception:
+                self.audit_export_dir = None
+        else:
+            self.audit_export_dir = None
+        if self.audit_open_button:
+            if self.audit_export_dir and self.audit_export_dir.exists():
+                self.audit_open_button.configure(state="normal")
+            else:
+                self.audit_open_button.configure(state="disabled")
+
+    def refresh_audit_panel(self) -> None:
+        if self.audit_last_result:
+            return
+        db_path = (self.db_path.get() or "").strip()
+        if not db_path:
+            self.audit_baseline_var.set("No baseline recorded.")
+            self.audit_delta_var.set("")
+            return
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            self.audit_baseline_var.set("No baseline recorded.")
+            self.audit_delta_var.set("")
+            return
+        try:
+            row = conn.execute(
+                """
+                SELECT created_utc
+                FROM audit_baseline
+                ORDER BY datetime(created_utc) DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            self.audit_baseline_var.set("No baseline recorded.")
+        else:
+            if row:
+                created = row["created_utc"] if "created_utc" in row.keys() else row[0]
+                if created:
+                    self.audit_baseline_var.set(f"Latest baseline: {created}")
+                else:
+                    self.audit_baseline_var.set("No baseline recorded.")
+            else:
+                self.audit_baseline_var.set("No baseline recorded.")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.audit_delta_var.set("")
 
     def _build_quality_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -8002,7 +8314,7 @@ class App:
         initial_dir_path = Path(self.db_path.get()).parent if self.db_path.get() else Path(BASE_DIR)
         fn = filedialog.askopenfilename(initialdir=str(initial_dir_path), title="Open catalog DB", filetypes=[("SQLite DB","*.db"),("All","*.*")])
         if not fn: return
-        self.db_path.set(fn); init_catalog(fn); self.refresh_all(); self._persist_catalog_path(fn)
+        self.db_path.set(fn); init_catalog(fn); self.audit_last_result = None; self.refresh_all(); self._persist_catalog_path(fn)
 
     def db_reset(self):
         if not messagebox.askyesno("Reset", "This will wipe the current catalog tables (keeps shards). Continue?"):
@@ -8011,6 +8323,7 @@ class App:
         con = sqlite3.connect(self.db_path.get()); cur = con.cursor()
         cur.executescript("DELETE FROM jobs; DELETE FROM drives; VACUUM;")
         con.commit(); con.close()
+        self.audit_last_result = None
         self.refresh_all()
 
     def db_vacuum(self):
@@ -8708,6 +9021,15 @@ class App:
             if hasattr(self, "docpreview_progress_bar"):
                 current_max = float(self.docpreview_progress_bar["maximum"] or 1)
                 self.docpreview_progress_bar.configure(value=current_max)
+        elif etype == "audit-progress":
+            stage = str(event.get("stage") or "audit")
+            payload = event.get("payload") or {}
+            status = payload.get("status") or stage
+            self.audit_status_var.set(f"Audit {stage}: {status}")
+        elif etype == "audit-heartbeat":
+            self.audit_status_var.set("Audit running…")
+        elif etype == "audit-complete":
+            self._handle_audit_complete(event)
         elif etype == "quality-progress":
             payload = event.get("payload") or {}
             total = int(payload.get("total") or 0)
@@ -8980,7 +9302,7 @@ class App:
             self.stop_evt = None
 
     def refresh_all(self):
-        self.refresh_drives(); self.refresh_jobs(); self.refresh_structure_view(); self.refresh_quality_results()
+        self.refresh_drives(); self.refresh_jobs(); self.refresh_structure_view(); self.refresh_quality_results(); self.refresh_audit_panel()
 
     def refresh_drives(self):
         self.tree.delete(*self.tree.get_children())
@@ -9044,6 +9366,9 @@ class App:
         if self.music_worker and self.music_worker.is_alive():
             if self.music_cancel:
                 self.music_cancel.set()
+        if self.audit_worker and self.audit_worker.is_alive():
+            if self.audit_cancel:
+                self.audit_cancel.set()
         if self.worker and self.worker.is_alive():
             if self.stop_evt:
                 self.stop_evt.set()

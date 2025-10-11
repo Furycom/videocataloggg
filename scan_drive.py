@@ -72,6 +72,7 @@ from semantic import (
     SemanticTranscriber,
 )
 from tools import bootstrap_local_bin, probe_tool
+from audit.run import AuditRequest, AuditCancelledError, run_audit_pack
 from fingerprints import (
     audio_chroma as fp_audio,
     store as fp_store,
@@ -3279,6 +3280,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Process at most this many candidate documents.",
     )
     parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Run the catalog audit summary without exports.",
+    )
+    parser.add_argument(
+        "--audit-export",
+        action="store_true",
+        help="Generate the audit exports (CSV/JSON).",
+    )
+    parser.add_argument(
+        "--audit-baseline",
+        action="store_true",
+        help="Store a new audit baseline snapshot.",
+    )
+    parser.add_argument(
+        "--audit-delta",
+        action="store_true",
+        help="Compare the current database against the latest baseline.",
+    )
+    parser.add_argument(
         "--quality",
         action="store_true",
         help="Run the video quality report for videos in the shard.",
@@ -4428,6 +4449,120 @@ def _run_docpreview_cli(
     return 0
 
 
+def _run_audit_cli(
+    args: argparse.Namespace,
+    catalog_db_path: Path,
+    working_dir: Path,
+) -> int:
+    request = AuditRequest(
+        export=bool(getattr(args, "audit_export", False)),
+        create_baseline=bool(getattr(args, "audit_baseline", False)),
+        compare_delta=bool(getattr(args, "audit_delta", False)),
+    )
+    if not (getattr(args, "audit", False) or request.export or request.create_baseline or request.compare_delta):
+        request = AuditRequest()
+
+    def _progress(stage: str, payload: dict) -> None:
+        status = payload.get("status") or "progress"
+        LOGGER.info("Audit %s status=%s", stage, status)
+
+    def _heartbeat(message: str) -> None:
+        LOGGER.debug("Audit heartbeat: %s", message)
+
+    try:
+        result = run_audit_pack(
+            catalog_db_path,
+            working_dir,
+            request,
+            progress_cb=_progress,
+            heartbeat_cb=_heartbeat,
+        )
+    except AuditCancelledError:
+        LOGGER.warning("Audit cancelled by operator")
+        print("Audit cancelled.")
+        return 1
+    except Exception as exc:
+        LOGGER.error("Audit run failed: %s", exc)
+        print(f"[ERROR] Audit run failed: {exc}", file=sys.stderr)
+        return 2
+
+    summary = result.summary
+    print(f"Audit summary generated at {summary.generated_utc}")
+    print(
+        "Movies total={total} high={high} medium={medium} low={low}".format(
+            total=summary.movies.total,
+            high=summary.movies.high,
+            medium=summary.movies.medium,
+            low=summary.movies.low,
+        )
+    )
+    print(
+        "Episodes total={total} high={high} medium={medium} low={low}".format(
+            total=summary.episodes.total,
+            high=summary.episodes.high,
+            medium=summary.episodes.medium,
+            low=summary.episodes.low,
+        )
+    )
+    print(
+        "Review queue movies={movies} episodes={episodes}".format(
+            movies=summary.review_queue.movies,
+            episodes=summary.review_queue.episodes,
+        )
+    )
+    print(
+        "Duplicates={dupes} unresolved_movies={um} unresolved_episodes={ue}".format(
+            dupes=summary.duplicate_pairs,
+            um=summary.unresolved_movies,
+            ue=summary.unresolved_episodes,
+        )
+    )
+    if summary.quality_flags is not None:
+        print(f"Quality flags={summary.quality_flags}")
+
+    if result.delta and result.latest_baseline:
+        delta = result.delta
+        print(
+            "Delta since baseline {stamp}: +{add_v} / -{rem_v} videos, +{add_e} / -{rem_e} episodes".format(
+                stamp=result.latest_baseline.created_utc,
+                add_v=delta.added_videos,
+                rem_v=delta.removed_videos,
+                add_e=delta.added_episodes,
+                rem_e=delta.removed_episodes,
+            )
+        )
+        print(
+            "Low confidence movies +{add_m} / -{rem_m}, episodes +{add_me} / -{rem_me}".format(
+                add_m=delta.new_low_confidence,
+                rem_m=delta.resolved_low_confidence,
+                add_me=delta.new_low_confidence_episodes,
+                rem_me=delta.resolved_low_confidence_episodes,
+            )
+        )
+        print(
+            "Duplicates +{add_d} / -{rem_d}, quality flags +{add_q} / -{rem_q}".format(
+                add_d=delta.new_duplicates,
+                rem_d=delta.resolved_duplicates,
+                add_q=delta.new_quality_flags,
+                rem_q=delta.resolved_quality_flags,
+            )
+        )
+        if delta.changed_hashes:
+            print("Changed datasets:", ", ".join(delta.changed_hashes))
+
+    if result.export:
+        print(f"Exports saved to {result.export.directory}")
+        for path in result.export.files:
+            print(f"  - {path}")
+
+    if result.created_baseline:
+        print(f"Baseline stored at {result.created_baseline.created_utc}")
+    elif result.latest_baseline:
+        print(f"Latest baseline: {result.latest_baseline.created_utc}")
+
+    return 0
+
+
 def _auto_optimize_after_scan(shard_path: Path, label: str, options: MaintenanceOptions) -> None:
     if not shard_path.exists():
         return
@@ -4524,6 +4659,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"catalog: {catalog_db_path} | shard: {shard_db_path}"
     )
     LOGGER.info(startup_info)
+
+    if args.audit or args.audit_export or args.audit_baseline or args.audit_delta:
+        return _run_audit_cli(args, Path(catalog_db_path), WORKING_DIR_PATH)
 
     structure_requested = bool(
         args.structure_scan or args.structure_verify or args.structure_export_review
