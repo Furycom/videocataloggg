@@ -108,6 +108,9 @@ from textlite import TextLiteSettings, run_for_shard as run_textlite_for_shard
 from robust import CancellationToken
 from musicnames import parse_music_name, score_parse_result
 from audit.run import AuditRequest, AuditCancelledError, run_audit_pack
+from diagnostics.report import export_report_bundle, build_report_snapshot
+from diagnostics.smoke import DEFAULT_SUBSYSTEMS
+from diagnostics.tools import DiagnosticsTools
 
 from db_maint import (
     MaintenanceOptions,
@@ -2241,6 +2244,33 @@ class App:
         self.textlite_worker: Optional[threading.Thread] = None
         self.textlite_cancel: Optional[CancellationToken] = None
         self.textlite_rows: Dict[str, dict] = {}
+        diag_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_diag = _SETTINGS.get("diagnostics")
+            if isinstance(maybe_diag, dict):
+                diag_cfg = maybe_diag
+        self.diagnostics_config = diag_cfg
+        self.diagnostics_tools = DiagnosticsTools(WORKING_DIR_PATH)
+        self.preflight_result: Optional[Dict[str, Any]] = None
+        self.smoke_result: Optional[Dict[str, Any]] = None
+        self.gpu_ready = True
+        self.gpu_details: Dict[str, Any] = {}
+        self._gpu_banner_active = False
+        self.debug_preflight_status_var = StringVar(value="Preflight not run.")
+        self.debug_smoke_status_var = StringVar(value="Smoke tests not run.")
+        self.debug_gpu_status_var = StringVar(value="GPU check pending.")
+        self.debug_last_report_var = StringVar(value="No diagnostics report exported yet.")
+        self.debug_gpu_detail_vars = {
+            "name": StringVar(value="—"),
+            "vram_gb": StringVar(value="—"),
+            "free_vram_gb": StringVar(value="—"),
+            "driver_ver": StringVar(value="—"),
+            "cuda_ok": StringVar(value="—"),
+            "cuda_runtime": StringVar(value="—"),
+        }
+        self.debug_preflight_tree: Optional[ttk.Treeview] = None
+        self.debug_smoke_tree: Optional[ttk.Treeview] = None
+        self.debug_logs_tree: Optional[ttk.Treeview] = None
         self.learning_settings = load_learning_settings(_SETTINGS if isinstance(_SETTINGS, dict) else {})
         self.learning_status_var = StringVar(value="Learning idle.")
         self.learning_metrics_var = StringVar(value="Model: —")
@@ -2549,6 +2579,7 @@ class App:
 
         self.refresh_tool_statuses(initial=True)
         self._refresh_gpu_status()
+        self._run_initial_preflight()
 
         register_log_listener(self._log_enqueue)
         self._load_existing_logs()
@@ -3174,6 +3205,10 @@ class App:
         self.assistant_tab.rowconfigure(1, weight=1)
         self.assistant_tab.rowconfigure(2, weight=1)
         self.main_notebook.add(self.assistant_tab, text="Assistant")
+        self.debug_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.debug_tab.columnconfigure(0, weight=1)
+        self.debug_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.debug_tab, text="Debug")
 
         self._build_dashboard_controls(self.dashboard_tab)
         self._build_search_tab(self.search_tab)
@@ -3186,6 +3221,7 @@ class App:
         self._build_docpreview_tab(self.docpreview_tab)
         self._build_music_tab(self.music_tab)
         self._build_assistant_tab(self.assistant_tab)
+        self._build_debug_tab(self.debug_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3840,16 +3876,18 @@ class App:
             text="Refresh",
             command=self.refresh_structure_view,
         ).grid(row=0, column=3, sticky="ew", padx=(12, 0))
-        ttk.Button(
+        self.visualreview_generate_button = ttk.Button(
             controls,
             text="Generate visuals for queue",
             command=self.start_visualreview_job,
-        ).grid(row=0, column=4, sticky="ew", padx=(12, 0))
-        ttk.Button(
+        )
+        self.visualreview_generate_button.grid(row=0, column=4, sticky="ew", padx=(12, 0))
+        self.visualreview_cancel_button = ttk.Button(
             controls,
             text="Cancel visuals",
             command=self.cancel_visualreview_job,
-        ).grid(row=0, column=5, sticky="ew", padx=(12, 0))
+        )
+        self.visualreview_cancel_button.grid(row=0, column=5, sticky="ew", padx=(12, 0))
 
         ttk.Label(
             controls,
@@ -5001,15 +5039,16 @@ class App:
         actions = ttk.Frame(controls, style="Card.TFrame")
         actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(16, 0))
         actions.columnconfigure(3, weight=1)
-        ttk.Button(actions, text="Run preview", command=self.start_docpreview_job, style="Accent.TButton").grid(
-            row=0, column=0, sticky="w"
+        self.docpreview_run_button = ttk.Button(
+            actions, text="Run preview", command=self.start_docpreview_job, style="Accent.TButton"
         )
-        ttk.Button(actions, text="Cancel", command=self.cancel_docpreview_job).grid(
-            row=0, column=1, sticky="w", padx=(12, 0)
+        self.docpreview_run_button.grid(row=0, column=0, sticky="w")
+        self.docpreview_cancel_button = ttk.Button(actions, text="Cancel", command=self.cancel_docpreview_job)
+        self.docpreview_cancel_button.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.docpreview_refresh_button = ttk.Button(
+            actions, text="Refresh results", command=self.refresh_docpreview_results
         )
-        ttk.Button(actions, text="Refresh results", command=self.refresh_docpreview_results).grid(
-            row=0, column=2, sticky="w", padx=(12, 0)
-        )
+        self.docpreview_refresh_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
 
         progress_frame = ttk.Frame(parent, style="Card.TFrame", padding=(16, 12))
         progress_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -5572,6 +5611,8 @@ class App:
             self.textlite_status_var.set("Cancelling TextLite…")
 
     def start_docpreview_job(self) -> None:
+        if self._heavy_feature_blocked("Doc preview"):
+            return
         if self.docpreview_worker and self.docpreview_worker.is_alive():
             messagebox.showwarning("Doc Preview", "A doc preview job is already running.")
             return
@@ -6514,8 +6555,347 @@ class App:
         )
         self._update_assistant_controls_state()
 
+    def _build_debug_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(3, weight=1)
+
+        buttons = ttk.Frame(parent, style="Card.TFrame", padding=(12, 10))
+        buttons.grid(row=0, column=0, sticky="ew")
+        buttons.columnconfigure(3, weight=1)
+        self.debug_run_preflight_button = ttk.Button(
+            buttons,
+            text="Run Preflight",
+            command=self.run_preflight_diagnostics,
+            style="Accent.TButton",
+        )
+        self.debug_run_preflight_button.grid(row=0, column=0, sticky="w")
+        self.debug_run_smoke_button = ttk.Button(
+            buttons,
+            text="Run Smoke Tests",
+            command=self.run_smoke_diagnostics,
+        )
+        self.debug_run_smoke_button.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.debug_export_button = ttk.Button(
+            buttons,
+            text="Export Report…",
+            command=self.export_diagnostics_report,
+        )
+        self.debug_export_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Button(buttons, text="View logs", command=self._open_diagnostics_logs).grid(
+            row=0, column=3, sticky="e"
+        )
+
+        status = ttk.LabelFrame(
+            parent,
+            text="Summary",
+            padding=(12, 10),
+            style="Card.TLabelframe",
+        )
+        status.grid(row=1, column=0, sticky="ew")
+        status.columnconfigure(1, weight=1)
+        self.debug_preflight_status_label = ttk.Label(
+            status,
+            textvariable=self.debug_preflight_status_var,
+            style="StatusInfo.TLabel",
+        )
+        self.debug_preflight_status_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.debug_smoke_status_label = ttk.Label(
+            status,
+            textvariable=self.debug_smoke_status_var,
+            style="StatusInfo.TLabel",
+        )
+        self.debug_smoke_status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.debug_gpu_status_label = ttk.Label(
+            status,
+            textvariable=self.debug_gpu_status_var,
+            style="StatusWarning.TLabel",
+        )
+        self.debug_gpu_status_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(status, textvariable=self.debug_last_report_var, style="Subtle.TLabel").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+
+        gpu_frame = ttk.LabelFrame(
+            parent,
+            text="GPU details",
+            padding=(12, 10),
+            style="Card.TLabelframe",
+        )
+        gpu_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        for idx, (label, key) in enumerate(
+            [
+                ("Adapter", "name"),
+                ("VRAM", "vram_gb"),
+                ("Free VRAM", "free_vram_gb"),
+                ("Driver", "driver_ver"),
+                ("CUDA", "cuda_ok"),
+                ("CUDA runtime", "cuda_runtime"),
+            ]
+        ):
+            ttk.Label(gpu_frame, text=f"{label}:").grid(row=idx, column=0, sticky="w", pady=(0, 4))
+            ttk.Label(gpu_frame, textvariable=self.debug_gpu_detail_vars[key], style="Value.TLabel").grid(
+                row=idx, column=1, sticky="w", padx=(8, 0), pady=(0, 4)
+            )
+
+        trees = ttk.Frame(parent, style="Content.TFrame")
+        trees.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        trees.columnconfigure(0, weight=1)
+        trees.columnconfigure(1, weight=1)
+
+        preflight_frame = ttk.LabelFrame(
+            trees,
+            text="Preflight checks",
+            padding=(12, 10),
+            style="Card.TLabelframe",
+        )
+        preflight_frame.grid(row=0, column=0, sticky="nsew")
+        preflight_frame.columnconfigure(0, weight=1)
+        preflight_frame.rowconfigure(0, weight=1)
+        self.debug_preflight_tree = ttk.Treeview(
+            preflight_frame,
+            columns=("severity", "message", "hint"),
+            show="headings",
+            height=8,
+            style="Card.Treeview",
+        )
+        self.debug_preflight_tree.heading("severity", text="Severity")
+        self.debug_preflight_tree.heading("message", text="Message")
+        self.debug_preflight_tree.heading("hint", text="Hint")
+        self.debug_preflight_tree.column("severity", width=110, anchor="center")
+        self.debug_preflight_tree.column("message", width=360, anchor="w")
+        self.debug_preflight_tree.column("hint", width=240, anchor="w")
+        self.debug_preflight_tree.grid(row=0, column=0, sticky="nsew")
+        preflight_scroll = ttk.Scrollbar(
+            preflight_frame, orient="vertical", command=self.debug_preflight_tree.yview
+        )
+        preflight_scroll.grid(row=0, column=1, sticky="ns")
+        self.debug_preflight_tree.configure(yscrollcommand=preflight_scroll.set)
+
+        smoke_frame = ttk.LabelFrame(
+            trees,
+            text="Smoke tests",
+            padding=(12, 10),
+            style="Card.TLabelframe",
+        )
+        smoke_frame.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        smoke_frame.columnconfigure(0, weight=1)
+        smoke_frame.rowconfigure(0, weight=1)
+        self.debug_smoke_tree = ttk.Treeview(
+            smoke_frame,
+            columns=("severity", "message", "duration", "hint"),
+            show="headings",
+            height=8,
+            style="Card.Treeview",
+        )
+        self.debug_smoke_tree.heading("severity", text="Severity")
+        self.debug_smoke_tree.heading("message", text="Message")
+        self.debug_smoke_tree.heading("duration", text="Duration ms")
+        self.debug_smoke_tree.heading("hint", text="Hint")
+        self.debug_smoke_tree.column("severity", width=110, anchor="center")
+        self.debug_smoke_tree.column("message", width=320, anchor="w")
+        self.debug_smoke_tree.column("duration", width=110, anchor="e")
+        self.debug_smoke_tree.column("hint", width=240, anchor="w")
+        self.debug_smoke_tree.grid(row=0, column=0, sticky="nsew")
+        smoke_scroll = ttk.Scrollbar(smoke_frame, orient="vertical", command=self.debug_smoke_tree.yview)
+        smoke_scroll.grid(row=0, column=1, sticky="ns")
+        self.debug_smoke_tree.configure(yscrollcommand=smoke_scroll.set)
+
+    def _open_diagnostics_logs(self) -> None:
+        log_path = LOGS_DIR_PATH / "diagnostics.log.jsonl"
+        target = log_path if log_path.exists() else LOGS_DIR_PATH
+        self._open_path_in_explorer(str(target))
+
+    def _heavy_feature_blocked(self, feature: str) -> bool:
+        if self.gpu_ready or not self.diagnostics_config.get("gpu_hard_requirement", True):
+            return False
+        messagebox.showerror(
+            "GPU not ready",
+            f"{feature} is disabled until an NVIDIA GPU with >=8GB VRAM is available.",
+        )
+        return True
+
+    def _apply_preflight_result(self, result: Dict[str, Any]) -> None:
+        self.preflight_result = result
+        self.gpu_ready = bool(result.get("gpu_ready", True))
+        sections = result.get("sections") if isinstance(result.get("sections"), dict) else {}
+        self.gpu_details = sections.get("gpu", {}) if isinstance(sections.get("gpu"), dict) else {}
+        self._update_gpu_gate()
+        self._update_debug_tab()
+
+    def _update_gpu_gate(self) -> None:
+        require_gpu = bool(self.diagnostics_config.get("gpu_hard_requirement", True))
+        if not require_gpu:
+            return
+        if self.gpu_ready:
+            if self._gpu_banner_active and not self.scan_in_progress:
+                self.clear_banner()
+                self._gpu_banner_active = False
+            if self.assistant_enable_checkbox is not None:
+                self.assistant_enable_checkbox.configure(state="normal")
+            if self.docpreview_run_button is not None:
+                self.docpreview_run_button.configure(state="normal")
+            if self.visualreview_generate_button is not None:
+                self.visualreview_generate_button.configure(state="normal")
+            self._update_assistant_controls_state()
+        else:
+            message = (
+                "GPU not ready: VideoCatalog requires an NVIDIA GPU with >=8GB VRAM. "
+                "Install/Update drivers and retry."
+            )
+            self.show_banner(message, level="ERROR")
+            self._gpu_banner_active = True
+            if self.assistant_enable_checkbox is not None:
+                self.assistant_enable_checkbox.configure(state="disabled")
+            self.assistant_enabled_var.set(0)
+            self._update_assistant_controls_state()
+            if self.docpreview_run_button is not None:
+                self.docpreview_run_button.configure(state="disabled")
+            if self.visualreview_generate_button is not None:
+                self.visualreview_generate_button.configure(state="disabled")
+            self.visualreview_status_var.set("Visual review disabled: GPU not ready.")
+            self.docpreview_status_var.set("Doc preview disabled: GPU not ready.")
+
+    def _update_debug_tab(self) -> None:
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        if self.preflight_result:
+            summary = self.preflight_result.get("summary", {})
+            major = int(summary.get("MAJOR", 0) or 0)
+            minor = int(summary.get("MINOR", 0) or 0)
+            self.debug_preflight_status_var.set(
+                f"Preflight: {major} major / {minor} minor issues (run {now})"
+            )
+            style = "StatusSuccess.TLabel"
+            if major:
+                style = "StatusDanger.TLabel"
+            elif minor:
+                style = "StatusWarning.TLabel"
+            self.debug_preflight_status_label.configure(style=style)
+            if self.debug_preflight_tree is not None:
+                self.debug_preflight_tree.delete(*self.debug_preflight_tree.get_children())
+                for check in self.preflight_result.get("checks", []):
+                    severity = check.get("severity", "INFO")
+                    message = check.get("message", "")
+                    hint = check.get("hint") or ""
+                    self.debug_preflight_tree.insert("", "end", values=(severity, message, hint))
+        else:
+            self.debug_preflight_status_label.configure(style="StatusInfo.TLabel")
+
+        if self.smoke_result:
+            summary = self.smoke_result.get("summary", {})
+            major = int(summary.get("MAJOR", 0) or 0)
+            minor = int(summary.get("MINOR", 0) or 0)
+            self.debug_smoke_status_var.set(
+                f"Smoke: {major} major / {minor} minor issues (run {now})"
+            )
+            style = "StatusSuccess.TLabel"
+            if major:
+                style = "StatusDanger.TLabel"
+            elif minor:
+                style = "StatusWarning.TLabel"
+            self.debug_smoke_status_label.configure(style=style)
+            if self.debug_smoke_tree is not None:
+                self.debug_smoke_tree.delete(*self.debug_smoke_tree.get_children())
+                for check in self.smoke_result.get("checks", []):
+                    severity = check.get("severity", "INFO")
+                    message = check.get("message", "")
+                    duration = check.get("duration_ms")
+                    hint = check.get("hint") or ""
+                    duration_text = f"{float(duration):.0f}" if isinstance(duration, (int, float)) else "—"
+                    self.debug_smoke_tree.insert(
+                        "",
+                        "end",
+                        values=(severity, message, duration_text, hint),
+                    )
+        else:
+            self.debug_smoke_status_label.configure(style="StatusInfo.TLabel")
+
+        details = self.gpu_details or {}
+        adapter = details.get("name") or ("Ready" if self.gpu_ready else "Unavailable")
+        vram = details.get("vram_gb")
+        free_vram = details.get("free_vram_gb")
+        driver = details.get("driver_ver") or "—"
+        cuda_ok = "OK" if details.get("cuda_ok") else "Missing"
+        cuda_runtime = "OK" if details.get("cuda_runtime") else "Missing"
+        self.debug_gpu_status_var.set(
+            f"GPU {'ready' if self.gpu_ready else 'not ready'} — {adapter}"
+        )
+        self.debug_gpu_status_label.configure(
+            style="StatusSuccess.TLabel" if self.gpu_ready else "StatusDanger.TLabel"
+        )
+        self.debug_gpu_detail_vars["name"].set(str(adapter))
+        self.debug_gpu_detail_vars["vram_gb"].set(
+            f"{float(vram):.1f} GiB" if isinstance(vram, (int, float)) else "—"
+        )
+        self.debug_gpu_detail_vars["free_vram_gb"].set(
+            f"{float(free_vram):.1f} GiB" if isinstance(free_vram, (int, float)) else "—"
+        )
+        self.debug_gpu_detail_vars["driver_ver"].set(str(driver))
+        self.debug_gpu_detail_vars["cuda_ok"].set(cuda_ok)
+        self.debug_gpu_detail_vars["cuda_runtime"].set(cuda_runtime)
+
+    def run_preflight_diagnostics(self) -> None:
+        self.debug_preflight_status_var.set("Running preflight diagnostics…")
+
+        def worker() -> None:
+            try:
+                result = self.diagnostics_tools.diag_run_preflight()
+            except Exception as exc:  # pragma: no cover - defensive
+                self.worker_queue.put(
+                    {"type": "diagnostics-error", "op": "preflight", "error": str(exc)}
+                )
+                return
+            self.worker_queue.put({"type": "diagnostics-preflight", "payload": result})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_smoke_diagnostics(self) -> None:
+        self.debug_smoke_status_var.set("Running smoke tests…")
+
+        def worker() -> None:
+            try:
+                result = self.diagnostics_tools.diag_run_smoke(DEFAULT_SUBSYSTEMS)
+            except Exception as exc:  # pragma: no cover - defensive
+                self.worker_queue.put(
+                    {"type": "diagnostics-error", "op": "smoke", "error": str(exc)}
+                )
+                return
+            self.worker_queue.put({"type": "diagnostics-smoke", "payload": result})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def export_diagnostics_report(self) -> None:
+        self.debug_last_report_var.set("Exporting diagnostics report…")
+
+        def worker() -> None:
+            try:
+                path = export_report_bundle(
+                    preflight=self.preflight_result,
+                    smoke=self.smoke_result,
+                    working_dir=WORKING_DIR_PATH,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                self.worker_queue.put(
+                    {"type": "diagnostics-error", "op": "export", "error": str(exc)}
+                )
+                return
+            self.worker_queue.put({"type": "diagnostics-report", "path": str(path)})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_initial_preflight(self) -> None:
+        try:
+            result = self.diagnostics_tools.diag_run_preflight()
+        except Exception as exc:  # pragma: no cover - defensive
+            self.debug_preflight_status_var.set(f"Preflight failed: {exc}")
+            return
+        self._apply_preflight_result(result)
+        self.debug_preflight_status_var.set("Preflight completed.")
+
     def _update_assistant_controls_state(self) -> None:
-        enabled = bool(self.assistant_enabled_var.get())
+        require_gpu = bool(self.diagnostics_config.get("gpu_hard_requirement", True))
+        enabled = bool(self.assistant_enabled_var.get()) and (
+            self.gpu_ready or not require_gpu
+        )
         state = "normal" if enabled else "disabled"
         for widget in list(self._assistant_controls):
             try:
@@ -8477,6 +8857,8 @@ class App:
         )
 
     def start_visualreview_job(self) -> None:
+        if self._heavy_feature_blocked("Visual review"):
+            return
         if self.visualreview_worker and self.visualreview_worker.is_alive():
             messagebox.showwarning(
                 "Visual Review", "A visual review job is already running."
@@ -11050,6 +11432,47 @@ class App:
             if hasattr(self, "textlite_progress_bar"):
                 current_max = float(self.textlite_progress_bar["maximum"] or 1)
                 self.textlite_progress_bar.configure(value=current_max)
+        elif etype == "diagnostics-preflight":
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if isinstance(payload, dict):
+                self._apply_preflight_result(payload)
+                summary = payload.get("summary") or {}
+                major = int(summary.get("MAJOR", 0) or 0)
+                minor = int(summary.get("MINOR", 0) or 0)
+                status = f"Preflight complete — {major} major / {minor} minor issues"
+                self.debug_preflight_status_var.set(status)
+            else:
+                self.debug_preflight_status_var.set("Preflight diagnostics failed: invalid payload")
+        elif etype == "diagnostics-smoke":
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if isinstance(payload, dict):
+                self.smoke_result = payload
+                summary = payload.get("summary") or {}
+                major = int(summary.get("MAJOR", 0) or 0)
+                minor = int(summary.get("MINOR", 0) or 0)
+                status = f"Smoke tests complete — {major} major / {minor} minor issues"
+                self.debug_smoke_status_var.set(status)
+                self._update_debug_tab()
+            else:
+                self.debug_smoke_status_var.set("Smoke diagnostics failed: invalid payload")
+        elif etype == "diagnostics-report":
+            path_value = event.get("path") if isinstance(event, dict) else None
+            if path_value:
+                export_path = Path(path_value)
+                self.debug_last_report_var.set(f"Report exported to {export_path}")
+                self._show_toast(f"Diagnostics report exported: {export_path}", "success")
+            else:
+                self.debug_last_report_var.set("Report export completed")
+        elif etype == "diagnostics-error":
+            op = event.get("op") if isinstance(event, dict) else "operation"
+            message = event.get("error") if isinstance(event, dict) else "Unknown diagnostics error"
+            if op == "preflight":
+                self.debug_preflight_status_var.set(f"Preflight failed: {message}")
+            elif op == "smoke":
+                self.debug_smoke_status_var.set(f"Smoke tests failed: {message}")
+            elif op == "export":
+                self.debug_last_report_var.set(f"Report export failed: {message}")
+            self.show_banner(f"Diagnostics error ({op}): {message}", "ERROR")
         elif etype == "audit-progress":
             stage = str(event.get("stage") or "audit")
             payload = event.get("payload") or {}
