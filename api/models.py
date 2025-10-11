@@ -437,9 +437,41 @@ class AssistantStatusResponse(BaseModel):
     requested: bool
     gpu_ready: bool
     enabled: bool
+    disabled_by_gpu: bool
     message: str
     gpu: Dict[str, Any]
     runtime: Optional[Dict[str, Any]] = None
+
+
+class RealtimeClientStatus(BaseModel):
+    client_id: str
+    last_seen_utc: Optional[str]
+    stale: bool
+
+
+class RealtimeStatusResponse(BaseModel):
+    ts_utc: str
+    ws_connected: int
+    sse_connected: int
+    events_pushed_total: float
+    events_dropped_total: float
+    event_lag_ms_p50: Optional[float]
+    event_lag_ms_p95: Optional[float]
+    last_event_utc: Optional[str]
+    last_event_age_ms: Optional[float]
+    ai_requests_total: float
+    ai_errors_total: float
+    client: Optional[RealtimeClientStatus] = None
+
+
+class RealtimeHeartbeatRequest(BaseModel):
+    client_id: str = Field(..., min_length=4, max_length=128)
+    transport: str = Field(..., regex="^(ws|sse)$")
+
+
+class RealtimeHeartbeatResponse(BaseModel):
+    acknowledged: bool
+    ts_utc: str
 class FeatureVectorResponse(BaseModel):
     """Single feature vector payload."""
 

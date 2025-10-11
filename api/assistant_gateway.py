@@ -55,6 +55,7 @@ class AssistantGateway:
             "requested": bool(self._settings.enable),
             "gpu_ready": bool(self._gpu_ready),
             "enabled": bool(self.enabled),
+            "disabled_by_gpu": bool(not self._gpu_ready),
             "message": self._status_message,
             "gpu": {
                 "has_nvidia": bool(self._gpu_info.get("has_nvidia")),

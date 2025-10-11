@@ -11,6 +11,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 1.5rem;
   padding: 0.75rem 2rem;
   backdrop-filter: blur(12px);
   background: rgba(10, 14, 20, 0.9);
@@ -43,34 +44,88 @@
   color: #fff;
 }
 
-.rightPanel {
+.headerAside {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 1rem;
 }
 
-.liveIndicator {
-  margin-left: 1.25rem;
+.headerStatus {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.2rem;
+}
+
+.liveChip {
   padding: 0.25rem 0.75rem;
   border-radius: 999px;
   font-size: 0.85rem;
   font-weight: 600;
   background: rgba(255, 255, 255, 0.06);
   color: rgba(255, 255, 255, 0.8);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
-.live-online {
-  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35);
-  color: #22c55e;
+.liveChipOk {
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4);
+  color: #34d399;
 }
 
-.live-connecting {
+.liveChipWarn {
   box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.45);
   color: #facc15;
 }
 
-.live-offline {
+.liveChipCritical {
   box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.45);
+  color: #f87171;
+}
+
+.fallbackNote {
+  font-size: 0.7rem;
+  color: rgba(250, 204, 21, 0.8);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.rightPanel {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.realtimePanel {
+  display: grid;
+  grid-template-columns: auto;
+  gap: 0.3rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.04);
+  min-width: 180px;
+}
+
+.realtimeRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.realtimeRow strong {
+  font-size: 0.78rem;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.realtimeOk {
+  color: #34d399;
+}
+
+.realtimeWarn {
   color: #f87171;
 }
 

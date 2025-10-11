@@ -4,9 +4,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterable, List, Optional
 
 from .db import DataAccess
+
+if TYPE_CHECKING:  # pragma: no cover - typing aid
+    from assistant_webmon import WebMonitor
 
 LOGGER = logging.getLogger("videocatalog.api.events")
 
@@ -30,6 +33,7 @@ class CatalogEventBroker:
         *,
         poll_interval: float = 1.0,
         batch_limit: int = 128,
+        monitor: Optional["WebMonitor"] = None,
     ) -> None:
         self._data = data_access
         self._poll_interval = max(0.2, float(poll_interval))
@@ -39,6 +43,7 @@ class CatalogEventBroker:
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
         self._last_seq = 0
+        self._monitor = monitor
 
     async def start(self) -> None:
         """Start the polling loop if it is not already running."""
@@ -99,7 +104,7 @@ class CatalogEventBroker:
                 if events:
                     catalog_events = [self._normalize_event(event) for event in events]
                     self._last_seq = max(self._last_seq, catalog_events[-1].seq)
-                    await self._broadcast(catalog_events)
+                    await self._broadcast(self._coalesce_events(catalog_events))
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
@@ -124,6 +129,8 @@ class CatalogEventBroker:
                     LOGGER.warning(
                         "catalog events: subscriber %s queue overflow; dropping event", subscriber_id
                     )
+                    if self._monitor:
+                        self._monitor.record_event_drop()
                     dead.append(subscriber_id)
             for subscriber_id in dead:
                 self._subscribers.pop(subscriber_id, None)
@@ -140,4 +147,22 @@ class CatalogEventBroker:
                 if key is not None
             },
         )
+
+    @staticmethod
+    def _coalesce_events(events: List[CatalogEvent]) -> List[CatalogEvent]:
+        if len(events) <= 50:
+            return events
+        ordered: Dict[str, CatalogEvent] = {}
+        for event in events:
+            payload = event.payload or {}
+            identifier = (
+                payload.get("path")
+                or payload.get("item_id")
+                or payload.get("id")
+                or payload.get("doc_id")
+                or payload.get("series_id")
+            )
+            key = f"{event.kind}:{identifier if identifier is not None else event.seq}"
+            ordered[key] = event
+        return list(ordered.values())
 

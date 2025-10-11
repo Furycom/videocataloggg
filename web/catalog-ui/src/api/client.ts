@@ -7,6 +7,7 @@ import type {
   MovieDetail,
   MovieRow,
   PaginatedResponse,
+  RealtimeStatus,
   SearchResponse,
   SeriesRow,
   SeasonRow,
@@ -135,5 +136,17 @@ export async function askAssistant(
       tool_budget: options?.toolBudget,
       rag: options?.rag,
     }),
+  });
+}
+
+export async function getRealtimeStatus(clientId?: string): Promise<RealtimeStatus> {
+  const query = buildQuery({ client_id: clientId });
+  return fetchJson<RealtimeStatus>(`${API_BASE}/realtime/status${query}`);
+}
+
+export async function sendRealtimeHeartbeat(clientId: string, transport: 'ws' | 'sse'): Promise<void> {
+  await fetchJson(`${API_BASE}/realtime/heartbeat`, {
+    method: 'POST',
+    body: JSON.stringify({ client_id: clientId, transport }),
   });
 }
