@@ -1,0 +1,123 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 2.5rem;
+}
+
+.hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.5rem;
+  align-items: center;
+}
+
+.hero h1 {
+  margin: 0 0 0.5rem;
+  font-size: 2rem;
+}
+
+.hero p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.72);
+  max-width: 520px;
+}
+
+.statsGrid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.statCard {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  padding: 1rem 1.25rem;
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.05), transparent);
+}
+
+.statLabel {
+  display: block;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.statValue {
+  font-size: 1.8rem;
+  margin-top: 0.35rem;
+}
+
+.reviewSection h2 {
+  margin-top: 0;
+}
+
+.reviewGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1.5rem;
+}
+
+.reviewList {
+  background: rgba(15, 19, 26, 0.85);
+  border-radius: 18px;
+  padding: 1.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.reviewList h3 {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+}
+
+.reviewList ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.reviewList button {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem 0.75rem;
+  border-radius: 12px;
+  border: none;
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.reviewList button:hover {
+  background: rgba(59, 130, 246, 0.18);
+}
+
+.reviewTitle {
+  font-weight: 600;
+}
+
+.reviewMeta {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 0.85rem;
+}
+
+.confidenceBadge {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 999px;
+  background: rgba(244, 114, 182, 0.22);
+  color: #f472b6;
+}
+
+.placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.error {
+  color: #f87171;
+}
