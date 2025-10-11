@@ -27,6 +27,27 @@ class VisualReviewStoreConfig:
     max_db_blob_mb: int = 256
 
 
+@dataclass(slots=True)
+class StoredThumbnail:
+    """Thumbnail payload fetched from the persistence layer."""
+
+    format: str
+    width: int
+    height: int
+    data: bytes
+
+
+@dataclass(slots=True)
+class StoredContactSheet:
+    """Contact sheet payload fetched from the persistence layer."""
+
+    format: str
+    width: int
+    height: int
+    frame_count: int
+    data: bytes
+
+
 class VisualReviewStore:
     """SQLite-backed storage for thumbnails and contact sheets."""
 
@@ -165,6 +186,75 @@ class VisualReviewStore:
         self._trim_table_by_count("contact_sheets", self._config.sheet_retention)
         self._trim_table_by_blob_budget("video_thumbs", "image_blob")
         self._trim_table_by_blob_budget("contact_sheets", "image_blob")
+
+    def fetch_thumbnail(
+        self,
+        *,
+        item_type: str,
+        item_key: str,
+    ) -> Optional[StoredThumbnail]:
+        try:
+            cursor = self._conn.execute(
+                """
+                SELECT format, width, height, image_blob
+                FROM video_thumbs
+                WHERE item_type = ? AND item_key = ?
+                LIMIT 1
+                """,
+                (item_type, item_key),
+            )
+        except sqlite3.DatabaseError:
+            return None
+        row = cursor.fetchone()
+        if not row:
+            return None
+        blob = row[3]
+        if blob is None:
+            return None
+        data = bytes(blob)
+        if not data:
+            return None
+        return StoredThumbnail(
+            format=str(row[0] or ""),
+            width=int(row[1] or 0),
+            height=int(row[2] or 0),
+            data=data,
+        )
+
+    def fetch_contact_sheet(
+        self,
+        *,
+        item_type: str,
+        item_key: str,
+    ) -> Optional[StoredContactSheet]:
+        try:
+            cursor = self._conn.execute(
+                """
+                SELECT format, width, height, frame_count, image_blob
+                FROM contact_sheets
+                WHERE item_type = ? AND item_key = ?
+                LIMIT 1
+                """,
+                (item_type, item_key),
+            )
+        except sqlite3.DatabaseError:
+            return None
+        row = cursor.fetchone()
+        if not row:
+            return None
+        blob = row[4]
+        if blob is None:
+            return None
+        data = bytes(blob)
+        if not data:
+            return None
+        return StoredContactSheet(
+            format=str(row[0] or ""),
+            width=int(row[1] or 0),
+            height=int(row[2] or 0),
+            frame_count=int(row[3] or 0),
+            data=data,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -2,6 +2,7 @@
 # Requiert: Python 3.10+, mediainfo (CLI), sqlite3 (intégré), smartctl/ffmpeg optionnels, blake3 (pip)
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
+import io
 import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser, base64, csv
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, asdict
@@ -63,13 +64,29 @@ from search_util import (
 from core.search_plus_client import SearchPlusClient
 import reports_util
 from tkinter import (
-    Tk, Toplevel, StringVar, IntVar, END, N, S, E, W,
-    filedialog, messagebox, ttk, Menu, Spinbox, PhotoImage
+    Tk,
+    Toplevel,
+    StringVar,
+    IntVar,
+    END,
+    N,
+    S,
+    E,
+    W,
+    Canvas,
+    filedialog,
+    messagebox,
+    ttk,
+    Menu,
+    Spinbox,
+    PhotoImage,
 )
 from tkinter.scrolledtext import ScrolledText
 
 from gpu.capabilities import probe_gpu
 from gpu.runtime import get_hwaccel_args, select_provider
+from PIL import Image, ImageTk
+from visualreview import ReviewRunner, VisualReviewStore, load_visualreview_settings
 
 # ---------------- Config & constantes ----------------
 WORKING_DIR_PATH = resolve_working_dir()
@@ -1780,6 +1797,17 @@ class App:
         self.structure_status_var = StringVar(value="Structure profiling idle.")
         self.structure_summary_var = StringVar(value="No structure data available yet.")
         self._structure_action = "idle"
+        self.visualreview_settings = load_visualreview_settings(
+            _SETTINGS if isinstance(_SETTINGS, dict) else {}
+        )
+        self.visualreview_status_var = StringVar(value="Visual review idle.")
+        self.visualreview_worker: Optional[threading.Thread] = None
+        self.visualreview_cancel: Optional[threading.Event] = None
+        self.structure_rows: Dict[str, dict] = {}
+        self._structure_contact_sheet_photo: Optional[ImageTk.PhotoImage] = None
+        self._structure_contact_sheet_image: Optional[Image.Image] = None
+        self._structure_keyframe_photos: list[ImageTk.PhotoImage] = []
+        self._structure_keyframe_images: list[Image.Image] = []
         doc_cfg: Dict[str, object] = {}
         if isinstance(_SETTINGS, dict):
             maybe_doc = _SETTINGS.get("docpreview")
@@ -3128,8 +3156,8 @@ class App:
             style="Card.TLabelframe",
         )
         controls.grid(row=0, column=0, sticky="ew")
-        for column in range(4):
-            controls.columnconfigure(column, weight=1 if column in (1, 2) else 0)
+        for column in range(6):
+            controls.columnconfigure(column, weight=1 if column in (1, 2, 4, 5) else 0)
 
         ttk.Button(
             controls,
@@ -3152,12 +3180,27 @@ class App:
             text="Refresh",
             command=self.refresh_structure_view,
         ).grid(row=0, column=3, sticky="ew", padx=(12, 0))
+        ttk.Button(
+            controls,
+            text="Generate visuals for queue",
+            command=self.start_visualreview_job,
+        ).grid(row=0, column=4, sticky="ew", padx=(12, 0))
+        ttk.Button(
+            controls,
+            text="Cancel visuals",
+            command=self.cancel_visualreview_job,
+        ).grid(row=0, column=5, sticky="ew", padx=(12, 0))
 
         ttk.Label(
             controls,
             textvariable=self.structure_status_var,
             style="Subtle.TLabel",
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(12, 0))
+        ttk.Label(
+            controls,
+            textvariable=self.visualreview_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         review_frame = ttk.LabelFrame(
             parent,
@@ -3166,12 +3209,18 @@ class App:
             style="Card.TLabelframe",
         )
         review_frame.grid(row=1, column=0, sticky=(N, S, E, W), pady=(12, 0))
-        review_frame.columnconfigure(0, weight=1)
+        review_frame.columnconfigure(0, weight=3)
+        review_frame.columnconfigure(1, weight=2)
         review_frame.rowconfigure(0, weight=1)
+
+        tree_container = ttk.Frame(review_frame, style="Card.TFrame")
+        tree_container.grid(row=0, column=0, sticky=(N, S, E, W))
+        tree_container.columnconfigure(0, weight=1)
+        tree_container.rowconfigure(0, weight=1)
 
         columns = ("folder", "confidence", "title", "year", "issues")
         self.structure_tree = ttk.Treeview(
-            review_frame,
+            tree_container,
             columns=columns,
             show="headings",
             height=12,
@@ -3197,7 +3246,7 @@ class App:
             self.structure_tree.column(key, anchor=anchor, width=widths[key], stretch=True)
 
         review_scroll = ttk.Scrollbar(
-            review_frame,
+            tree_container,
             orient="vertical",
             command=self.structure_tree.yview,
         )
@@ -3205,13 +3254,88 @@ class App:
         self.structure_tree.grid(row=0, column=0, sticky=(N, S, E, W))
         review_scroll.grid(row=0, column=1, sticky=(N, S))
 
+        preview_notebook = ttk.Notebook(review_frame)
+        preview_notebook.grid(row=0, column=1, sticky=(N, S, E, W), padx=(12, 0))
+        self.structure_preview_notebook = preview_notebook
+
+        sheet_tab = ttk.Frame(preview_notebook, padding=(12, 12), style="Card.TFrame")
+        sheet_tab.columnconfigure(0, weight=1)
+        sheet_tab.rowconfigure(0, weight=1)
+        self.structure_sheet_label = ttk.Label(
+            sheet_tab,
+            text="Select a queue item to view contact sheet.",
+            anchor="center",
+            justify="center",
+            wraplength=420,
+        )
+        self.structure_sheet_label.grid(row=0, column=0, sticky=(N, S, E, W))
+        self.structure_sheet_info_var = StringVar(value="No visuals loaded.")
+        ttk.Label(
+            sheet_tab,
+            textvariable=self.structure_sheet_info_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+        preview_notebook.add(sheet_tab, text="Contact sheet")
+
+        keyframes_tab = ttk.Frame(preview_notebook, padding=(12, 12), style="Card.TFrame")
+        keyframes_tab.columnconfigure(0, weight=1)
+        keyframes_tab.rowconfigure(0, weight=1)
+        self.structure_keyframe_canvas = Canvas(
+            keyframes_tab,
+            highlightthickness=0,
+            background=self.colors.get("content", "#1a1a1a"),
+        )
+        self.structure_keyframe_canvas.grid(row=0, column=0, sticky=(N, S, E, W))
+        keyframe_scroll = ttk.Scrollbar(
+            keyframes_tab,
+            orient="vertical",
+            command=self.structure_keyframe_canvas.yview,
+        )
+        keyframe_scroll.grid(row=0, column=1, sticky=(N, S))
+        self.structure_keyframe_canvas.configure(yscrollcommand=keyframe_scroll.set)
+        self.structure_keyframe_frame = ttk.Frame(
+            self.structure_keyframe_canvas, style="Card.TFrame"
+        )
+        self._structure_keyframe_window = self.structure_keyframe_canvas.create_window(
+            (0, 0),
+            window=self.structure_keyframe_frame,
+            anchor="nw",
+            tags=("frame",),
+        )
+        self.structure_keyframe_frame.columnconfigure(0, weight=1)
+        self.structure_keyframe_frame.bind(
+            "<Configure>",
+            lambda event: self.structure_keyframe_canvas.configure(
+                scrollregion=self.structure_keyframe_canvas.bbox("all")
+            ),
+        )
+        self.structure_keyframe_canvas.bind(
+            "<Configure>",
+            lambda event: self.structure_keyframe_canvas.itemconfigure(
+                self._structure_keyframe_window, width=event.width
+            ),
+        )
+        self.structure_keyframe_hint = ttk.Label(
+            self.structure_keyframe_frame,
+            text="Select a queue item to load keyframes.",
+            style="Subtle.TLabel",
+            anchor="center",
+            justify="center",
+            wraplength=380,
+        )
+        self.structure_keyframe_hint.grid(row=0, column=0, sticky="nwe", pady=(12, 0))
+        preview_notebook.add(keyframes_tab, text="Keyframes")
+
+        self.structure_tree.bind("<<TreeviewSelect>>", self._on_structure_tree_select)
+
         summary_frame = ttk.Frame(parent, style="Card.TFrame")
-        summary_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        summary_frame.grid(row=2, column=0, columnspan=1, sticky="ew", pady=(12, 0))
         ttk.Label(
             summary_frame,
             textvariable=self.structure_summary_var,
             style="Subtle.TLabel",
         ).grid(row=0, column=0, sticky="w")
+        self._clear_structure_preview()
 
     def _build_docpreview_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -4375,7 +4499,9 @@ class App:
         if not hasattr(self, "structure_tree"):
             return
         label = self.label_var.get().strip()
+        self.structure_rows.clear()
         self.structure_tree.delete(*self.structure_tree.get_children())
+        self._clear_structure_preview()
         if not label:
             self.structure_summary_var.set("Select a drive label to view structure data.")
             return
@@ -4386,13 +4512,21 @@ class App:
             self.structure_summary_var.set(
                 f"Folders: {summary['total']} — confident {summary['confident']} | "
                 f"medium {summary['medium']} | low {summary['low']}"
-            )
+        )
         if rows:
-            for row in rows:
+            for index, row in enumerate(rows):
                 issues = ", ".join(row.get("issues", [])) if row.get("issues") else ""
+                base_id = row.get("folder_path") or f"row-{index}"
+                iid = base_id
+                suffix = 1
+                while iid in self.structure_rows:
+                    iid = f"{base_id}-{suffix}"
+                    suffix += 1
+                self.structure_rows[iid] = dict(row)
                 self.structure_tree.insert(
                     "",
                     "end",
+                    iid=iid,
                     values=(
                         row.get("folder_path"),
                         f"{row.get('confidence', 0.0):.2f}",
@@ -4467,11 +4601,298 @@ class App:
                         "parsed_title": entry["parsed_title"],
                         "parsed_year": entry["parsed_year"],
                         "issues": issues,
+                        "item_type": "folder",
+                        "item_key": entry["folder_path"],
                     }
                 )
         finally:
             conn.close()
         return summary, rows
+
+    def _get_selected_structure_row(self) -> Optional[dict]:
+        if not hasattr(self, "structure_tree"):
+            return None
+        selection = self.structure_tree.selection()
+        if not selection:
+            return None
+        return self.structure_rows.get(selection[0])
+
+    def _clear_structure_preview(self, message: Optional[str] = None) -> None:
+        if not hasattr(self, "structure_sheet_label"):
+            return
+        text = message or "Select a queue item to view contact sheet."
+        self.structure_sheet_label.configure(image="", text=text)
+        self.structure_sheet_info_var.set("No visuals loaded.")
+        self._structure_contact_sheet_photo = None
+        self._structure_contact_sheet_image = None
+        self._structure_keyframe_photos.clear()
+        self._structure_keyframe_images.clear()
+        if hasattr(self, "structure_keyframe_frame"):
+            for child in list(self.structure_keyframe_frame.winfo_children()):
+                if child is self.structure_keyframe_hint:
+                    continue
+                child.destroy()
+        if hasattr(self, "structure_keyframe_hint"):
+            self.structure_keyframe_hint.configure(
+                text="Select a queue item to load keyframes."
+            )
+            self.structure_keyframe_hint.grid(row=0, column=0, sticky="nwe", pady=(12, 0))
+
+    def _on_structure_tree_select(self, _event: Optional[object] = None) -> None:
+        row = self._get_selected_structure_row()
+        if not row:
+            self._clear_structure_preview()
+            return
+        self._load_structure_visuals(row)
+
+    def _load_structure_visuals(self, row: dict) -> None:
+        label = self.label_var.get().strip()
+        if not label:
+            self._clear_structure_preview("Select a drive label to view contact sheet.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            self._clear_structure_preview("Shard database not found for this drive.")
+            return
+        item_type = row.get("item_type") or "folder"
+        item_key = row.get("item_key") or row.get("folder_path")
+        if not item_key:
+            self._clear_structure_preview("Unable to resolve cache key for selection.")
+            return
+        try:
+            with VisualReviewStore(shard) as store:
+                sheet = store.fetch_contact_sheet(
+                    item_type=str(item_type), item_key=str(item_key)
+                )
+        except Exception as exc:
+            self._clear_structure_preview(f"Failed to load visuals: {exc}")
+            return
+        if not sheet:
+            self._update_structure_contact_sheet(None, None, message="No contact sheet cached for this item.")
+            self._populate_structure_keyframes(None, 0)
+            return
+        try:
+            image = Image.open(io.BytesIO(sheet.data))
+            image.load()
+        except Exception as exc:
+            self._update_structure_contact_sheet(
+                None,
+                None,
+                message=f"Failed to decode contact sheet: {exc}",
+            )
+            self._populate_structure_keyframes(None, 0)
+            return
+        self._update_structure_contact_sheet(sheet, image)
+        self._populate_structure_keyframes(image, sheet.frame_count)
+
+    def _update_structure_contact_sheet(
+        self,
+        sheet: Optional[object],
+        image: Optional[Image.Image],
+        *,
+        message: Optional[str] = None,
+    ) -> None:
+        if not hasattr(self, "structure_sheet_label"):
+            return
+        if not sheet or not image:
+            self.structure_sheet_label.configure(image="", text=message or "No contact sheet available.")
+            self.structure_sheet_info_var.set("No visuals loaded.")
+            self._structure_contact_sheet_photo = None
+            self._structure_contact_sheet_image = None
+            return
+        self._structure_contact_sheet_image = image.copy()
+        preview = image.copy()
+        max_width = 560
+        max_height = 420
+        try:
+            preview.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        except Exception:
+            preview = image.copy()
+        photo = ImageTk.PhotoImage(preview)
+        self._structure_contact_sheet_photo = photo
+        self.structure_sheet_label.configure(image=photo, text="")
+        self.structure_sheet_label.image = photo
+        width = int(getattr(sheet, "width", preview.width) or preview.width)
+        height = int(getattr(sheet, "height", preview.height) or preview.height)
+        frames = int(getattr(sheet, "frame_count", 0) or 0)
+        self.structure_sheet_info_var.set(
+            f"{width}×{height} • {frames} frames"
+        )
+
+    def _populate_structure_keyframes(
+        self, image: Optional[Image.Image], frame_count: int
+    ) -> None:
+        if not hasattr(self, "structure_keyframe_frame"):
+            return
+        for child in list(self.structure_keyframe_frame.winfo_children()):
+            if child is self.structure_keyframe_hint:
+                continue
+            child.destroy()
+        self._structure_keyframe_photos.clear()
+        self._structure_keyframe_images.clear()
+        if not image or frame_count <= 0:
+            self.structure_keyframe_hint.configure(
+                text="No keyframes cached for this item."
+            )
+            self.structure_keyframe_hint.grid(row=0, column=0, sticky="nwe", pady=(12, 0))
+            return
+        self.structure_keyframe_hint.grid_forget()
+        columns = max(1, int(getattr(self.visualreview_settings, "sheet_columns", 4) or 1))
+        cell_size = getattr(self.visualreview_settings, "sheet_cell_px", (320, 180))
+        if not isinstance(cell_size, (tuple, list)) or len(cell_size) != 2:
+            cell_size = (320, 180)
+        cell_width = max(16, int(cell_size[0]))
+        cell_height = max(16, int(cell_size[1]))
+        margin = max(0, int(getattr(self.visualreview_settings, "sheet_margin", 24) or 0))
+        padding = max(0, int(getattr(self.visualreview_settings, "sheet_padding", 6) or 0))
+        display_columns = 2
+        for col_index in range(display_columns):
+            self.structure_keyframe_frame.columnconfigure(col_index, weight=1)
+        frames_added = 0
+        for index in range(frame_count):
+            col = index % columns
+            row = index // columns
+            left = margin + col * (cell_width + padding)
+            top = margin + row * (cell_height + padding)
+            right = min(left + cell_width, image.width)
+            bottom = min(top + cell_height, image.height)
+            if right <= left or bottom <= top:
+                continue
+            frame_image = image.crop((left, top, right, bottom))
+            self._structure_keyframe_images.append(frame_image)
+            frame_index = len(self._structure_keyframe_images) - 1
+            preview = frame_image.copy()
+            try:
+                preview.thumbnail((220, 220), Image.Resampling.LANCZOS)
+            except Exception:
+                pass
+            photo = ImageTk.PhotoImage(preview)
+            self._structure_keyframe_photos.append(photo)
+            container = ttk.Frame(
+                self.structure_keyframe_frame, style="Card.TFrame", padding=(6, 6)
+            )
+            display_row = frame_index // display_columns
+            display_col = frame_index % display_columns
+            container.grid(row=display_row, column=display_col, padx=8, pady=8, sticky="nwe")
+            container.columnconfigure(0, weight=1)
+            label = ttk.Label(container, image=photo, cursor="hand2")
+            label.image = photo
+            label.grid(row=0, column=0, sticky="n")
+            label.bind(
+                "<Button-1>",
+                lambda _event, idx=frame_index: self._open_keyframe_dialog(idx),
+            )
+            ttk.Label(
+                container,
+                text=f"Frame {frame_index + 1}",
+                style="Subtle.TLabel",
+            ).grid(row=1, column=0, sticky="n", pady=(6, 0))
+            frames_added += 1
+        if frames_added <= 0:
+            self.structure_keyframe_hint.configure(
+                text="No keyframes cached for this item."
+            )
+            self.structure_keyframe_hint.grid(row=0, column=0, sticky="nwe", pady=(12, 0))
+
+    def _open_keyframe_dialog(self, index: int) -> None:
+        if index < 0 or index >= len(self._structure_keyframe_images):
+            return
+        image = self._structure_keyframe_images[index]
+        window = Toplevel(self.root)
+        window.title(f"Keyframe {index + 1}")
+        window.configure(background=self.colors.get("background", "#101827"))
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        photo = ImageTk.PhotoImage(image.copy())
+        window._photo = photo  # type: ignore[attr-defined]
+        label = ttk.Label(window, image=photo)
+        label.grid(row=0, column=0, padx=12, pady=12)
+        window.bind("<Escape>", lambda _event: window.destroy())
+
+    def start_visualreview_job(self) -> None:
+        if self.visualreview_worker and self.visualreview_worker.is_alive():
+            messagebox.showwarning(
+                "Visual Review", "A visual review job is already running."
+            )
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showerror("Visual Review", "Fill the Disk Label field first.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror(
+                "Visual Review", f"Shard database not found for '{label}'."
+            )
+            return
+        mount = self.path_var.get().strip()
+        if not mount:
+            messagebox.showerror(
+                "Visual Review",
+                "Set the Path field to the mounted drive root before generating visuals.",
+            )
+            return
+        mount_path = Path(mount)
+        if not mount_path.exists():
+            proceed = messagebox.askyesno(
+                "Visual Review",
+                f"The path '{mount_path}' does not exist. Continue anyway?",
+            )
+            if not proceed:
+                return
+        settings = self.visualreview_settings
+        config = settings.to_runner_config(
+            working_dir=WORKING_DIR_PATH,
+            mounts={label: mount_path},
+            shard_labels=[label],
+        )
+        cancel_event = threading.Event()
+        self.visualreview_cancel = cancel_event
+        self.visualreview_status_var.set("Visual review running…")
+
+        def progress_cb(progress: "ReviewProgress") -> None:
+            payload = {
+                "processed": int(progress.processed),
+                "skipped": int(progress.skipped),
+                "failed": int(progress.failed),
+                "total": int(progress.total_attempted),
+            }
+            if progress.last_item:
+                payload["item"] = progress.last_item.item_key
+            self.worker_queue.put({"type": "visualreview-progress", "payload": payload})
+
+        def cancel_cb() -> bool:
+            return cancel_event.is_set()
+
+        def worker() -> None:
+            try:
+                runner = ReviewRunner(config)
+                summary = runner.run(progress=progress_cb, cancel=cancel_cb)
+                self.worker_queue.put(
+                    {
+                        "type": "visualreview-complete",
+                        "summary": {
+                            "processed": summary.processed,
+                            "skipped": summary.skipped,
+                            "failed": summary.failed,
+                            "sheets_written": summary.sheets_written,
+                            "thumbnails_written": summary.thumbnails_written,
+                        },
+                        "cancelled": cancel_event.is_set(),
+                    }
+                )
+            except Exception as exc:
+                self.worker_queue.put(
+                    {"type": "visualreview-complete", "error": str(exc)}
+                )
+
+        self.visualreview_worker = threading.Thread(target=worker, daemon=True)
+        self.visualreview_worker.start()
+
+    def cancel_visualreview_job(self) -> None:
+        if self.visualreview_cancel:
+            self.visualreview_cancel.set()
+            self.visualreview_status_var.set("Cancelling visual review…")
 
         self.tree = ttk.Treeview(drives_container, columns=cols, show="headings", height=9, style="Card.Treeview")
         for c in cols:
@@ -6738,6 +7159,47 @@ class App:
                 self.status_line_idle_text = f"{fmt} export failed."
             self.status_line_var.set(f"{fmt} export failed")
             self._update_status_line(force=True)
+        elif etype == "visualreview-progress":
+            payload = event.get("payload") or {}
+            processed = int(payload.get("processed") or 0)
+            skipped = int(payload.get("skipped") or 0)
+            failed = int(payload.get("failed") or 0)
+            total = int(payload.get("total") or 0)
+            item = payload.get("item")
+            status = (
+                f"Visual review • processed={processed} skipped={skipped} failed={failed}"
+            )
+            if total:
+                status += f" attempted={total}"
+            if item:
+                status += f" • last={item}"
+            self.visualreview_status_var.set(status)
+        elif etype == "visualreview-complete":
+            self.visualreview_worker = None
+            self.visualreview_cancel = None
+            summary = event.get("summary") or {}
+            error = event.get("error")
+            cancelled = bool(event.get("cancelled"))
+            if error:
+                message = f"Visual review failed: {error}"
+                self.visualreview_status_var.set(message)
+                messagebox.showerror("Visual Review", message)
+            else:
+                processed = int(summary.get("processed") or 0)
+                skipped = int(summary.get("skipped") or 0)
+                failed = int(summary.get("failed") or 0)
+                sheets = int(summary.get("sheets_written") or 0)
+                thumbs = int(summary.get("thumbnails_written") or 0)
+                status = (
+                    f"Visual review {'cancelled' if cancelled else 'complete'} — "
+                    f"processed={processed} skipped={skipped} failed={failed} "
+                    f"sheets={sheets} thumbs={thumbs}"
+                )
+                self.visualreview_status_var.set(status)
+                if cancelled:
+                    self._on_structure_tree_select()
+                else:
+                    self.refresh_structure_view()
         elif etype == "docpreview-progress":
             payload = event.get("payload") or {}
             total = int(payload.get("total") or 0)
