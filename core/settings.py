@@ -69,6 +69,19 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "max_video_frames": 2,
         "prefer_ffmpeg": True,
     },
+    "disk_marker": {
+        "enable": False,
+        "filename": ".videocatalog.id",
+        "write_hidden": True,
+        "write_readonly": True,
+        "use_hmac": True,
+        "catalog_uuid": None,
+        "hmac_key": None,
+    },
+    "delta_scan": {
+        "use_ntfs_usn": True,
+        "fallback_sampling": True,
+    },
     "gpu": {
         "policy": "AUTO",
         "allow_hwaccel_video": True,

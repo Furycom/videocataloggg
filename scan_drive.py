@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -117,6 +117,8 @@ from structure import (
 from textverify import TextVerifySettings, run_for_shard as run_textverify_for_shard
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
 from visualreview import load_visualreview_settings
+from diskmark.marker import MarkerRuntime, MarkerWriteResult, load_marker, prepare_runtime, write_marker
+from diskmark.winvol import get_volume_info, query_usn_journal
 from visualreview.run import process_queue
 from musicnames import (
     generate_review_bundle,
@@ -1608,6 +1610,7 @@ def _inventory_scan(
         "skipped_toolong": 0,
         "skipped_ignored": 0,
     }
+    total_bytes = 0
 
     start_time = time.perf_counter()
     writer = InventoryWriter(
@@ -1755,6 +1758,7 @@ def _inventory_scan(
                 mime, ext = detect_mime(fs_path)
                 category = categorize(mime, ext)
                 totals[category] = totals.get(category, 0) + 1
+                total_bytes += int(stat_result.st_size)
                 indexed_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
                 row = InventoryRow(
                     path=display_path,
@@ -1788,6 +1792,7 @@ def _inventory_scan(
     )
     return {
         "total_files": total_files,
+        "total_bytes": total_bytes,
         "duration_seconds": duration_seconds,
         "totals": totals,
         "skipped_perm": metrics["skipped_perm"],
@@ -2144,13 +2149,14 @@ def scan_drive(
     music_from_filenames: Optional[bool] = None,
     music_min_confidence: Optional[float] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    disk_marker_enable: Optional[bool] = None,
+    disk_marker_filename: Optional[str] = None,
+    delta_scan_mode: Optional[str] = None,
 ) -> dict:
     mount = Path(mount_path)
     if not mount.exists():
         print(f"[ERROR] Mount path not found: {mount_path}")
         sys.exit(2)
-
-    shard_path = Path(shard_db_path) if shard_db_path else get_shard_db_path(WORKING_DIR_PATH, label)
 
     effective_settings = settings or load_settings(WORKING_DIR_PATH)
     music_settings_raw: Dict[str, object] = {}
@@ -2172,6 +2178,45 @@ def scan_drive(
         except (TypeError, ValueError):
             music_confidence = default_music_conf
     music_confidence = max(0.0, min(1.0, music_confidence))
+    if not isinstance(effective_settings, dict):
+        effective_settings = {}
+    marker_runtime = prepare_runtime(
+        WORKING_DIR_PATH,
+        effective_settings,
+        enable_override=disk_marker_enable,
+        filename_override=disk_marker_filename,
+    )
+    delta_raw = effective_settings.get("delta_scan") if isinstance(effective_settings, dict) else {}
+    if not isinstance(delta_raw, dict):
+        delta_raw = {}
+    use_ntfs_usn = bool(delta_raw.get("use_ntfs_usn", True))
+    fallback_sampling = bool(delta_raw.get("fallback_sampling", True))
+    if isinstance(delta_scan_mode, str):
+        mode = delta_scan_mode.strip().lower()
+        if mode == "usn":
+            use_ntfs_usn = True
+        elif mode == "off":
+            use_ntfs_usn = False
+    volume_info = get_volume_info(mount)
+    marker_path = mount / marker_runtime.filename
+    marker_read = load_marker(
+        marker_path,
+        hmac_key=marker_runtime.hmac_key if marker_runtime.use_hmac else None,
+    )
+    marker_initial_created: Optional[str] = None
+    marker_initial_last_scan: Optional[str] = None
+    marker_signature_ok = marker_read.signature_ok
+    if marker_read.exists and marker_read.content:
+        marker_initial_created = marker_read.content.get("created_utc")
+        marker_initial_last_scan = marker_read.content.get("last_scan_utc")
+    if marker_read.exists:
+        if not marker_read.schema_ok:
+            LOGGER.warning("Disk marker at %s has unexpected schema.", marker_path)
+        elif marker_read.signature_ok is False:
+            LOGGER.error(
+                "Disk marker signature mismatch at %s; read-only mode enforced.",
+                marker_path,
+            )
     perf_overrides = perf_overrides or {}
     light_cfg = _resolve_light_analysis(effective_settings, light_analysis)
     fingerprint_cfg = _resolve_fingerprint_settings(effective_settings, fingerprint_overrides)
@@ -2193,6 +2238,17 @@ def scan_drive(
         "Music filename parsing: enabled=%s min_conf=%.2f",
         "true" if music_enabled else "false",
         music_confidence,
+    )
+    LOGGER.info(
+        "Disk marker: enable=%s filename=%s hmac=%s",
+        "true" if marker_runtime.enabled else "false",
+        marker_runtime.filename,
+        "true" if marker_runtime.use_hmac else "false",
+    )
+    LOGGER.info(
+        "Delta scan: use_usn=%s fallback_sampling=%s",
+        "true" if use_ntfs_usn else "false",
+        "true" if fallback_sampling else "false",
     )
     try:
         print(
@@ -2323,6 +2379,24 @@ def scan_drive(
             progress_callback=progress_callback,
         )
         conn.close()
+        scan_completed_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        counts_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
+        counts_bytes = int(result.get("total_bytes", 0)) if isinstance(result, dict) else 0
+        marker_info = _finalize_marker(counts_files, counts_bytes, last_scan_utc=scan_completed_utc)
+        delta_info = {
+            "requested_usn": bool(use_ntfs_usn),
+            "supports_usn": volume_info.supports_usn,
+            "fallback_sampling": bool(fallback_sampling),
+            "journal": {
+                "available": bool(usn_info),
+                "journal_id": getattr(usn_info, "journal_id", None),
+                "next_usn": getattr(usn_info, "next_usn", None),
+                "timestamp_utc": getattr(usn_info, "timestamp_utc", None),
+            },
+        }
+        if isinstance(result, dict):
+            result["disk_marker"] = marker_info
+            result["delta_scan"] = delta_info
         return result
 
     state_store = ScanStateStore(conn, label, interval_seconds=int(checkpoint_seconds))
@@ -2346,6 +2420,7 @@ def scan_drive(
         "skipped_toolong": 0,
         "skipped_ignored": 0,
         "retries": 0,
+        "bytes_seen": 0,
     }
 
     processed_files = 0
@@ -2354,6 +2429,155 @@ def scan_drive(
     total_enqueued = 0
     pending_tasks = 0
     last_processed_path = resume_path
+
+    marker_write_result: Optional[MarkerWriteResult] = None
+    usn_info = None
+
+    def _finalize_marker(counts_files: int, counts_bytes: int, *, last_scan_utc: str) -> dict[str, Any]:
+        nonlocal marker_write_result, usn_info
+        marker_info: dict[str, Any] = {
+            "enabled": marker_runtime.enabled,
+            "path": str(marker_path),
+            "schema_ok": bool(marker_read.schema_ok),
+            "signature_ok": marker_signature_ok,
+            "volume": {
+                "label": volume_info.label,
+                "guid": volume_info.volume_guid,
+                "serial": volume_info.volume_serial_hex,
+                "filesystem": volume_info.filesystem,
+                "supports_usn": volume_info.supports_usn,
+                "is_network": volume_info.is_network,
+            },
+            "counts": {"files": int(counts_files), "bytes": int(counts_bytes)},
+            "last_scan_utc": last_scan_utc,
+            "initial_created_utc": marker_initial_created,
+            "initial_last_scan_utc": marker_initial_last_scan,
+            "completed": True,
+        }
+
+        def _binding_guid() -> str:
+            if volume_info.volume_guid:
+                return str(volume_info.volume_guid)
+            return f"LABEL:{label.upper()}"
+
+        marker_info["status"] = "skipped"
+        marker_info["message"] = "Disk marker disabled."
+        marker_last_scan_for_db: Optional[str] = marker_initial_last_scan
+
+        if marker_runtime.enabled and os.name == "nt":
+            marker_info["status"] = "skipped"
+            marker_info["message"] = "Marker not written."
+            if marker_signature_ok is False:
+                marker_info["status"] = "mismatch"
+                marker_info["message"] = "Existing marker signature mismatch."
+            elif not marker_runtime.catalog_uuid:
+                marker_info["message"] = "Catalog UUID unavailable."
+            else:
+                payload = {
+                    "db_uuid": marker_runtime.catalog_uuid,
+                    "drive_label": label,
+                    "volume_guid": volume_info.volume_guid,
+                    "volume_serial_hex": volume_info.volume_serial_hex,
+                    "filesystem": volume_info.filesystem,
+                    "created_utc": marker_initial_created or last_scan_utc,
+                    "last_scan_utc": last_scan_utc,
+                    "counts": marker_info["counts"],
+                    "app": {
+                        "name": marker_runtime.app_name,
+                        "version": marker_runtime.app_version,
+                    },
+                }
+                marker_write_result = write_marker(mount, marker_runtime, payload=payload)
+                marker_info["status"] = marker_write_result.status
+                marker_info["message"] = marker_write_result.message
+                if marker_write_result.written:
+                    marker_info["marker_created_utc"] = payload["created_utc"]
+                    marker_info["marker_last_scan_utc"] = payload["last_scan_utc"]
+                    marker_last_scan_for_db = payload["last_scan_utc"]
+                else:
+                    marker_info["error"] = marker_write_result.message
+        elif marker_runtime.enabled and os.name != "nt":
+            marker_info["status"] = "skipped"
+            marker_info["message"] = "Disk markers require Windows."
+
+        marker_seen = 0
+        if marker_runtime.enabled:
+            if marker_write_result and marker_write_result.written:
+                marker_seen = 1
+            elif marker_read.exists and marker_read.schema_ok and marker_signature_ok is not False:
+                marker_seen = 1
+                marker_info.setdefault("marker_last_scan_utc", marker_initial_last_scan)
+                marker_last_scan_for_db = marker_initial_last_scan
+
+        if use_ntfs_usn and os.name == "nt" and volume_info.supports_usn:
+            try:
+                usn_info_local = query_usn_journal(volume_info.volume_guid)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.debug("USN journal query failed for %s: %s", volume_info.volume_guid, exc)
+                usn_info_local = None
+            usn_info_holder = usn_info_local
+        else:
+            usn_info_holder = None
+        usn_info = usn_info_holder
+
+        try:
+            with sqlite3.connect(str(catalog_db_path)) as catalog:
+                catalog.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS drive_binding(
+                      volume_guid TEXT PRIMARY KEY,
+                      drive_label TEXT NOT NULL,
+                      volume_serial_hex TEXT,
+                      filesystem TEXT,
+                      marker_seen INTEGER,
+                      marker_last_scan_utc TEXT,
+                      last_scan_usn INTEGER,
+                      last_scan_utc TEXT NOT NULL
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_binding_label ON drive_binding(drive_label);
+                    """
+                )
+                catalog.execute(
+                    "DELETE FROM drive_binding WHERE drive_label = ? AND volume_guid != ?",
+                    (label, _binding_guid()),
+                )
+                catalog.execute(
+                    """
+                    INSERT INTO drive_binding(
+                        volume_guid,
+                        drive_label,
+                        volume_serial_hex,
+                        filesystem,
+                        marker_seen,
+                        marker_last_scan_utc,
+                        last_scan_usn,
+                        last_scan_utc
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(volume_guid) DO UPDATE SET
+                        drive_label=excluded.drive_label,
+                        volume_serial_hex=excluded.volume_serial_hex,
+                        filesystem=excluded.filesystem,
+                        marker_seen=excluded.marker_seen,
+                        marker_last_scan_utc=excluded.marker_last_scan_utc,
+                        last_scan_usn=excluded.last_scan_usn,
+                        last_scan_utc=excluded.last_scan_utc
+                    """,
+                    (
+                        _binding_guid(),
+                        label,
+                        volume_info.volume_serial_hex,
+                        volume_info.filesystem,
+                        int(marker_seen),
+                        marker_last_scan_for_db,
+                        int(usn_info.next_usn) if usn_info and usn_info.next_usn is not None else None,
+                        last_scan_utc,
+                    ),
+                )
+                catalog.commit()
+        except sqlite3.DatabaseError as exc:
+            LOGGER.warning("Unable to update drive_binding for %s: %s", label, exc)
+
+        return marker_info
 
     progress_last_emit = 0.0
 
@@ -2757,6 +2981,7 @@ def scan_drive(
                         is_av=_is_av(display_entry),
                     )
                     metrics["files_seen"] += 1
+                    metrics["bytes_seen"] += int(stat_result.st_size)
                     if info.is_av:
                         metrics["av_total"] += 1
                     existing_key = key_for_path(info.path, casefold=is_windows)
@@ -2846,6 +3071,21 @@ def scan_drive(
         state_store.clear()
 
     duration = time.perf_counter() - start_time
+    scan_completed_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    counts_files = int(metrics.get("files_seen", 0))
+    counts_bytes = int(metrics.get("bytes_seen", 0))
+    marker_info = _finalize_marker(counts_files, counts_bytes, last_scan_utc=scan_completed_utc)
+    delta_info = {
+        "requested_usn": bool(use_ntfs_usn),
+        "supports_usn": volume_info.supports_usn,
+        "fallback_sampling": bool(fallback_sampling),
+        "journal": {
+            "available": bool(usn_info),
+            "journal_id": getattr(usn_info, "journal_id", None),
+            "next_usn": getattr(usn_info, "next_usn", None),
+            "timestamp_utc": getattr(usn_info, "timestamp_utc", None),
+        },
+    }
     LOGGER.info(
         "Scan complete for %s. Processed %s files (%s AV) in %.2fs.",
         label,
@@ -2903,8 +3143,9 @@ def scan_drive(
                 int(music_summary.get("processed") or 0),
             )
     conn.close()
-    return {
+    result_summary = {
         "total_files": metrics["files_seen"],
+        "total_bytes": metrics.get("bytes_seen", 0),
         "av_files": metrics["av_total"],
         "pending": total_enqueued,
         "unchanged": unchanged_count,
@@ -2917,7 +3158,10 @@ def scan_drive(
         "light_analysis": light_summary,
         "fingerprints": fingerprint_summary,
         "music_names": music_summary,
+        "disk_marker": marker_info,
+        "delta_scan": delta_info,
     }
+    return result_summary
 
 
 
@@ -3116,6 +3360,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--long-paths",
         choices=["auto", "force", "off"],
         help="Control Windows extended-length path handling (default: auto).",
+    )
+    parser.add_argument(
+        "--disk-marker",
+        choices=["on", "off"],
+        help="Enable or disable root Disk Marker creation during this scan.",
+    )
+    parser.add_argument(
+        "--disk-marker-name",
+        dest="disk_marker_name",
+        help="Override Disk Marker filename (default: .videocatalog.id).",
+    )
+    parser.add_argument(
+        "--delta-scan",
+        choices=["usn", "off"],
+        help="Select delta scan mode (usn to use NTFS Change Journal, off to disable).",
     )
     parser.add_argument(
         "--op-timeout",
@@ -4124,6 +4383,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         except (TypeError, ValueError):
             effective_music_conf = default_music_conf
     effective_music_conf = max(0.0, min(1.0, effective_music_conf))
+    disk_marker_override = None
+    if getattr(args, "disk_marker", None) is not None:
+        disk_marker_override = getattr(args, "disk_marker").lower() == "on"
+    disk_marker_name_override = getattr(args, "disk_marker_name", None)
+    delta_scan_mode = getattr(args, "delta_scan", None)
     semantic_exit = _run_cli_semantic(args, settings_data)
     if semantic_exit is not None:
         return semantic_exit
@@ -4266,6 +4530,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         gpu_overrides=gpu_cli_overrides,
         music_from_filenames=effective_music_from,
         music_min_confidence=effective_music_conf,
+        disk_marker_enable=disk_marker_override,
+        disk_marker_filename=disk_marker_name_override,
+        delta_scan_mode=delta_scan_mode,
     )
 
     total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
@@ -4396,6 +4663,23 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(fingerprint_line)
         if music_line:
             print(music_line)
+    marker_info = result.get("disk_marker") if isinstance(result, dict) else None
+    if isinstance(marker_info, dict):
+        guid = marker_info.get("volume", {}).get("guid") or "n/a"
+        marker_status = str(marker_info.get("status") or ("enabled" if marker_info.get("enabled") else "disabled"))
+        marker_message = marker_info.get("message")
+        line = f"Marker {marker_status}, Drive={args.label}, GUID={guid}"
+        if marker_message and marker_message.lower() not in {marker_status.lower(), "marker not written."}:
+            line += f" ({marker_message})"
+        print(line)
+    delta_info = result.get("delta_scan") if isinstance(result, dict) else None
+    if isinstance(delta_info, dict):
+        journal = delta_info.get("journal") if isinstance(delta_info.get("journal"), dict) else {}
+        availability = "available" if journal.get("available") else "unavailable"
+        next_usn = journal.get("next_usn")
+        extra = f" next_usn={next_usn}" if next_usn is not None else ""
+        mode = "usn" if delta_info.get("requested_usn") else "off"
+        print(f"Delta scan {mode}, USN {availability}{extra}")
     if not getattr(args, "inventory_only", False):
         try:
             maintenance_options = resolve_options(settings_data)

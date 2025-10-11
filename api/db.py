@@ -216,23 +216,55 @@ class DataAccess:
     def list_drives(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         with self._catalog() as conn:
-            cursor = conn.execute(
-                """
-                SELECT label,
-                       NULLIF(TRIM(COALESCE(drive_type, '')),'') AS drive_type,
-                       NULLIF(TRIM(COALESCE(scanned_at, '')),'') AS scanned_at
-                FROM drives
-                ORDER BY label COLLATE NOCASE ASC
-                """
+            has_binding = bool(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='drive_binding'"
+                ).fetchone()
             )
+            if has_binding:
+                cursor = conn.execute(
+                    """
+                    SELECT d.label,
+                           NULLIF(TRIM(COALESCE(d.drive_type, '')),'') AS drive_type,
+                           NULLIF(TRIM(COALESCE(d.scanned_at, '')),'') AS scanned_at,
+                           b.volume_guid,
+                           b.volume_serial_hex,
+                           b.filesystem,
+                           b.marker_seen,
+                           b.marker_last_scan_utc,
+                           b.last_scan_usn,
+                           b.last_scan_utc AS binding_last_scan_utc
+                    FROM drives AS d
+                    LEFT JOIN drive_binding AS b ON b.drive_label = d.label
+                    ORDER BY d.label COLLATE NOCASE ASC
+                    """
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT label,
+                           NULLIF(TRIM(COALESCE(drive_type, '')),'') AS drive_type,
+                           NULLIF(TRIM(COALESCE(scanned_at, '')),'') AS scanned_at
+                    FROM drives
+                    ORDER BY label COLLATE NOCASE ASC
+                    """
+                )
             for row in cursor.fetchall():
                 label = row["label"]
+                binding_last_scan = row["binding_last_scan_utc"] if has_binding else None
+                marker_seen_raw = row["marker_seen"] if has_binding else None
                 rows.append(
                     {
                         "label": label,
                         "type": row["drive_type"],
-                        "last_scan_utc": row["scanned_at"],
+                        "last_scan_utc": binding_last_scan or row["scanned_at"],
                         "shard_path": str(get_shard_db_path(self.working_dir, label)),
+                        "volume_guid": row["volume_guid"] if has_binding else None,
+                        "volume_serial_hex": row["volume_serial_hex"] if has_binding else None,
+                        "filesystem": row["filesystem"] if has_binding else None,
+                        "marker_seen": bool(marker_seen_raw) if marker_seen_raw is not None else False,
+                        "marker_last_scan_utc": row["marker_last_scan_utc"] if has_binding else None,
+                        "last_scan_usn": row["last_scan_usn"] if has_binding else None,
                     }
                 )
         return rows

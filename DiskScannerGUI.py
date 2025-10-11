@@ -44,6 +44,8 @@ from core.paths import (
     safe_label,
 )
 from core.settings import load_settings, update_settings
+from diskmark.marker import prepare_runtime as prepare_marker_runtime, load_marker as load_disk_marker, write_marker as write_disk_marker
+from diskmark.winvol import get_volume_info as get_disk_volume_info, query_usn_journal
 from exports import ExportFilters, export_shard
 from perf import resolve_performance_config
 from tools import (
@@ -349,6 +351,17 @@ def init_catalog(db_path: str):
       started_at TEXT NOT NULL,
       status TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS drive_binding(
+      volume_guid TEXT PRIMARY KEY,
+      drive_label TEXT NOT NULL,
+      volume_serial_hex TEXT,
+      filesystem TEXT,
+      marker_seen INTEGER,
+      marker_last_scan_utc TEXT,
+      last_scan_usn INTEGER,
+      last_scan_utc TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_binding_label ON drive_binding(drive_label);
     """)
     con.commit()
 
@@ -518,6 +531,11 @@ class ScannerWorker(threading.Thread):
         stop_evt: threading.Event,
         event_queue: "queue.Queue[dict]",
         tool_state: Optional[Dict[str, dict]] = None,
+        *,
+        disk_marker_enabled: bool = False,
+        disk_marker_filename: Optional[str] = None,
+        delta_use_usn: bool = True,
+        delta_fallback: bool = True,
     ):
         super().__init__(daemon=False)
         self.label = label
@@ -541,6 +559,7 @@ class ScannerWorker(threading.Thread):
         self._last_progress_emit: float = 0.0
         self._total_all: int = 0
         self._total_av: int = 0
+        self._scan_bytes_total: int = 0
         self._current_phase: str = "enumerating"
         self._tool_missing_reported = False
         self.tool_state: Dict[str, dict] = tool_state or {}
@@ -554,6 +573,12 @@ class ScannerWorker(threading.Thread):
             self._gpu_overrides["policy"] = self.gpu_policy
         if self.gpu_hwaccel is not None:
             self._gpu_overrides["allow_hwaccel_video"] = bool(self.gpu_hwaccel)
+        self.disk_marker_override = bool(disk_marker_enabled)
+        self.disk_marker_filename = disk_marker_filename or ".videocatalog.id"
+        self.delta_use_usn = bool(delta_use_usn)
+        self.delta_fallback = bool(delta_fallback)
+        self.disk_marker_info: Optional[Dict[str, Any]] = None
+        self.delta_scan_info: Optional[Dict[str, Any]] = None
 
     def _put(self, payload: dict):
         try:
@@ -592,6 +617,9 @@ class ScannerWorker(threading.Thread):
                 light_analysis=False,
                 gpu_overrides=self._gpu_overrides,
                 progress_callback=self._inventory_progress_callback,
+                disk_marker_enable=self.disk_marker_override,
+                disk_marker_filename=self.disk_marker_filename,
+                delta_scan_mode="usn" if self.delta_use_usn else "off",
             )
         except SystemExit as exc:
             message = f"Inventory failed ({exc.code})."
@@ -609,7 +637,12 @@ class ScannerWorker(threading.Thread):
             maybe_totals = result.get("totals")
             if isinstance(maybe_totals, dict):
                 totals = {k: int(v or 0) for k, v in maybe_totals.items()}
+            marker_payload = result.get("disk_marker")
+            self.disk_marker_info = marker_payload if isinstance(marker_payload, dict) else None
+            delta_payload = result.get("delta_scan")
+            self.delta_scan_info = delta_payload if isinstance(delta_payload, dict) else None
         total_files = int(result.get("total_files", 0)) if isinstance(result, dict) else 0
+        total_bytes = int(result.get("total_bytes", 0)) if isinstance(result, dict) else 0
         duration_seconds = float(result.get("duration_seconds", 0.0)) if isinstance(result, dict) else 0.0
         total_seconds = int(round(duration_seconds))
         hours, remainder = divmod(max(0, total_seconds), 3600)
@@ -619,7 +652,7 @@ class ScannerWorker(threading.Thread):
             "Inventory done — total files: "
             f"{total_files:,} — video: {totals.get('video', 0):,} — "
             f"audio: {totals.get('audio', 0):,} — image: {totals.get('image', 0):,} "
-            f"— duration: {duration_text}"
+            f"— bytes: {total_bytes:,} — duration: {duration_text}"
         )
         self._put({"type": "status", "message": summary_line})
         self._put(
@@ -629,12 +662,15 @@ class ScannerWorker(threading.Thread):
                 "total_all": total_files,
                 "done_av": 0,
                 "total_av": 0,
+                "total_bytes": total_bytes,
                 "duration": int(round(duration_seconds)),
                 "message": summary_line,
                 "inventory_totals": totals,
                 "skipped_perm": int(result.get("skipped_perm", 0)) if isinstance(result, dict) else 0,
                 "skipped_toolong": int(result.get("skipped_toolong", 0)) if isinstance(result, dict) else 0,
                 "skipped_ignored": int(result.get("skipped_ignored", 0)) if isinstance(result, dict) else 0,
+                "disk_marker": self.disk_marker_info,
+                "delta_scan": self.delta_scan_info,
             }
         )
 
@@ -711,6 +747,196 @@ class ScannerWorker(threading.Thread):
         self._start_monotonic = time.perf_counter()
         self._last_progress_emit = (self._start_monotonic or time.perf_counter()) - 6
 
+        settings_data = load_settings(WORKING_DIR_PATH)
+        marker_runtime = prepare_marker_runtime(
+            WORKING_DIR_PATH,
+            settings_data,
+            enable_override=self.disk_marker_override,
+            filename_override=self.disk_marker_filename,
+        )
+        volume_info = get_disk_volume_info(mount)
+        marker_path = mount / marker_runtime.filename
+        marker_read = load_disk_marker(
+            marker_path,
+            hmac_key=marker_runtime.hmac_key if marker_runtime.use_hmac else None,
+        )
+        marker_initial_created = None
+        marker_initial_last_scan = None
+        if marker_read.exists and marker_read.content:
+            marker_initial_created = marker_read.content.get("created_utc")
+            marker_initial_last_scan = marker_read.content.get("last_scan_utc")
+        marker_signature_ok = marker_read.signature_ok
+        if marker_read.exists:
+            if not marker_read.schema_ok:
+                log(f"[DiskMarker] Unexpected schema at {marker_path}")
+            elif marker_read.signature_ok is False:
+                log(f"[DiskMarker] Signature mismatch at {marker_path}")
+
+        def _finalize_marker_gui(
+            counts_files: int,
+            counts_bytes: int,
+            *,
+            last_scan_utc: str,
+            completed: bool = True,
+        ) -> dict[str, Any]:
+            marker_info: Dict[str, Any] = {
+                "enabled": marker_runtime.enabled,
+                "path": str(marker_path),
+                "schema_ok": bool(marker_read.schema_ok),
+                "signature_ok": marker_signature_ok,
+                "counts": {"files": int(counts_files), "bytes": int(counts_bytes)},
+                "last_scan_utc": last_scan_utc,
+                "initial_created_utc": marker_initial_created,
+                "initial_last_scan_utc": marker_initial_last_scan,
+                "completed": bool(completed),
+                "volume": {
+                    "label": volume_info.label,
+                    "guid": volume_info.volume_guid,
+                    "serial": volume_info.volume_serial_hex,
+                    "filesystem": volume_info.filesystem,
+                    "supports_usn": volume_info.supports_usn,
+                    "is_network": volume_info.is_network,
+                },
+            }
+
+            def _binding_guid() -> str:
+                if volume_info.volume_guid:
+                    return str(volume_info.volume_guid)
+                return f"LABEL:{self.label.upper()}"
+
+            marker_info["status"] = "skipped"
+            marker_info["message"] = "Disk marker disabled."
+            marker_last_scan_for_db = marker_initial_last_scan
+
+            if marker_runtime.enabled and os.name == "nt":
+                marker_info["status"] = "skipped"
+                marker_info["message"] = "Marker not written."
+                if marker_signature_ok is False:
+                    marker_info["status"] = "mismatch"
+                    marker_info["message"] = "Existing marker signature mismatch."
+                elif not marker_runtime.catalog_uuid:
+                    marker_info["message"] = "Catalog UUID unavailable."
+                elif completed:
+                    payload = {
+                        "db_uuid": marker_runtime.catalog_uuid,
+                        "drive_label": self.label,
+                        "volume_guid": volume_info.volume_guid,
+                        "volume_serial_hex": volume_info.volume_serial_hex,
+                        "filesystem": volume_info.filesystem,
+                        "created_utc": marker_initial_created or last_scan_utc,
+                        "last_scan_utc": last_scan_utc,
+                        "counts": marker_info["counts"],
+                        "app": {
+                            "name": marker_runtime.app_name,
+                            "version": marker_runtime.app_version,
+                        },
+                    }
+                    result = write_disk_marker(mount, marker_runtime, payload=payload)
+                    marker_info["status"] = result.status
+                    marker_info["message"] = result.message
+                    if result.written:
+                        marker_info["marker_created_utc"] = payload["created_utc"]
+                        marker_info["marker_last_scan_utc"] = payload["last_scan_utc"]
+                        marker_last_scan_for_db = payload["last_scan_utc"]
+                    else:
+                        marker_info["error"] = result.message
+                else:
+                    marker_info["message"] = "Scan incomplete; marker not updated."
+            elif marker_runtime.enabled and os.name != "nt":
+                marker_info["status"] = "skipped"
+                marker_info["message"] = "Disk markers require Windows."
+
+            marker_seen = 0
+            if marker_runtime.enabled:
+                if marker_info.get("status") == "ok" or (
+                    marker_info.get("status") in {"created", "updated"}
+                ):
+                    marker_seen = 1
+                elif marker_read.exists and marker_read.schema_ok and marker_signature_ok is not False:
+                    marker_seen = 1
+                    marker_info.setdefault("marker_last_scan_utc", marker_initial_last_scan)
+                    marker_last_scan_for_db = marker_initial_last_scan
+
+            usn_state = None
+            if self.delta_use_usn and os.name == "nt" and volume_info.supports_usn:
+                try:
+                    usn_state = query_usn_journal(volume_info.volume_guid)
+                except Exception as exc:
+                    log(f"[DiskMarker] USN query failed: {exc}")
+
+            self.delta_scan_info = {
+                "requested_usn": bool(self.delta_use_usn),
+                "supports_usn": volume_info.supports_usn,
+                "fallback_sampling": bool(self.delta_fallback),
+                "journal": {
+                    "available": bool(usn_state),
+                    "journal_id": getattr(usn_state, "journal_id", None),
+                    "next_usn": getattr(usn_state, "next_usn", None),
+                    "timestamp_utc": getattr(usn_state, "timestamp_utc", None),
+                },
+            }
+
+            if completed:
+                try:
+                    with sqlite3.connect(self.db_catalog) as catalog:
+                        catalog.executescript(
+                            """
+                            CREATE TABLE IF NOT EXISTS drive_binding(
+                              volume_guid TEXT PRIMARY KEY,
+                              drive_label TEXT NOT NULL,
+                              volume_serial_hex TEXT,
+                              filesystem TEXT,
+                              marker_seen INTEGER,
+                              marker_last_scan_utc TEXT,
+                              last_scan_usn INTEGER,
+                              last_scan_utc TEXT NOT NULL
+                            );
+                            CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_binding_label ON drive_binding(drive_label);
+                            """
+                        )
+                        catalog.execute(
+                            "DELETE FROM drive_binding WHERE drive_label = ? AND volume_guid != ?",
+                            (self.label, _binding_guid()),
+                        )
+                        catalog.execute(
+                            """
+                            INSERT INTO drive_binding(
+                                volume_guid,
+                                drive_label,
+                                volume_serial_hex,
+                                filesystem,
+                                marker_seen,
+                                marker_last_scan_utc,
+                                last_scan_usn,
+                                last_scan_utc
+                            ) VALUES(?,?,?,?,?,?,?,?)
+                            ON CONFLICT(volume_guid) DO UPDATE SET
+                                drive_label=excluded.drive_label,
+                                volume_serial_hex=excluded.volume_serial_hex,
+                                filesystem=excluded.filesystem,
+                                marker_seen=excluded.marker_seen,
+                                marker_last_scan_utc=excluded.marker_last_scan_utc,
+                                last_scan_usn=excluded.last_scan_usn,
+                                last_scan_utc=excluded.last_scan_utc
+                            """,
+                            (
+                                _binding_guid(),
+                                self.label,
+                                volume_info.volume_serial_hex,
+                                volume_info.filesystem,
+                                int(marker_seen),
+                                marker_last_scan_for_db,
+                                int(usn_state.next_usn) if usn_state and usn_state.next_usn is not None else None,
+                                last_scan_utc,
+                            ),
+                        )
+                        catalog.commit()
+                except sqlite3.DatabaseError as exc:
+                    log(f"[DiskMarker] Failed to update drive_binding: {exc}")
+
+            self.disk_marker_info = marker_info
+            return marker_info
+
         shard_path = shard_path_for(self.label)
         shard_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -756,6 +982,7 @@ class ScannerWorker(threading.Thread):
         av_count = 0
         stack: list[Path] = [mount]
         last_emit = time.perf_counter()
+        scan_bytes = 0
         while stack and not self.stop_evt.is_set():
             current = stack.pop()
             try:
@@ -782,6 +1009,7 @@ class ScannerWorker(threading.Thread):
                             is_av=Path(entry.path).suffix.lower() in AV_EXTS,
                         )
                         file_infos.append(info)
+                        scan_bytes += info.size_bytes
                         if info.is_av:
                             av_count += 1
                         now = time.perf_counter()
@@ -798,6 +1026,7 @@ class ScannerWorker(threading.Thread):
         total_av = av_count
         self._total_all = total_all
         self._total_av = total_av
+        self._scan_bytes_total = int(scan_bytes)
         self._emit_progress(self._current_phase, total_all, total_av, total_all=total_all, force=True)
 
         if self.stop_evt.is_set():
@@ -807,7 +1036,7 @@ class ScannerWorker(threading.Thread):
 
         started_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         smart_blob = try_smart_overview(self.tool_paths.get("smartctl"))
-        total_bytes, free_bytes = disk_usage_bytes(mount)
+        volume_total_bytes, free_bytes = disk_usage_bytes(mount)
 
         light_cfg = scan_drive._resolve_light_analysis(settings_data, self.light_analysis)
         gpu_cfg = scan_drive._resolve_gpu_settings(settings_data, self._gpu_overrides)
@@ -936,7 +1165,7 @@ class ScannerWorker(threading.Thread):
                         self.label,
                         str(mount),
                         None,
-                        total_bytes,
+                        volume_total_bytes,
                         free_bytes,
                         smart_blob,
                         started_at,
@@ -1124,6 +1353,16 @@ class ScannerWorker(threading.Thread):
             status = "Stopped" if self.stop_evt.is_set() else "Done"
             if light_pipeline is not None:
                 light_summary = light_pipeline.finalize()
+            scan_completed_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            marker_last_scan_value = (
+                scan_completed_utc if status == "Done" else (marker_initial_last_scan or scan_completed_utc)
+            )
+            marker_info = _finalize_marker_gui(
+                total_all,
+                self._scan_bytes_total,
+                last_scan_utc=marker_last_scan_value,
+                completed=(status == "Done"),
+            )
 
         with sqlite3.connect(self.db_catalog) as catalog:
             catalog.execute(
@@ -1147,8 +1386,11 @@ class ScannerWorker(threading.Thread):
             "total_all": total_all,
             "done_av": done_av,
             "total_av": total_av,
+            "total_bytes": self._scan_bytes_total,
             "duration": duration,
             "light_analysis": light_summary,
+            "disk_marker": marker_info,
+            "delta_scan": self.delta_scan_info,
         })
 
 
@@ -1871,6 +2113,24 @@ class App:
         self.music_from_filenames_var = IntVar(value=1 if music_enabled_default else 0)
         self.music_conf_value_var = StringVar(value=f"{music_conf_default:.2f}")
         self.music_conf_display_var = StringVar(value=f"{music_conf_default:.2f}")
+        disk_marker_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_dm = _SETTINGS.get("disk_marker")
+            if isinstance(maybe_dm, dict):
+                disk_marker_cfg = maybe_dm
+        disk_marker_default = bool(disk_marker_cfg.get("enable", False))
+        self.disk_marker_filename = str(disk_marker_cfg.get("filename") or ".videocatalog.id")
+        self.disk_marker_var = IntVar(value=1 if disk_marker_default else 0)
+        status_label = "Disk marker: enabled (pending)." if disk_marker_default else "Disk marker: disabled."
+        self.disk_marker_status_var = StringVar(value=status_label)
+        delta_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_delta = _SETTINGS.get("delta_scan")
+            if isinstance(maybe_delta, dict):
+                delta_cfg = maybe_delta
+        delta_usn_default = bool(delta_cfg.get("use_ntfs_usn", True))
+        self.delta_fallback_sampling = bool(delta_cfg.get("fallback_sampling", True))
+        self.usn_delta_var = IntVar(value=1 if delta_usn_default else 0)
         self.music_status_var = StringVar(value="Music parsing idle.")
         self.music_progress_total = IntVar(value=0)
         self.music_progress_done = IntVar(value=0)
@@ -2182,6 +2442,57 @@ class App:
 
     def _on_gpu_hwaccel_toggle(self) -> None:
         self._save_gpu_settings()
+
+    def _on_disk_marker_toggle(self) -> None:
+        settings_snapshot = load_settings(WORKING_DIR_PATH)
+        disk_cfg = {}
+        if isinstance(settings_snapshot, dict):
+            maybe = settings_snapshot.get("disk_marker")
+            if isinstance(maybe, dict):
+                disk_cfg = dict(maybe)
+        disk_cfg["enable"] = bool(self.disk_marker_var.get())
+        disk_cfg.setdefault("filename", self.disk_marker_filename)
+        update_settings(WORKING_DIR_PATH, disk_marker=disk_cfg)
+        if disk_cfg["enable"]:
+            self.disk_marker_status_var.set("Disk marker: enabled (pending).")
+        else:
+            self.disk_marker_status_var.set("Disk marker: disabled.")
+
+    def _on_delta_toggle(self) -> None:
+        settings_snapshot = load_settings(WORKING_DIR_PATH)
+        delta_cfg = {}
+        if isinstance(settings_snapshot, dict):
+            maybe = settings_snapshot.get("delta_scan")
+            if isinstance(maybe, dict):
+                delta_cfg = dict(maybe)
+        delta_cfg["use_ntfs_usn"] = bool(self.usn_delta_var.get())
+        delta_cfg["fallback_sampling"] = bool(self.delta_fallback_sampling)
+        update_settings(WORKING_DIR_PATH, delta_scan=delta_cfg)
+
+    def _apply_disk_marker_status(self, marker_info: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(marker_info, dict):
+            if bool(self.disk_marker_var.get()):
+                self.disk_marker_status_var.set("Disk marker: skipped.")
+            else:
+                self.disk_marker_status_var.set("Disk marker: disabled.")
+            return
+        status_value = str(
+            marker_info.get("status")
+            or ("enabled" if marker_info.get("enabled") else "disabled")
+        ).strip()
+        message = marker_info.get("message")
+        status_display = status_value.replace("_", " ") or "unknown"
+        label = f"Disk marker: {status_display}."
+        if message:
+            label = f"Disk marker: {status_display} ({message})."
+        self.disk_marker_status_var.set(label)
+        if marker_info.get("status") == "mismatch" or marker_info.get("signature_ok") is False:
+            self.show_banner("Disk marker signature mismatch (read-only mode used).", "ERROR")
+        elif marker_info.get("status") == "error":
+            self.show_banner(
+                f"Disk marker error — {message or 'write failed.'}",
+                "WARNING",
+            )
 
     def _maybe_prompt_cuda_help(self, caps: Dict[str, object]) -> None:
         if not sys.platform.startswith("win"):
@@ -2720,8 +3031,34 @@ class App:
             variable=self.resume_var,
         ).grid(row=0, column=1, rowspan=2, sticky="w", padx=(24, 0))
 
+        storage_frame = ttk.LabelFrame(
+            scan_frame,
+            text="Storage",
+            padding=(12, 10),
+            style="Card.TLabelframe",
+        )
+        storage_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        storage_frame.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            storage_frame,
+            text="Create root Disk Marker on scanned drives (one small hidden file)",
+            variable=self.disk_marker_var,
+            command=self._on_disk_marker_toggle,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            storage_frame,
+            text="Use NTFS Change Journal for delta scans (read-only)",
+            variable=self.usn_delta_var,
+            command=self._on_delta_toggle,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            storage_frame,
+            textvariable=self.disk_marker_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
         actions = ttk.Frame(scan_frame, style="Card.TFrame")
-        actions.grid(row=10, column=0, columnspan=4, sticky="ew")
+        actions.grid(row=11, column=0, columnspan=4, sticky="ew")
         for c in range(5):
             actions.columnconfigure(c, weight=1)
         ttk.Button(actions, text="Scan", command=self.start_scan, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
@@ -2740,7 +3077,7 @@ class App:
         self.exports_button = exports_menu_btn
 
         status_activity = ttk.Frame(scan_frame, style="Card.TFrame")
-        status_activity.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        status_activity.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(12, 0))
         status_activity.columnconfigure(1, weight=1)
 
         self.activity_indicator = ttk.Progressbar(
@@ -7264,6 +7601,10 @@ class App:
         except (TypeError, ValueError):
             threads = 1
         threads = max(1, min(32, threads))
+        if bool(self.disk_marker_var.get()):
+            self.disk_marker_status_var.set("Disk marker: running…")
+        else:
+            self.disk_marker_status_var.set("Disk marker: disabled.")
         self.worker = ScannerWorker(
             label=self.label_var.get().strip(),
             mount=self.path_var.get().strip(),
@@ -7282,6 +7623,10 @@ class App:
             stop_evt=self.stop_evt,
             event_queue=self.worker_queue,
             tool_state=tool_state,
+            disk_marker_enabled=bool(self.disk_marker_var.get()),
+            disk_marker_filename=self.disk_marker_filename,
+            delta_use_usn=bool(self.usn_delta_var.get()),
+            delta_fallback=bool(self.delta_fallback_sampling),
         )
         self.clear_banner()
         self.show_banner("Scan started", "INFO")
@@ -7655,6 +8000,11 @@ class App:
         elif etype == "done":
             self._await_worker_completion()
             status = event.get("status", "Ready")
+            marker_payload = event.get("disk_marker") if isinstance(event, dict) else None
+            self.disk_marker_info = marker_payload if isinstance(marker_payload, dict) else None
+            self._apply_disk_marker_status(self.disk_marker_info)
+            delta_payload = event.get("delta_scan") if isinstance(event, dict) else None
+            self.delta_scan_info = delta_payload if isinstance(delta_payload, dict) else None
             self.scan_in_progress = False
             self._notify_maintenance_scan_state()
             self._stop_activity_indicator()
@@ -7668,6 +8018,7 @@ class App:
             total_av = event.get("done_av")
             if total_av is None:
                 total_av = summary_snapshot.get("av_seen")
+            total_bytes_event = event.get("total_bytes")
             duration = event.get("duration")
             if duration is None and summary_snapshot.get("elapsed_s") is not None:
                 duration = summary_snapshot.get("elapsed_s")
@@ -7738,8 +8089,11 @@ class App:
                 else:
                     summary_text = (
                         "Done — total files: "
-                        f"{(total_all or 0):,} — AV files: {(total_av or 0):,} — duration: {self._format_elapsed(duration)}"
+                        f"{(total_all or 0):,} — AV files: {(total_av or 0):,}"
                     )
+                    if total_bytes_event is not None:
+                        summary_text = f"{summary_text} — bytes: {int(total_bytes_event or 0):,}"
+                    summary_text = f"{summary_text} — duration: {self._format_elapsed(duration)}"
                     light_info = event.get("light_analysis")
                     light_line = None
                     if isinstance(light_info, dict):
