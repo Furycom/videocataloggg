@@ -2,6 +2,7 @@
 # Requiert: Python 3.10+, mediainfo (CLI), sqlite3 (intégré), smartctl/ffmpeg optionnels, blake3 (pip)
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
+import argparse
 import io
 import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser, base64, csv, urllib.parse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -9,10 +10,95 @@ from dataclasses import dataclass, asdict
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+
+
+def _preparse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--health", action="store_true")
+    parser.add_argument("--health-json", action="store_true")
+    parser.add_argument("--devguard", action="store_true")
+    parser.add_argument("--devguard-skeleton", type=str)
+    args, remaining = parser.parse_known_args(argv)
+    return args, remaining
+
+
+def _run_health_cli(json_output: bool) -> int:
+    from health.run import format_report, run_health_checks
+
+    report = run_health_checks()
+    if json_output:
+        payload = {
+            "ts": report.ts,
+            "summary": {
+                "major": report.summary.major,
+                "minor": report.summary.minor,
+            },
+            "items": [
+                {
+                    "severity": item.severity.value,
+                    "code": item.code,
+                    "where": item.where,
+                    "hint": item.hint,
+                    "details": item.details,
+                }
+                for item in report.items
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_report(report, include_details=False))
+    return 0
+
+
+def _run_devguard_cli(skeleton: Optional[str]) -> int:
+    from devguard.actions import create_skeleton, suggest_splits
+    from devguard.graph import build_dependency_graph, find_cycles
+    from devguard.metrics import collect_metrics
+
+    project_root = Path(__file__).resolve().parent
+    graph = build_dependency_graph(project_root)
+    cycles = find_cycles(graph)
+    metrics = collect_metrics(project_root)
+    suggestions = suggest_splits(project_root)
+    print(f"Modules analyzed: {len(metrics)}")
+    if cycles:
+        print("Dependency cycles detected:")
+        for cycle in cycles:
+            print(" - " + " -> ".join(cycle))
+    else:
+        print("No dependency cycles detected.")
+    oversize = [m for m in metrics if m.oversized]
+    if oversize:
+        print("Oversized modules:")
+        for metric in oversize:
+            print(f" - {metric.path} — {metric.total_lines} lines")
+    if suggestions:
+        print("Split suggestions:")
+        for suggestion in suggestions:
+            proposed = ", ".join(suggestion.suggested_modules)
+            print(f" - {suggestion.path}: {suggestion.reason} -> {proposed}")
+    if skeleton:
+        target = Path(skeleton)
+        created = create_skeleton(target)
+        print(f"Created skeleton at {created}")
+    return 0
+
+
+_PRE_ARGS, _REMAINING = _preparse_args(sys.argv[1:])
+if _PRE_ARGS.health:
+    raise SystemExit(_run_health_cli(json_output=_PRE_ARGS.health_json))
+if _PRE_ARGS.devguard or _PRE_ARGS.devguard_skeleton:
+    raise SystemExit(_run_devguard_cli(_PRE_ARGS.devguard_skeleton))
+sys.argv = [sys.argv[0], *_REMAINING]
 from types import SimpleNamespace
 
-import scan_drive
+try:
+    import scan_drive
+    _SCAN_DRIVE_IMPORT_ERROR: Optional[Exception] = None
+except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+    scan_drive = None  # type: ignore[assignment]
+    _SCAN_DRIVE_IMPORT_ERROR = exc
 from structure import load_structure_settings as load_structure_config
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
 from quality import QualitySettings, run_for_shard as run_quality_for_shard
@@ -35,6 +121,7 @@ from db_maint import (
     vacuum_if_needed,
 )
 
+from core.logging_utils import configure_json_logging, redact_secret
 from core.paths import (
     ensure_working_dir_structure,
     get_catalog_db_path,
@@ -48,6 +135,8 @@ from core.paths import (
     safe_label,
 )
 from core.settings import load_settings, update_settings
+from health.store import HealthStore
+from ui import MainThreadWatchdog
 from diskmark.marker import prepare_runtime as prepare_marker_runtime, load_marker as load_disk_marker, write_marker as write_disk_marker
 from diskmark.winvol import get_volume_info as get_disk_volume_info, query_usn_journal
 from exports import ExportFilters, export_shard
@@ -99,6 +188,8 @@ from visualreview import ReviewRunner, VisualReviewStore, load_visualreview_sett
 WORKING_DIR_PATH = resolve_working_dir()
 ensure_working_dir_structure(WORKING_DIR_PATH)
 bootstrap_local_bin(WORKING_DIR_PATH)
+
+LOGGER = configure_json_logging()
 
 def _expand_user_path(value: str) -> Path:
     expanded = os.path.expandvars(os.path.expanduser(value))
@@ -157,6 +248,15 @@ _STARTUP_INFO = (
     f"catalog: {DB_DEFAULT_PATH} | shards: {SHARDS_DIR_PATH}"
 )
 print(f"[INFO] {_STARTUP_INFO}", flush=True)
+LOGGER.info(
+    "startup",
+    extra={
+        "event": "startup",
+        "working_dir": str(WORKING_DIR_PATH),
+        "catalog_db": str(DB_DEFAULT_PATH),
+        "shards_dir": str(SHARDS_DIR_PATH),
+    },
+)
 
 
 def shard_path_for(label: str) -> Path:
@@ -10865,12 +10965,21 @@ class ToolInstallDialog(Toplevel):
         self.destroy()
 
 # ---------------- main ----------------
-def main():
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="VideoCatalog GUI")
+    parser.add_argument(
+        "--developer-view",
+        action="store_true",
+        help="Start GUI with developer view enabled",
+    )
+    args = parser.parse_args(argv)
     ensure_working_dir_structure(WORKING_DIR_PATH)
     init_catalog(DB_DEFAULT)
     root = Tk()
-    App(root)
+    app = App(root, developer_view=args.developer_view)
+    MainThreadWatchdog(root)
     root.mainloop()
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
