@@ -110,6 +110,19 @@
     },
     "max_candidates": 5
   },
+  "learning": {
+    "enable": true,
+    "algo": "logreg",
+    "calibration": "auto",
+    "k_folds": 5,
+    "min_labels": 200,
+    "retrain_every_labels": 100,
+    "class_weight": "balanced",
+    "active": {
+      "strategy": "uncertainty_diversity",
+      "topN": 200
+    }
+  },
   "tv": {
     "enable": true,
     "use_opensubtitles": true,

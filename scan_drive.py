@@ -62,6 +62,8 @@ from core.paths import (
 from core.ann import ANNIndexManager
 from core.db import connect, transaction
 from core.settings import load_settings
+from learning import LearningEngine, load_learning_settings
+from learning.db import count_examples
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
 from semantic import (
@@ -3363,6 +3365,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override thumbnail image format for visual review (e.g. JPEG, PNG).",
     )
     parser.add_argument(
+        "--learn-train",
+        action="store_true",
+        help="Train the learning model on collected confirmations/denials.",
+    )
+    parser.add_argument(
+        "--learn-queue",
+        action="store_true",
+        help="Print the active learning queue ordered by uncertainty.",
+    )
+    parser.add_argument(
+        "--learn-score",
+        metavar="PATH",
+        help="Compute calibrated p_correct for a single folder or episode path.",
+    )
+    parser.add_argument(
+        "--learn-limit",
+        type=int,
+        help="Limit the number of entries shown for --learn-queue.",
+    )
+    parser.add_argument(
         "--maint-target",
         dest="maint_target",
         help="Maintenance target: catalog, shard:<label>, or all-shards.",
@@ -4686,6 +4708,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     settings_data = load_settings(WORKING_DIR_PATH)
+    learning_settings = load_learning_settings(settings_data)
     music_settings_raw: Dict[str, object] = {}
     if isinstance(settings_data, dict):
         maybe_music = settings_data.get("musicnames")
@@ -4734,6 +4757,90 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"catalog: {catalog_db_path} | shard: {shard_db_path}"
     )
     LOGGER.info(startup_info)
+
+    if args.learn_train or args.learn_queue or args.learn_score:
+        if not learning_settings.enable:
+            print("Learning subsystem disabled in settings.json (learning.enable=false).", file=sys.stderr)
+            return 2
+        if not args.label:
+            print("[ERROR] --label is required for learning commands.", file=sys.stderr)
+            return 2
+        shard_path = Path(shard_db_path)
+        if not shard_path.exists():
+            print(f"[ERROR] Shard database not found for label {args.label}.", file=sys.stderr)
+            return 2
+        conn = sqlite3.connect(shard_path)
+        try:
+            engine = LearningEngine(conn, working_dir=WORKING_DIR_PATH, settings=learning_settings)
+            if args.learn_train:
+                current = count_examples(conn)
+                if current < max(learning_settings.min_labels, 2):
+                    print(
+                        f"Learning: need at least {learning_settings.min_labels} labels before training (have {current}).",
+                        file=sys.stderr,
+                    )
+                    return 3
+                artifacts = engine.train()
+                if artifacts is None:
+                    print(
+                        "Learning: unable to fit model with the current labels.",
+                        file=sys.stderr,
+                    )
+                    return 3
+                metrics = artifacts.metrics
+                print(
+                    "Trained model {version} — auc={auc:.3f} brier={brier:.4f} ece={ece:.3f} n={n}".format(
+                        version=artifacts.version,
+                        auc=float(metrics.get("auc", 0.0)),
+                        brier=float(metrics.get("brier", 0.0)),
+                        ece=float(metrics.get("ece", 0.0)),
+                        n=int(metrics.get("n", 0)),
+                    )
+                )
+                if artifacts.onnx_path is not None:
+                    print(f"ONNX exported to {artifacts.onnx_path}")
+            if args.learn_queue:
+                limit = args.learn_limit or learning_settings.active.top_n
+                queue = engine.build_active_queue(limit=limit)
+                if not queue:
+                    print("Learning queue is empty — no unlabeled uncertain items found.")
+                else:
+                    print(f"Learning queue (top {len(queue)} by uncertainty):")
+                    for index, item in enumerate(queue, start=1):
+                        print(
+                            "{idx:02d}. {typ} {path} p_correct={prob:.3f} uncertainty={unc:.3f} confidence={conf:.3f}".format(
+                                idx=index,
+                                typ=item.item_type,
+                                path=item.path,
+                                prob=item.p_correct,
+                                unc=item.uncertainty,
+                                conf=item.source_confidence,
+                            )
+                        )
+                        if item.reasons:
+                            print("    reasons: " + ", ".join(item.reasons))
+            if args.learn_score:
+                scored = engine.score_path(args.learn_score)
+                if scored is None:
+                    print(
+                        f"[ERROR] Unable to collect features for {args.learn_score}; check that it exists in the queue.",
+                        file=sys.stderr,
+                    )
+                    return 4
+                print(
+                    "p_correct={prob:.3f} (model {version}) features={count}".format(
+                        prob=float(scored.get("p_correct", 0.0)),
+                        version=scored.get("version", "unknown"),
+                        count=len(scored.get("features_used", [])),
+                    )
+                )
+                print(
+                    "feature_list: "
+                    + ", ".join(sorted(scored.get("features_used", [])))
+                )
+            return 0
+        finally:
+            conn.close()
 
     if args.audit or args.audit_export or args.audit_baseline or args.audit_delta:
         return _run_audit_cli(args, Path(catalog_db_path), WORKING_DIR_PATH)
