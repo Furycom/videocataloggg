@@ -226,6 +226,25 @@ class DocPreviewResponse(PaginatedResponse):
     results: List[DocPreviewRow] = Field(..., description="Preview rows for this page.")
 
 
+class TextLiteRow(BaseModel):
+    """Row describing a TextLite plaintext preview."""
+
+    path: str = Field(..., description="Inventory path processed for TextLite.")
+    kind: Optional[str] = Field(None, description="Detected text kind (txt/md/log/…).")
+    bytes_sampled: int = Field(..., description="Approximate bytes sampled from the source file.")
+    lines_sampled: int = Field(..., description="Number of lines captured in the snippet.")
+    summary: Optional[str] = Field(None, description="Generated summary for the text sample.")
+    keywords: Optional[str] = Field(None, description="Keywords extracted from the sample.")
+    schema_json: Optional[str] = Field(None, description="Serialized schema hints (CSV headers, JSON keys…).")
+    updated_utc: Optional[str] = Field(None, description="Timestamp of the preview generation.")
+
+
+class TextLiteResponse(PaginatedResponse):
+    """Paginated response for TextLite previews."""
+
+    results: List[TextLiteRow] = Field(..., description="TextLite previews for this page.")
+
+
 class TextVerifyRow(BaseModel):
     """Row describing a subtitle/plot cross-check summary."""
 

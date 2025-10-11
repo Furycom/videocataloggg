@@ -18,6 +18,7 @@ from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_s
 from quality import QualitySettings, run_for_shard as run_quality_for_shard
 from quality.ffprobe import ffprobe_available as quality_ffprobe_available
 from textverify import TextVerifySettings
+from textlite import TextLiteSettings, run_for_shard as run_textlite_for_shard
 from robust import CancellationToken
 from musicnames import parse_music_name, score_parse_result
 from audit.run import AuditRequest, AuditCancelledError, run_audit_pack
@@ -2102,6 +2103,31 @@ class App:
         self.docpreview_worker: Optional[threading.Thread] = None
         self.docpreview_cancel: Optional[CancellationToken] = None
         self.docpreview_rows: Dict[str, dict] = {}
+        textlite_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_text = _SETTINGS.get("textlite")
+            if isinstance(maybe_text, dict):
+                textlite_cfg = maybe_text
+        self.textlite_config = TextLiteSettings.from_mapping(textlite_cfg)
+        self.textlite_enable_var = IntVar(value=1 if self.textlite_config.enable else 0)
+        self.textlite_max_bytes_var = IntVar(value=self.textlite_config.max_bytes)
+        self.textlite_max_lines_var = IntVar(value=self.textlite_config.max_lines)
+        if self.textlite_config.summary_tokens <= 60:
+            tl_summary_mode = "short"
+        elif self.textlite_config.summary_tokens >= 120:
+            tl_summary_mode = "long"
+        else:
+            tl_summary_mode = "medium"
+        self.textlite_summary_mode = StringVar(value=tl_summary_mode)
+        self.textlite_schema_csv_var = IntVar(value=1 if self.textlite_config.schema_csv_headers else 0)
+        self.textlite_schema_json_var = IntVar(value=1 if self.textlite_config.schema_json_keys else 0)
+        self.textlite_schema_yaml_var = IntVar(value=1 if self.textlite_config.schema_yaml_keys else 0)
+        self.textlite_status_var = StringVar(value="TextLite preview idle.")
+        self.textlite_progress_total = IntVar(value=0)
+        self.textlite_progress_done = IntVar(value=0)
+        self.textlite_worker: Optional[threading.Thread] = None
+        self.textlite_cancel: Optional[CancellationToken] = None
+        self.textlite_rows: Dict[str, dict] = {}
         quality_cfg: Dict[str, object] = {}
         if isinstance(_SETTINGS, dict):
             maybe_quality = _SETTINGS.get("quality")
@@ -2931,6 +2957,10 @@ class App:
         self.audit_tab.columnconfigure(0, weight=1)
         self.audit_tab.rowconfigure(1, weight=1)
         self.main_notebook.add(self.audit_tab, text="Audit")
+        self.textlite_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.textlite_tab.columnconfigure(0, weight=1)
+        self.textlite_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.textlite_tab, text="Text")
         self.docpreview_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
         self.docpreview_tab.columnconfigure(0, weight=1)
         self.docpreview_tab.rowconfigure(1, weight=1)
@@ -2947,6 +2977,7 @@ class App:
         self._build_structure_tab(self.structure_tab)
         self._build_quality_tab(self.quality_tab)
         self._build_audit_tab(self.audit_tab)
+        self._build_textlite_tab(self.textlite_tab)
         self._build_docpreview_tab(self.docpreview_tab)
         self._build_music_tab(self.music_tab)
 
@@ -4388,6 +4419,198 @@ class App:
                 "ffprobe not found. Install FFmpeg to enable quality scoring."
             )
 
+    def _build_textlite_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        controls = ttk.LabelFrame(
+            parent,
+            text="TextLite Preview (read-only)",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        controls.grid(row=0, column=0, sticky="ew")
+        for col in range(4):
+            controls.columnconfigure(col, weight=1 if col in (1, 3) else 0)
+
+        ttk.Checkbutton(
+            controls,
+            text="Enable TextLite previews",
+            variable=self.textlite_enable_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(controls, text="Max bytes:").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        bytes_spin = Spinbox(
+            controls,
+            from_=4096,
+            to=131072,
+            increment=1024,
+            textvariable=self.textlite_max_bytes_var,
+            width=8,
+            justify="center",
+        )
+        bytes_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        bytes_spin.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+
+        ttk.Label(controls, text="Max lines:").grid(row=1, column=2, sticky="e", pady=(12, 0))
+        lines_spin = Spinbox(
+            controls,
+            from_=40,
+            to=1200,
+            increment=20,
+            textvariable=self.textlite_max_lines_var,
+            width=6,
+            justify="center",
+        )
+        lines_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        lines_spin.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(12, 0))
+
+        summary_box = ttk.LabelFrame(
+            controls,
+            text="Summary length",
+            padding=(8, 4),
+            style="Card.TLabelframe",
+        )
+        summary_box.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        for idx, (mode, label) in enumerate(("short", "Short"), ("medium", "Medium"), ("long", "Long")):
+            ttk.Radiobutton(
+                summary_box,
+                text=label,
+                value=mode,
+                variable=self.textlite_summary_mode,
+            ).grid(row=0, column=idx, sticky="w", padx=(4 if idx else 0, 4))
+
+        schema_box = ttk.LabelFrame(
+            controls,
+            text="Schema extraction",
+            padding=(8, 4),
+            style="Card.TLabelframe",
+        )
+        schema_box.grid(row=2, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(12, 0))
+        ttk.Checkbutton(
+            schema_box,
+            text="CSV headers",
+            variable=self.textlite_schema_csv_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            schema_box,
+            text="JSON keys",
+            variable=self.textlite_schema_json_var,
+        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Checkbutton(
+            schema_box,
+            text="YAML keys",
+            variable=self.textlite_schema_yaml_var,
+        ).grid(row=0, column=2, sticky="w", padx=(12, 0))
+
+        actions = ttk.Frame(controls, style="Card.TFrame")
+        actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        actions.columnconfigure(3, weight=1)
+        ttk.Button(actions, text="Run TextLite", command=self.start_textlite_job, style="Accent.TButton").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(actions, text="Cancel", command=self.cancel_textlite_job).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(actions, text="Refresh results", command=self.refresh_textlite_results).grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
+        )
+
+        progress_frame = ttk.Frame(parent, style="Card.TFrame", padding=(16, 12))
+        progress_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        progress_frame.columnconfigure(0, weight=1)
+        self.textlite_progress_bar = ttk.Progressbar(
+            progress_frame,
+            mode="determinate",
+            maximum=1,
+            value=0,
+        )
+        self.textlite_progress_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            progress_frame,
+            textvariable=self.textlite_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.textlite_log = ScrolledText(progress_frame, height=6, wrap="word")
+        self.textlite_log.configure(
+            state="disabled",
+            background=self.colors["content"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+        )
+        self.textlite_log.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        results = ttk.LabelFrame(
+            parent,
+            text="Latest previews",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        results.grid(row=2, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(0, weight=1)
+        columns = ("path", "kind", "keywords", "summary", "schema", "updated")
+        self.textlite_tree = ttk.Treeview(
+            results,
+            columns=columns,
+            show="headings",
+            height=12,
+            style="Card.Treeview",
+        )
+        headings = {
+            "path": "Path",
+            "kind": "Kind",
+            "keywords": "Keywords",
+            "summary": "Summary",
+            "schema": "Schema",
+            "updated": "Updated",
+        }
+        widths = {
+            "path": 280,
+            "kind": 80,
+            "keywords": 160,
+            "summary": 320,
+            "schema": 200,
+            "updated": 140,
+        }
+        for key in columns:
+            self.textlite_tree.heading(key, text=headings[key])
+            anchor = "w" if key not in {"kind", "updated"} else "center"
+            self.textlite_tree.column(key, width=widths[key], anchor=anchor, stretch=True)
+        self.textlite_tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        tl_scroll = ttk.Scrollbar(results, orient="vertical", command=self.textlite_tree.yview)
+        tl_scroll.grid(row=0, column=1, sticky=(N, S))
+        self.textlite_tree.configure(yscrollcommand=tl_scroll.set)
+        self.textlite_tree.bind("<Double-1>", lambda _event: self.open_textlite_folder())
+
+        actions_row = ttk.Frame(parent, style="Card.TFrame")
+        actions_row.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(actions_row, text="Open folder", command=self.open_textlite_folder).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(actions_row, text="Copy path", command=self.copy_textlite_path).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(actions_row, text="Export…", command=self.export_textlite_results).grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
+        )
+
+        self.refresh_textlite_results()
+
     def _build_docpreview_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
@@ -4563,6 +4786,231 @@ class App:
         )
 
         self.refresh_docpreview_results()
+
+    def _textlite_summary_tokens(self) -> int:
+        mode = (self.textlite_summary_mode.get() or "medium").strip().lower()
+        mapping = {"short": 60, "medium": 80, "long": 120}
+        return mapping.get(mode, 80)
+
+    def _textlite_payload(self) -> Dict[str, object]:
+        schema_flags = {
+            "csv_headers": bool(self.textlite_schema_csv_var.get()),
+            "json_keys": bool(self.textlite_schema_json_var.get()),
+            "yaml_keys": bool(self.textlite_schema_yaml_var.get()),
+        }
+        payload = {
+            "enable": bool(self.textlite_enable_var.get()),
+            "max_bytes": int(self.textlite_max_bytes_var.get()),
+            "max_lines": int(self.textlite_max_lines_var.get()),
+            "head_lines": self.textlite_config.head_lines,
+            "mid_lines": self.textlite_config.mid_lines,
+            "tail_lines": self.textlite_config.tail_lines,
+            "summary_tokens": self._textlite_summary_tokens(),
+            "keywords_topk": self.textlite_config.keywords_topk,
+            "schema": schema_flags,
+            "skip_if_gt_mb": self.textlite_config.skip_if_gt_mb,
+            "gentle_sleep_ms": self.textlite_config.gentle_sleep_ms,
+            "gpu_allowed": self.textlite_config.gpu_allowed,
+        }
+        return payload
+
+    def _textlite_gentle_sleep(self) -> float:
+        base = max(0.0, (self.textlite_config.gentle_sleep_ms or 0) / 1000.0)
+        mount = self.path_var.get().strip() or "."
+        settings_dict = _SETTINGS if isinstance(_SETTINGS, dict) else {}
+        try:
+            perf_cfg = resolve_performance_config(mount, settings=settings_dict)
+            if getattr(perf_cfg, "gentle_io", False):
+                return max(base, 0.05)
+        except Exception:
+            return base
+        return base
+
+    def _reset_textlite_progress(self) -> None:
+        self.textlite_progress_total.set(0)
+        self.textlite_progress_done.set(0)
+        if hasattr(self, "textlite_progress_bar"):
+            self.textlite_progress_bar.configure(maximum=1, value=0)
+        if hasattr(self, "textlite_log"):
+            self.textlite_log.configure(state="normal")
+            self.textlite_log.delete("1.0", "end")
+            self.textlite_log.configure(state="disabled")
+
+    def _append_textlite_log(self, line: str) -> None:
+        if not hasattr(self, "textlite_log"):
+            return
+        self.textlite_log.configure(state="normal")
+        self.textlite_log.insert("end", line + "\n")
+        self.textlite_log.see("end")
+        self.textlite_log.configure(state="disabled")
+
+    def _get_selected_textlite_row(self) -> Optional[dict]:
+        if not hasattr(self, "textlite_tree"):
+            return None
+        selection = self.textlite_tree.selection()
+        if not selection:
+            return None
+        return self.textlite_rows.get(selection[0])
+
+    def refresh_textlite_results(self) -> None:
+        if not hasattr(self, "textlite_tree"):
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            self.textlite_rows.clear()
+            self.textlite_tree.delete(*self.textlite_tree.get_children())
+            self.textlite_status_var.set("TextLite idle. Select a drive to view results.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            self.textlite_rows.clear()
+            self.textlite_tree.delete(*self.textlite_tree.get_children())
+            self.textlite_status_var.set("TextLite tables not found for this drive.")
+            return
+        conn = sqlite3.connect(str(shard))
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='textlite_preview'"
+            )
+            if cur.fetchone() is None:
+                self.textlite_tree.delete(*self.textlite_tree.get_children())
+                self.textlite_rows.clear()
+                self.textlite_status_var.set("TextLite has not been run yet for this drive.")
+                return
+            cur.execute(
+                """
+                SELECT path, kind, bytes_sampled, lines_sampled, summary, keywords, schema_json, updated_utc
+                FROM textlite_preview
+                ORDER BY updated_utc DESC
+                LIMIT 200
+                """
+            )
+            rows = cur.fetchall()
+        except sqlite3.DatabaseError as exc:
+            self.textlite_tree.delete(*self.textlite_tree.get_children())
+            self.textlite_rows.clear()
+            self.textlite_status_var.set(f"TextLite query failed: {exc}")
+            return
+        finally:
+            conn.close()
+        self.textlite_tree.delete(*self.textlite_tree.get_children())
+        self.textlite_rows.clear()
+        for row in rows:
+            path = row["path"]
+            summary = row["summary"] or ""
+            summary_display = summary[:197] + "…" if len(summary) > 200 else summary
+            keywords_value = row["keywords"] or ""
+            keywords_list: List[str]
+            if isinstance(keywords_value, str):
+                try:
+                    parsed = json.loads(keywords_value)
+                    if isinstance(parsed, list):
+                        keywords_list = [str(item) for item in parsed if str(item).strip()]
+                    else:
+                        keywords_list = [kw.strip() for kw in keywords_value.split(",") if kw.strip()]
+                except json.JSONDecodeError:
+                    keywords_list = [kw.strip() for kw in keywords_value.split(",") if kw.strip()]
+            elif isinstance(keywords_value, list):
+                keywords_list = [str(item) for item in keywords_value if str(item).strip()]
+            else:
+                keywords_list = [str(keywords_value)]
+            keywords_display = ", ".join(keywords_list[:6])
+            schema_value = row["schema_json"] or ""
+            schema_display = ""
+            schema_dict: Dict[str, object] = {}
+            if schema_value:
+                try:
+                    schema_dict = json.loads(schema_value)
+                except json.JSONDecodeError:
+                    schema_dict = {}
+            if isinstance(schema_dict, dict) and schema_dict:
+                parts: List[str] = []
+                for key, values in schema_dict.items():
+                    if isinstance(values, list):
+                        joined = ", ".join(str(v) for v in values[:4])
+                        parts.append(f"{key}:{joined}")
+                schema_display = " | ".join(parts)
+            values = (
+                path,
+                row["kind"] or "",
+                keywords_display,
+                summary_display,
+                schema_display,
+                row["updated_utc"] or "",
+            )
+            item = self.textlite_tree.insert("", "end", values=values)
+            self.textlite_rows[item] = {
+                "path": path,
+                "kind": row["kind"],
+                "bytes_sampled": row["bytes_sampled"],
+                "lines_sampled": row["lines_sampled"],
+                "keywords": keywords_list,
+                "summary": summary,
+                "schema_json": schema_value,
+                "updated_utc": row["updated_utc"],
+            }
+        self.textlite_status_var.set(f"TextLite entries: {len(rows)}")
+
+    def open_textlite_folder(self) -> None:
+        row = self._get_selected_textlite_row()
+        if not row:
+            return
+        path = row.get("path")
+        if path:
+            self._open_path_in_explorer(path)
+
+    def copy_textlite_path(self) -> None:
+        row = self._get_selected_textlite_row()
+        if not row:
+            return
+        path = row.get("path") or ""
+        if not path:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+        except Exception:
+            messagebox.showerror("TextLite", "Failed to copy path to clipboard.")
+
+    def export_textlite_results(self) -> None:
+        if not self.textlite_rows:
+            messagebox.showinfo("TextLite", "No TextLite results to export.")
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Export TextLite",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not destination:
+            return
+        rows = list(self.textlite_rows.values())
+        try:
+            if destination.lower().endswith(".json"):
+                with open(destination, "w", encoding="utf-8") as handle:
+                    json.dump(rows, handle, ensure_ascii=False, indent=2)
+            else:
+                with open(destination, "w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=[
+                            "path",
+                            "kind",
+                            "bytes_sampled",
+                            "lines_sampled",
+                            "keywords",
+                            "summary",
+                            "schema_json",
+                            "updated_utc",
+                        ],
+                    )
+                    writer.writeheader()
+                    writer.writerows(rows)
+        except Exception as exc:
+            messagebox.showerror("TextLite", f"Failed to export results: {exc}")
+            return
+        messagebox.showinfo("TextLite", f"Exported {len(rows)} rows to {destination}")
 
     def _docpreview_summary_tokens(self) -> int:
         mode = (self.docpreview_summary_mode.get() or "medium").strip().lower()
@@ -4743,6 +5191,76 @@ class App:
             elif key == "message":
                 add(f"Probe message: {value}")
         return "; ".join(lines)
+
+    def start_textlite_job(self) -> None:
+        if self.textlite_worker and self.textlite_worker.is_alive():
+            messagebox.showwarning("TextLite", "A TextLite preview job is already running.")
+            return
+        if not bool(self.textlite_enable_var.get()):
+            messagebox.showinfo("TextLite", "Enable the TextLite toggle before running.")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showerror("TextLite", "Fill the Disk Label field first.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror("TextLite", f"Shard database not found for '{label}'.")
+            return
+        payload = self._textlite_payload()
+        overrides = dict(payload)
+        overrides["enable"] = True
+        settings = self.textlite_config.with_overrides(**overrides)
+        self.textlite_config = settings
+        try:
+            update_settings(WORKING_DIR_PATH, textlite=payload)
+        except Exception:
+            pass
+        if isinstance(_SETTINGS, dict):
+            _SETTINGS["textlite"] = dict(payload)
+        self._reset_textlite_progress()
+        self.textlite_status_var.set("TextLite preview running…")
+        gentle_sleep = self._textlite_gentle_sleep()
+        cancel_token = CancellationToken()
+        self.textlite_cancel = cancel_token
+
+        def progress(payload: Dict[str, object]) -> None:
+            self.worker_queue.put({"type": "textlite-progress", "payload": payload})
+
+        def worker() -> None:
+            try:
+                self.worker_queue.put({"type": "textlite-log", "line": f"Starting TextLite for {label}…"})
+                gpu_settings = _SETTINGS.get("gpu") if isinstance(_SETTINGS, dict) else {}
+                summary = run_textlite_for_shard(
+                    shard,
+                    settings=settings,
+                    gpu_settings=gpu_settings,
+                    progress_callback=progress,
+                    cancellation=cancel_token,
+                    gentle_sleep=gentle_sleep,
+                )
+                self.worker_queue.put(
+                    {
+                        "type": "textlite-complete",
+                        "summary": {
+                            "processed": summary.processed,
+                            "skipped": summary.skipped,
+                            "errors": summary.errors,
+                            "updated": summary.updated,
+                            "elapsed_s": summary.elapsed_s,
+                        },
+                    }
+                )
+            except Exception as exc:
+                self.worker_queue.put({"type": "textlite-complete", "error": str(exc)})
+
+        self.textlite_worker = threading.Thread(target=worker, daemon=True)
+        self.textlite_worker.start()
+
+    def cancel_textlite_job(self) -> None:
+        if self.textlite_cancel:
+            self.textlite_cancel.set()
+            self.textlite_status_var.set("Cancelling TextLite…")
 
     def start_docpreview_job(self) -> None:
         if self.docpreview_worker and self.docpreview_worker.is_alive():
@@ -6867,6 +7385,85 @@ class App:
             rows = cursor.execute(sql, params).fetchall()
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             formatted = format_results(rows)
+            results_map: Dict[str, dict] = {item.get("path"): item for item in formatted if item.get("path")}
+            textlite_hits = 0
+            fts_query = None
+            text_query = query_parts.get("text")
+            if text_query:
+                terms = [term.strip() for term in text_query.split() if term.strip()]
+                if terms:
+                    fts_query = " OR ".join(terms)
+                else:
+                    fts_query = text_query
+            if fts_query:
+                try:
+                    tl_cursor = connection.cursor()
+                    tl_rows = tl_cursor.execute(
+                        """
+                        SELECT prev.path, prev.kind, prev.summary, prev.keywords, prev.schema_json, prev.updated_utc
+                        FROM textlite_fts AS ft
+                        JOIN textlite_preview AS prev ON prev.path = ft.path
+                        WHERE textlite_fts MATCH ?
+                        ORDER BY bm25(textlite_fts)
+                        LIMIT 50
+                        """,
+                        (fts_query,),
+                    ).fetchall()
+                except sqlite3.DatabaseError:
+                    tl_rows = []
+                for tl_row in tl_rows:
+                    path = tl_row["path"]
+                    if not path:
+                        continue
+                    textlite_hits += 1
+                    inv_row = connection.execute(
+                        """
+                        SELECT path, name, category, size_bytes, mtime_utc, drive_label
+                        FROM inventory
+                        WHERE path = ?
+                        LIMIT 1
+                        """,
+                        (path,),
+                    ).fetchone()
+                    if inv_row is not None:
+                        formatted_inv = format_results([inv_row])[0]
+                    else:
+                        name = os.path.basename(path)
+                        formatted_inv = {
+                            "path": path,
+                            "name": name,
+                            "category": "TextLite",
+                            "size_bytes": 0,
+                            "size_display": "0 B",
+                            "modified_display": "—",
+                            "modified_raw": None,
+                            "drive": drive_label,
+                            "lower_name": name.lower(),
+                        }
+                    category = formatted_inv.get("category") or ""
+                    if "TextLite" not in category:
+                        formatted_inv["category"] = f"{category} · TextLite" if category else "TextLite"
+                    keywords_value = tl_row["keywords"] or ""
+                    keywords_display = ""
+                    try:
+                        parsed_kw = json.loads(keywords_value) if isinstance(keywords_value, str) else keywords_value
+                        if isinstance(parsed_kw, list):
+                            keywords_display = ", ".join(str(item) for item in parsed_kw[:6])
+                        elif parsed_kw:
+                            keywords_display = str(parsed_kw)
+                    except json.JSONDecodeError:
+                        if isinstance(keywords_value, str):
+                            keywords_display = keywords_value
+                    formatted_inv["textlite_summary"] = tl_row["summary"] or ""
+                    formatted_inv["textlite_keywords"] = keywords_display
+                    formatted_inv["textlite_kind"] = tl_row["kind"] or ""
+                    formatted_inv["textlite_schema"] = tl_row["schema_json"] or ""
+                    formatted_inv["textlite_updated"] = tl_row["updated_utc"] or ""
+                    if path in results_map:
+                        results_map[path].update(formatted_inv)
+                    else:
+                        formatted.append(formatted_inv)
+                        results_map[path] = formatted_inv
             if cancel_event.is_set():
                 return
             self._search_queue.put(
@@ -6878,6 +7475,7 @@ class App:
                     "drive": drive_label,
                     "fallback": not use_name,
                     "migration_error": migration_error,
+                    "textlite_hits": textlite_hits,
                 }
             )
         except sqlite3.OperationalError as exc:
@@ -6935,6 +7533,9 @@ class App:
             status = f"Results: {total:,} (showing first 1,000)"
         if payload.get("fallback"):
             status += " — path-only search"
+        textlite_hits = int(payload.get("textlite_hits") or 0)
+        if textlite_hits:
+            status += f" — TextLite matches: {textlite_hits}"
         self.search_status_var.set(status)
         migration_error = payload.get("migration_error")
         if migration_error:
@@ -9021,6 +9622,52 @@ class App:
             if hasattr(self, "docpreview_progress_bar"):
                 current_max = float(self.docpreview_progress_bar["maximum"] or 1)
                 self.docpreview_progress_bar.configure(value=current_max)
+        elif etype == "textlite-progress":
+            payload = event.get("payload") or {}
+            total = int(payload.get("total") or 0)
+            processed = int(payload.get("processed") or 0)
+            skipped = int(payload.get("skipped") or 0)
+            errors = int(payload.get("errors") or 0)
+            self.textlite_progress_total.set(total)
+            self.textlite_progress_done.set(processed)
+            if total <= 0:
+                self.textlite_progress_bar.configure(maximum=1, value=0)
+            else:
+                self.textlite_progress_bar.configure(maximum=total, value=processed)
+            snippet = payload.get("path") or ""
+            status = f"TextLite • {processed}/{total} processed (skipped={skipped}, errors={errors})"
+            self.textlite_status_var.set(status)
+            if snippet:
+                self._append_textlite_log(str(snippet))
+        elif etype == "textlite-log":
+            line = event.get("line")
+            if line:
+                self._append_textlite_log(str(line))
+        elif etype == "textlite-complete":
+            self.textlite_worker = None
+            self.textlite_cancel = None
+            summary = event.get("summary") or {}
+            error = event.get("error")
+            if error:
+                message = f"TextLite failed: {error}"
+                self.textlite_status_var.set(message)
+                messagebox.showerror("TextLite", message)
+            else:
+                processed = int(summary.get("processed", 0) or 0)
+                skipped = int(summary.get("skipped", 0) or 0)
+                errors = int(summary.get("errors", 0) or 0)
+                updated = int(summary.get("updated", 0) or 0)
+                elapsed = float(summary.get("elapsed_s", 0.0) or 0.0)
+                status = (
+                    "TextLite complete — "
+                    f"processed={processed} skipped={skipped} errors={errors} updated={updated} elapsed={elapsed:.1f}s"
+                )
+                self.textlite_status_var.set(status)
+                self._append_textlite_log(status)
+                self.refresh_textlite_results()
+            if hasattr(self, "textlite_progress_bar"):
+                current_max = float(self.textlite_progress_bar["maximum"] or 1)
+                self.textlite_progress_bar.configure(value=current_max)
         elif etype == "audit-progress":
             stage = str(event.get("stage") or "audit")
             payload = event.get("payload") or {}
