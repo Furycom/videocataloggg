@@ -64,6 +64,7 @@ from core.db import connect, transaction
 from core.settings import load_settings
 from learning import LearningEngine, load_learning_settings
 from learning.db import count_examples
+from assistant_monitor import get_dashboard
 from exports import ExportFilters, export_catalog, parse_since
 from inventory import InventoryRow, InventoryWriter, categorize, detect_mime
 from semantic import (
@@ -3365,6 +3366,27 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override thumbnail image format for visual review (e.g. JPEG, PNG).",
     )
     parser.add_argument(
+        "--assistant-dashboard",
+        action="store_true",
+        help="Print a snapshot of the assistant dashboard and exit.",
+    )
+    parser.add_argument(
+        "--assistant-warmup-model",
+        action="store_true",
+        help="Preload the local assistant model before exiting.",
+    )
+    parser.add_argument(
+        "--assistant-warmup-tmdb",
+        action="store_true",
+        help="Warm the TMDb cache using items from the review queues.",
+    )
+    parser.add_argument(
+        "--limit",
+        dest="assistant_warmup_limit",
+        type=int,
+        help="Limit the number of review queue entries to warm when using --assistant-warmup-tmdb.",
+    )
+    parser.add_argument(
         "--learn-train",
         action="store_true",
         help="Train the learning model on collected confirmations/denials.",
@@ -4699,6 +4721,149 @@ def _auto_optimize_after_scan(shard_path: Path, label: str, options: Maintenance
         LOGGER.warning("Auto maintenance failed for %s: %s", label, exc)
 
 
+def _print_assistant_snapshot(snapshot: Dict[str, Any]) -> None:
+    runtime = snapshot.get("runtime") or {}
+    runtime_name = runtime.get("runtime") or "offline"
+    model_name = runtime.get("model") or "—"
+    quant = runtime.get("quantization")
+    model_text = f"{model_name} ({quant})" if quant else str(model_name)
+    gpu_flag = "1" if runtime.get("gpu") else "0"
+    context = runtime.get("context")
+    context_text = str(int(context)) if context else "—"
+    print(f"Runtime: {runtime_name}")
+    print(f"Model: {model_text}")
+    print(f"GPU: {gpu_flag}")
+    print(f"Context: {context_text}")
+    budget = snapshot.get("tool_budget") or {}
+    remaining = int(budget.get("remaining") or 0)
+    total = int(budget.get("total") or 0)
+    used = int(budget.get("used") or 0)
+    print(f"Tool budget: remaining {remaining}/{total} used {used}")
+    latency = snapshot.get("latency") or {}
+    p50 = int(round(latency.get("p50") or 0))
+    p90 = int(round(latency.get("p90") or 0))
+    p95 = int(round(latency.get("p95") or 0))
+    print(f"Latency ms: p50={p50} p90={p90} p95={p95}")
+    tools = snapshot.get("tools") or {}
+    summary = tools.get("summary") or {}
+    success = int(summary.get("success") or 0)
+    failed = int(summary.get("failed") or 0)
+    total_calls = int(summary.get("total") or (success + failed))
+    print(f"Tool calls: success={success} fail={failed} total={total_calls}")
+    api_stats = snapshot.get("api") or {}
+    if api_stats:
+        print("API cache status:")
+        for provider, info in api_stats.items():
+            ratio = int(round((info.get("hit_ratio") or 0.0) * 100))
+            remaining_api = info.get("remaining")
+            remaining_text = str(remaining_api) if remaining_api is not None else "-"
+            reset = info.get("reset")
+            if reset:
+                try:
+                    reset_text = datetime.utcfromtimestamp(int(reset)).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    reset_text = str(reset)
+            else:
+                reset_text = "-"
+            status = info.get("status") or "unknown"
+            print(
+                f"  {provider.upper()}: hit={ratio}% remaining={remaining_text} reset={reset_text} status={status}"
+            )
+    slow_tools = tools.get("slow") or []
+    if slow_tools:
+        print("Slowest tools (p95 ms):")
+        for entry in slow_tools[:5]:
+            name = entry.get("name") or "—"
+            value = int(round(entry.get("p95") or 0))
+            print(f"  {name}: {value}")
+    action_log = snapshot.get("log") or []
+    if action_log:
+        print("Recent actions:")
+        for entry in action_log[-5:]:
+            timestamp = entry.get("timestamp") or ""
+            action = entry.get("action") or ""
+            outcome = entry.get("outcome") or ""
+            print(f"  {timestamp} {action}: {outcome}")
+
+
+def _wait_for_dashboard_action(dashboard, *, timeout: float = 180.0) -> Optional[Dict[str, Any]]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        snapshot = dashboard.snapshot()
+        action = snapshot.get("action")
+        if not action or action.get("status") != "running":
+            return action
+        time.sleep(0.5)
+    return {"status": "timeout"}
+
+
+def _run_assistant_cli(args: argparse.Namespace, settings_data: Dict[str, Any]) -> Optional[int]:
+    if not (
+        getattr(args, "assistant_dashboard", False)
+        or getattr(args, "assistant_warmup_model", False)
+        or getattr(args, "assistant_warmup_tmdb", False)
+    ):
+        return None
+    catalog_path = (
+        _expand_user_path(args.catalog_db)
+        if getattr(args, "catalog_db", None)
+        else Path(DEFAULT_DB_PATH)
+    )
+    dashboard = get_dashboard(
+        WORKING_DIR_PATH,
+        catalog_path,
+        settings_data if isinstance(settings_data, dict) else {},
+    )
+    try:
+        if getattr(args, "assistant_dashboard", False):
+            snapshot = dashboard.snapshot()
+            _print_assistant_snapshot(snapshot)
+            return 0
+        if getattr(args, "assistant_warmup_model", False):
+            try:
+                started = dashboard.preload_model()
+            except Exception as exc:
+                print(f"[ERROR] Unable to preload model: {exc}", file=sys.stderr)
+                return 1
+            if not started:
+                print("Assistant dashboard action already running.")
+            result = _wait_for_dashboard_action(dashboard, timeout=180.0)
+            if result:
+                status = result.get("status", "unknown")
+                duration = int(round(result.get("duration_ms") or 0))
+                print(f"Model warmup status: {status} duration={duration}ms")
+                if status in {"timeout", "rate-limited"} or status.startswith("error"):
+                    return 2
+            return 0
+        if getattr(args, "assistant_warmup_tmdb", False):
+            limit = getattr(args, "assistant_warmup_limit", None)
+            try:
+                started = dashboard.warm_tmdb_cache(limit=limit)
+            except Exception as exc:
+                print(f"[ERROR] Unable to warm TMDb cache: {exc}", file=sys.stderr)
+                return 1
+            if not started:
+                print("Assistant dashboard action already running.")
+                return 1
+            result = _wait_for_dashboard_action(dashboard, timeout=300.0)
+            if result:
+                status = result.get("status", "unknown")
+                requested = result.get("requested")
+                served = result.get("served_from_cache")
+                details = f"Warm TMDb cache status: {status}"
+                if requested is not None:
+                    details += f" requests={requested}"
+                if served is not None:
+                    details += f" cache_hits={served}"
+                print(details)
+                if status in {"timeout", "rate-limited"} or status.startswith("error"):
+                    return 2
+            return 0
+    finally:
+        dashboard.shutdown()
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
 
@@ -4708,6 +4873,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     settings_data = load_settings(WORKING_DIR_PATH)
+    assistant_exit = _run_assistant_cli(args, settings_data)
+    if assistant_exit is not None:
+        return assistant_exit
     learning_settings = load_learning_settings(settings_data)
     music_settings_raw: Dict[str, object] = {}
     if isinstance(settings_data, dict):

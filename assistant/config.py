@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
+from assistant_monitor import AssistantDashboardSettings
+
 
 RuntimeMode = Literal["auto", "ollama", "llama_cpp", "mlc"]
 IndexBackend = Literal["faiss", "hnswlib"]
@@ -83,6 +85,9 @@ def ensure_settings_section(path: Path) -> None:
     except Exception:
         return
     if "assistant" in payload:
+        if "assistant_dashboard" not in payload:
+            payload["assistant_dashboard"] = AssistantDashboardSettings().to_json()
         return
     payload["assistant"] = AssistantSettings().to_json()
+    payload["assistant_dashboard"] = AssistantDashboardSettings().to_json()
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

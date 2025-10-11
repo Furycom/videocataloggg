@@ -187,6 +187,7 @@ from visualreview import ReviewRunner, VisualReviewStore, load_visualreview_sett
 from learning import LearningEngine, LearningExamplePayload, load_learning_settings
 from learning.engine import ActiveItem
 from learning.db import count_examples
+from assistant_monitor import AssistantDashboard, get_dashboard
 
 try:
     from assistant import AssistantService, AssistantStatus
@@ -2327,6 +2328,31 @@ class App:
             self.assistant_default_min_score = float(rag_cfg.get("min_score", 0.25))
         except (TypeError, ValueError):
             self.assistant_default_min_score = 0.25
+
+        settings_payload = _SETTINGS if isinstance(_SETTINGS, dict) else {}
+        try:
+            self.assistant_dashboard: Optional[AssistantDashboard] = get_dashboard(
+                WORKING_DIR_PATH,
+                Path(self.db_path.get()),
+                settings_payload,
+            )
+        except Exception:
+            self.assistant_dashboard = None
+        self.assistant_dashboard_runtime_var = StringVar(value="Runtime: offline")
+        self.assistant_dashboard_model_var = StringVar(value="Model: —")
+        self.assistant_dashboard_gpu_var = StringVar(value="GPU: 0")
+        self.assistant_dashboard_context_var = StringVar(value="Context: —")
+        self.assistant_dashboard_budget_strip_var = StringVar(value="Budget: —")
+        self.assistant_dashboard_latency_var = StringVar(value="p50=0ms | p90=0ms | p95=0ms")
+        self.assistant_dashboard_tool_summary_var = StringVar(value="Tools success=0 fail=0")
+        self.assistant_dashboard_action_var = StringVar(value="No background action running.")
+        self.assistant_dashboard_api_tree: Optional[ttk.Treeview] = None
+        self.assistant_dashboard_tools_tree: Optional[ttk.Treeview] = None
+        self.assistant_dashboard_log_tree: Optional[ttk.Treeview] = None
+        self.assistant_dashboard_update_job: Optional[str] = None
+        self.assistant_dashboard_preload_button: Optional[ttk.Button] = None
+        self.assistant_dashboard_warmup_button: Optional[ttk.Button] = None
+        self.assistant_dashboard_cancel_button: Optional[ttk.Button] = None
 
         self.audit_status_var = StringVar(value="Audit idle.")
         self.audit_summary_var = StringVar(value="Audit has not been run yet.")
@@ -6279,15 +6305,164 @@ class App:
             row=3, column=5, sticky="e", pady=(12, 0)
         )
 
+        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(3, weight=1)
+
+        dashboard = ttk.LabelFrame(parent, text="Dashboard", padding=(16, 12), style="Card.TLabelframe")
+        dashboard.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        dashboard.columnconfigure(0, weight=1)
+        dashboard.columnconfigure(1, weight=1)
+        dashboard.columnconfigure(2, weight=1)
+        dashboard.rowconfigure(1, weight=1)
+        dashboard.rowconfigure(3, weight=1)
+        strip = ttk.Frame(dashboard, padding=(0, 0, 0, 8), style="Card.TFrame")
+        strip.grid(row=0, column=0, columnspan=3, sticky="ew")
+        strip.columnconfigure(4, weight=1)
+        for idx, var in enumerate(
+            [
+                self.assistant_dashboard_runtime_var,
+                self.assistant_dashboard_model_var,
+                self.assistant_dashboard_gpu_var,
+                self.assistant_dashboard_context_var,
+                self.assistant_dashboard_budget_strip_var,
+            ]
+        ):
+            ttk.Label(strip, textvariable=var, style="Subtle.TLabel").grid(
+                row=0,
+                column=idx,
+                sticky="w",
+                padx=(0 if idx == 0 else 16, 0),
+            )
+
+        latency_card = ttk.LabelFrame(dashboard, text="LLM latency", padding=(12, 8), style="Card.TLabelframe")
+        latency_card.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(latency_card, textvariable=self.assistant_dashboard_latency_var).grid(
+            row=0, column=0, sticky="w"
+        )
+
+        api_card = ttk.LabelFrame(dashboard, text="API cache & quota", padding=(12, 8), style="Card.TLabelframe")
+        api_card.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
+        api_card.columnconfigure(0, weight=1)
+        api_columns = ("provider", "hit", "remaining", "reset", "status")
+        self.assistant_dashboard_api_tree = ttk.Treeview(
+            api_card,
+            columns=api_columns,
+            show="headings",
+            height=4,
+            style="Card.Treeview",
+        )
+        headings = {
+            "provider": "Source",
+            "hit": "Hit %",
+            "remaining": "Remaining",
+            "reset": "Reset",
+            "status": "Status",
+        }
+        widths = {"provider": 110, "hit": 70, "remaining": 90, "reset": 120, "status": 80}
+        for key in api_columns:
+            self.assistant_dashboard_api_tree.heading(key, text=headings[key])
+            self.assistant_dashboard_api_tree.column(
+                key,
+                width=widths[key],
+                minwidth=60,
+                anchor="w" if key != "status" else "center",
+                stretch=(key in {"provider", "hit", "remaining", "reset"}),
+            )
+        self.assistant_dashboard_api_tree.grid(row=0, column=0, sticky="nsew")
+        api_scroll = ttk.Scrollbar(api_card, orient="vertical", command=self.assistant_dashboard_api_tree.yview)
+        api_scroll.grid(row=0, column=1, sticky="ns")
+        self.assistant_dashboard_api_tree.configure(yscrollcommand=api_scroll.set)
+        for status, color_key in {
+            "green": "success",
+            "yellow": "warning",
+            "red": "danger",
+            "unknown": "muted_text",
+        }.items():
+            self.assistant_dashboard_api_tree.tag_configure(
+                f"status-{status}",
+                foreground=self.colors.get(color_key, self.colors.get("text", "#e2e8f0")),
+            )
+
+        tools_card = ttk.LabelFrame(dashboard, text="Tools", padding=(12, 8), style="Card.TLabelframe")
+        tools_card.grid(row=1, column=2, sticky="nsew", padx=(12, 0))
+        tools_card.columnconfigure(0, weight=1)
+        ttk.Label(tools_card, textvariable=self.assistant_dashboard_tool_summary_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        tool_columns = ("tool", "p95")
+        self.assistant_dashboard_tools_tree = ttk.Treeview(
+            tools_card,
+            columns=tool_columns,
+            show="headings",
+            height=4,
+            style="Card.Treeview",
+        )
+        self.assistant_dashboard_tools_tree.heading("tool", text="Tool")
+        self.assistant_dashboard_tools_tree.heading("p95", text="p95 ms")
+        self.assistant_dashboard_tools_tree.column("tool", width=120, anchor="w", stretch=True)
+        self.assistant_dashboard_tools_tree.column("p95", width=80, anchor="e", stretch=False)
+        self.assistant_dashboard_tools_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+
+        action_bar = ttk.Frame(dashboard, padding=(0, 12, 0, 0), style="Card.TFrame")
+        action_bar.grid(row=2, column=0, columnspan=3, sticky="ew")
+        action_bar.columnconfigure(3, weight=1)
+        self.assistant_dashboard_preload_button = ttk.Button(
+            action_bar,
+            text="Preload model",
+            command=self._assistant_dashboard_preload,
+        )
+        self.assistant_dashboard_preload_button.grid(row=0, column=0, sticky="w")
+        self.assistant_dashboard_warmup_button = ttk.Button(
+            action_bar,
+            text="Warm TMDb cache",
+            command=self._assistant_dashboard_warm_tmdb,
+        )
+        self.assistant_dashboard_warmup_button.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.assistant_dashboard_cancel_button = ttk.Button(
+            action_bar,
+            text="Cancel",
+            command=self._assistant_dashboard_cancel,
+        )
+        self.assistant_dashboard_cancel_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(action_bar, textvariable=self.assistant_dashboard_action_var, style="Subtle.TLabel").grid(
+            row=0, column=3, sticky="w", padx=(16, 0)
+        )
+
+        log_frame = ttk.LabelFrame(dashboard, text="Activity log", padding=(12, 8), style="Card.TLabelframe")
+        log_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
+        log_frame.columnconfigure(0, weight=1)
+        self.assistant_dashboard_log_tree = ttk.Treeview(
+            log_frame,
+            columns=("time", "message"),
+            show="headings",
+            height=4,
+            style="Card.Treeview",
+        )
+        self.assistant_dashboard_log_tree.heading("time", text="Time")
+        self.assistant_dashboard_log_tree.heading("message", text="Outcome")
+        self.assistant_dashboard_log_tree.column("time", width=132, minwidth=110, anchor="w", stretch=False)
+        self.assistant_dashboard_log_tree.column("message", width=420, minwidth=260, anchor="w", stretch=True)
+        self.assistant_dashboard_log_tree.grid(row=0, column=0, sticky="nsew")
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.assistant_dashboard_log_tree.yview)
+        log_scroll.grid(row=0, column=1, sticky="ns")
+        self.assistant_dashboard_log_tree.configure(yscrollcommand=log_scroll.set)
+
+        if self.assistant_dashboard_preload_button is not None:
+            self._assistant_controls.append(self.assistant_dashboard_preload_button)
+        if self.assistant_dashboard_warmup_button is not None:
+            self._assistant_controls.append(self.assistant_dashboard_warmup_button)
+        if self.assistant_dashboard_cancel_button is not None:
+            self._assistant_controls.append(self.assistant_dashboard_cancel_button)
+
         chat_frame = ttk.LabelFrame(parent, text="Chat", padding=(16, 12), style="Card.TLabelframe")
-        chat_frame.grid(row=1, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        chat_frame.grid(row=2, column=0, sticky=(N, S, E, W), pady=(12, 0))
         chat_frame.columnconfigure(0, weight=1)
         chat_frame.rowconfigure(0, weight=1)
         self.assistant_chat_widget = ScrolledText(chat_frame, height=12, wrap="word", state="disabled")
         self.assistant_chat_widget.grid(row=0, column=0, sticky=(N, S, E, W))
 
         tool_frame = ttk.LabelFrame(parent, text="Tool calls", padding=(16, 12), style="Card.TLabelframe")
-        tool_frame.grid(row=2, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        tool_frame.grid(row=3, column=0, sticky=(N, S, E, W), pady=(12, 0))
         tool_frame.columnconfigure(0, weight=1)
         tool_frame.rowconfigure(0, weight=1)
         columns = ("tool", "summary")
@@ -6303,7 +6478,7 @@ class App:
         self.assistant_tool_tree.configure(yscrollcommand=tool_scroll.set)
 
         input_frame = ttk.Frame(parent, padding=(0, 12, 0, 0), style="Card.TFrame")
-        input_frame.grid(row=3, column=0, sticky="ew")
+        input_frame.grid(row=4, column=0, sticky="ew")
         input_frame.columnconfigure(1, weight=1)
         ttk.Label(input_frame, text="Ask:").grid(row=0, column=0, sticky="w", padx=(0, 12))
         entry = ttk.Entry(input_frame, textvariable=self.assistant_input_var)
@@ -6313,7 +6488,7 @@ class App:
         self.assistant_send_button.grid(row=0, column=2, sticky="ew", padx=(12, 0))
 
         buttons_frame = ttk.Frame(parent, padding=(0, 8, 0, 12), style="Card.TFrame")
-        buttons_frame.grid(row=4, column=0, sticky="ew")
+        buttons_frame.grid(row=5, column=0, sticky="ew")
         buttons_frame.columnconfigure(3, weight=1)
         self.assistant_create_task_button = ttk.Button(
             buttons_frame, text="Create task from answer", command=self._assistant_create_task_from_answer
@@ -6387,6 +6562,13 @@ class App:
     def _save_assistant_settings(self) -> None:
         payload = self._assistant_settings_payload()
         update_settings(WORKING_DIR_PATH, assistant=payload)
+        settings_payload = load_settings(WORKING_DIR_PATH)
+        if self.assistant_dashboard is not None and isinstance(settings_payload, dict):
+            try:
+                self.assistant_dashboard.reload_settings(settings_payload)
+                self._refresh_assistant_dashboard_view()
+            except Exception:
+                LOGGER.debug("Unable to refresh assistant dashboard after settings update")
         self._invalidate_assistant_service()
 
     def _on_assistant_toggle(self) -> None:
@@ -6415,7 +6597,18 @@ class App:
         if self.assistant_service is None:
             settings_payload = load_settings(WORKING_DIR_PATH)
             db_path = Path(self.db_path.get())
-            self.assistant_service = AssistantService(settings_payload, WORKING_DIR_PATH, db_path)
+            if self.assistant_dashboard is not None and isinstance(settings_payload, dict):
+                try:
+                    self.assistant_dashboard.update_db_path(db_path)
+                    self.assistant_dashboard.reload_settings(settings_payload)
+                except Exception:
+                    LOGGER.debug("Unable to refresh dashboard before starting assistant service")
+            self.assistant_service = AssistantService(
+                settings_payload,
+                WORKING_DIR_PATH,
+                db_path,
+                dashboard=self.assistant_dashboard,
+            )
             status = self.assistant_service.ensure_ready()
             self._update_assistant_status(status)
         return self.assistant_service
@@ -6594,6 +6787,158 @@ class App:
             self._show_toast("SQL copied to clipboard", "info")
         except Exception as exc:
             messagebox.showerror("Assistant", f"Unable to copy SQL: {exc}")
+
+    def _assistant_dashboard_preload(self) -> None:
+        if self.assistant_dashboard is None:
+            messagebox.showinfo("Assistant", "Dashboard is unavailable.")
+            return
+        try:
+            started = self.assistant_dashboard.preload_model()
+        except Exception as exc:
+            messagebox.showerror("Assistant", f"Unable to preload model: {exc}")
+            return
+        if not started:
+            messagebox.showinfo("Assistant", "Another dashboard action is already running.")
+
+    def _assistant_dashboard_warm_tmdb(self) -> None:
+        if self.assistant_dashboard is None:
+            messagebox.showinfo("Assistant", "Dashboard is unavailable.")
+            return
+        try:
+            started = self.assistant_dashboard.warm_tmdb_cache()
+        except Exception as exc:
+            messagebox.showerror("Assistant", f"Unable to warm TMDb cache: {exc}")
+            return
+        if not started:
+            messagebox.showinfo("Assistant", "Another dashboard action is already running.")
+
+    def _assistant_dashboard_cancel(self) -> None:
+        if self.assistant_dashboard is None:
+            return
+        try:
+            self.assistant_dashboard.cancel_action()
+        except Exception:
+            pass
+
+    def _refresh_assistant_dashboard_view(self) -> None:
+        if self.assistant_dashboard is None:
+            return
+        self.assistant_dashboard_update_job = None
+        try:
+            snapshot = self.assistant_dashboard.snapshot()
+        except Exception as exc:
+            LOGGER.debug("Dashboard snapshot failed: %s", exc)
+            snapshot = {}
+        runtime = snapshot.get("runtime") or {}
+        runtime_name = str(runtime.get("runtime") or "offline")
+        model_name = str(runtime.get("model") or "—")
+        quant = runtime.get("quantization")
+        if quant:
+            model_text = f"Model: {model_name} ({quant})"
+        else:
+            model_text = f"Model: {model_name}"
+        gpu_flag = "1" if runtime.get("gpu") else "0"
+        context_len = runtime.get("context")
+        context_text = f"Context: {int(context_len)}" if context_len else "Context: —"
+        self.assistant_dashboard_runtime_var.set(f"Runtime: {runtime_name}")
+        self.assistant_dashboard_model_var.set(model_text)
+        self.assistant_dashboard_gpu_var.set(f"GPU: {gpu_flag}")
+        self.assistant_dashboard_context_var.set(context_text)
+        budget = snapshot.get("tool_budget") or {}
+        total_budget = int(budget.get("total") or 0)
+        used_budget = int(budget.get("used") or 0)
+        remaining_budget = int(budget.get("remaining") or 0)
+        if total_budget > 0:
+            ratio = remaining_budget / total_budget
+            if remaining_budget <= 0:
+                budget_note = "critical"
+            elif ratio <= 0.25:
+                budget_note = "low"
+            else:
+                budget_note = "healthy"
+        else:
+            budget_note = "unknown"
+        self.assistant_dashboard_budget_strip_var.set(
+            f"Budget: {remaining_budget}/{total_budget} ({budget_note})"
+        )
+        self.assistant_budget_status_var.set(
+            f"Budget remaining: {remaining_budget}/{total_budget} (used {used_budget}, {budget_note})"
+        )
+        latency = snapshot.get("latency") or {}
+        p50 = float(latency.get("p50") or 0.0)
+        p90 = float(latency.get("p90") or 0.0)
+        p95 = float(latency.get("p95") or 0.0)
+        self.assistant_dashboard_latency_var.set(
+            f"p50={int(round(p50))}ms | p90={int(round(p90))}ms | p95={int(round(p95))}ms"
+        )
+        tool_summary = snapshot.get("tools", {}).get("summary", {})
+        success_calls = int(tool_summary.get("success") or 0)
+        failed_calls = int(tool_summary.get("failed") or 0)
+        total_calls = int(tool_summary.get("total") or (success_calls + failed_calls))
+        self.assistant_dashboard_tool_summary_var.set(
+            f"Tools success={success_calls} fail={failed_calls} total={total_calls}"
+        )
+        api_tree = self.assistant_dashboard_api_tree
+        if api_tree is not None:
+            for item in api_tree.get_children():
+                api_tree.delete(item)
+            api_stats = snapshot.get("api") or {}
+            for provider, info in api_stats.items():
+                ratio = float(info.get("hit_ratio") or 0.0)
+                hit_pct = f"{int(round(ratio * 100))}%"
+                remaining = info.get("remaining")
+                remaining_text = str(remaining) if remaining is not None else "—"
+                reset = info.get("reset")
+                if reset:
+                    try:
+                        reset_text = datetime.utcfromtimestamp(int(reset)).strftime("%H:%M:%S")
+                    except Exception:
+                        reset_text = str(reset)
+                else:
+                    reset_text = "—"
+                status = str(info.get("status") or "unknown")
+                normalized = status.lower()
+                if normalized not in {"green", "yellow", "red", "unknown"}:
+                    normalized = "unknown"
+                tag = f"status-{normalized}"
+                api_tree.insert(
+                    "",
+                    "end",
+                    values=(provider.upper(), hit_pct, remaining_text, reset_text, status.upper()),
+                    tags=(tag,),
+                )
+        tools_tree = self.assistant_dashboard_tools_tree
+        if tools_tree is not None:
+            for item in tools_tree.get_children():
+                tools_tree.delete(item)
+            for entry in snapshot.get("tools", {}).get("slow", []):
+                name = entry.get("name") or "—"
+                value = float(entry.get("p95") or 0.0)
+                tools_tree.insert("", "end", values=(name, f"{int(round(value))}"))
+        log_tree = self.assistant_dashboard_log_tree
+        if log_tree is not None:
+            for item in log_tree.get_children():
+                log_tree.delete(item)
+            for entry in snapshot.get("log", []):
+                timestamp = entry.get("timestamp") or "—"
+                action = entry.get("action") or "action"
+                outcome = entry.get("outcome") or ""
+                log_tree.insert("", "end", values=(timestamp, f"{action}: {outcome}"))
+        action_state = snapshot.get("action")
+        if action_state:
+            name = action_state.get("name", "action")
+            status = action_state.get("status", "running")
+            duration_ms = action_state.get("duration_ms")
+            if duration_ms is not None:
+                text = f"{name}: {status} ({int(round(duration_ms))} ms)"
+            else:
+                text = f"{name}: {status}"
+        else:
+            text = "No background action running."
+        self.assistant_dashboard_action_var.set(text)
+        runtime_status = f"Runtime: {runtime_name} ({model_name})"
+        self.assistant_runtime_status_var.set(runtime_status)
+        self.assistant_dashboard_update_job = self.root.after(3000, self._refresh_assistant_dashboard_view)
 
     def _update_assistant_status(self, status: AssistantStatus) -> None:
         gpu_flag = "GPU" if status.uses_gpu else "CPU"
@@ -11060,6 +11405,17 @@ class App:
         if self.assistant_service is not None:
             try:
                 self.assistant_service.shutdown()
+            except Exception:
+                pass
+        if self.assistant_dashboard_update_job is not None:
+            try:
+                self.root.after_cancel(self.assistant_dashboard_update_job)
+            except Exception:
+                pass
+            self.assistant_dashboard_update_job = None
+        if self.assistant_dashboard is not None:
+            try:
+                self.assistant_dashboard.shutdown()
             except Exception:
                 pass
         if self.worker and self.worker.is_alive():

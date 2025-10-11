@@ -5,9 +5,10 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from .apiguard import ApiGuard
 from .config import AssistantSettings
@@ -16,6 +17,10 @@ from .rag import VectorIndex
 LOGGER = logging.getLogger("videocatalog.assistant.tools")
 
 READ_ONLY_SQL = re.compile(r"^\s*select\b", re.IGNORECASE)
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from assistant_monitor import AssistantDashboard
 
 
 class ToolBudgetExceeded(RuntimeError):
@@ -38,6 +43,7 @@ class AssistantTooling:
         vector_index: VectorIndex,
         *,
         tmdb_api_key: Optional[str] = None,
+        dashboard: Optional["AssistantDashboard"] = None,
     ) -> None:
         self.settings = settings
         self.db_path = db_path
@@ -46,7 +52,8 @@ class AssistantTooling:
         self.tmdb_api_key = tmdb_api_key
         self.budget = settings.tool_budget
         self.calls = 0
-        self.api_guard = ApiGuard(working_dir, tmdb_api_key)
+        self.dashboard = dashboard
+        self.api_guard = ApiGuard(working_dir, tmdb_api_key, dashboard=dashboard)
         self._ensure_views()
 
     # ------------------------------------------------------------------
@@ -54,6 +61,8 @@ class AssistantTooling:
         self.calls = 0
         if budget is not None:
             self.budget = budget
+        if self.dashboard:
+            self.dashboard.update_tool_budget(self.budget, self.calls, self.budget - self.calls)
 
     def definitions(self) -> List[ToolDefinition]:
         definitions = [
@@ -232,9 +241,22 @@ class AssistantTooling:
             raise RuntimeError(f"Unknown tool: {name}")
         self.calls += 1
         resolved_args = dict(arguments or {})
-        result = handler(**resolved_args)
-        LOGGER.debug("Tool %s executed (call %d/%d)", name, self.calls, self.budget)
-        return {"name": name, "arguments": resolved_args, "result": result}
+        success = False
+        start = time.perf_counter()
+        try:
+            result = handler(**resolved_args)
+            success = True
+            LOGGER.debug("Tool %s executed (call %d/%d)", name, self.calls, self.budget)
+            return {"name": name, "arguments": resolved_args, "result": result}
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            remaining = max(0, self.budget - self.calls)
+            if self.dashboard:
+                try:
+                    self.dashboard.record_tool_call(name, duration_ms, success=success)
+                    self.dashboard.update_tool_budget(self.budget, self.calls, remaining)
+                except Exception:  # pragma: no cover - defensive instrumentation
+                    LOGGER.debug("Dashboard instrumentation failed for tool %s", name)
 
     # ------------------------------------------------------------------
     def _tool_db_query_sql(self, sql: str, params: Optional[List[Any]] = None, limit: int = 100) -> Dict[str, Any]:

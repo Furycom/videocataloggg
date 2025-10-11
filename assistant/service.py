@@ -18,6 +18,7 @@ from .llm_client import LLMClient
 from .rag import VectorIndex
 from .runtime import RuntimeManager
 from .tools import AssistantTooling
+from assistant_monitor import AssistantDashboard, get_dashboard
 
 LOGGER = logging.getLogger("videocatalog.assistant.service")
 
@@ -41,14 +42,28 @@ class AssistantStatus:
 
 
 class AssistantService:
-    def __init__(self, settings_payload: Dict[str, object], working_dir: Path, db_path: Path) -> None:
+    def __init__(
+        self,
+        settings_payload: Dict[str, object],
+        working_dir: Path,
+        db_path: Path,
+        dashboard: Optional[AssistantDashboard] = None,
+    ) -> None:
         self.settings = AssistantSettings.from_settings(settings_payload)
         self.working_dir = working_dir
         self.db_path = db_path
         self.vector_index = VectorIndex(self.settings, db_path, working_dir)
         self.runtime_manager = RuntimeManager(self.settings, working_dir)
         tmdb_key = self._resolve_tmdb_key(settings_payload)
-        self.tooling = AssistantTooling(self.settings, db_path, working_dir, self.vector_index, tmdb_api_key=tmdb_key)
+        self.dashboard = dashboard or get_dashboard(working_dir, db_path, settings_payload)
+        self.tooling = AssistantTooling(
+            self.settings,
+            db_path,
+            working_dir,
+            self.vector_index,
+            tmdb_api_key=tmdb_key,
+            dashboard=self.dashboard,
+        )
         self.controller: Optional[AssistantController] = None
         self.history: List[BaseMessage] = []
         self.session_id: Optional[str] = None
@@ -67,8 +82,24 @@ class AssistantService:
         self.tooling.reset_budget(self.settings.tool_budget)
         self.episode_assistant = EpisodeAssistant(self.tooling)
         client = LLMClient(runtime, self.settings.model, temperature=self.settings.temperature, ctx=self.settings.ctx)
-        self.controller = AssistantController(client, self.tooling, system_prompt=SYSTEM_PROMPT)
+        self.controller = AssistantController(
+            client,
+            self.tooling,
+            system_prompt=SYSTEM_PROMPT,
+            dashboard=self.dashboard,
+        )
         self._ensure_memory_tables()
+        try:
+            self.dashboard.update_runtime(
+                runtime=runtime.name,
+                model=self.settings.model,
+                context=self.settings.ctx,
+                gpu=runtime.uses_gpu,
+                source="service",
+            )
+            self.dashboard.update_tool_budget(self.settings.tool_budget, 0, self.settings.tool_budget)
+        except Exception:
+            LOGGER.debug("Dashboard update failed during ensure_ready")
         return AssistantStatus(
             runtime=runtime.name,
             model=self.settings.model,
@@ -140,6 +171,12 @@ class AssistantService:
         runtime = self.runtime_manager.current_runtime()
         uses_gpu = runtime.uses_gpu if runtime else False
         remaining = max(0, self.settings.tool_budget - self.tooling.calls)
+        if self.dashboard:
+            try:
+                total = self.settings.tool_budget
+                self.dashboard.update_tool_budget(total, self.tooling.calls, remaining)
+            except Exception:
+                LOGGER.debug("Dashboard update failed while reporting status")
         return AssistantStatus(
             runtime=runtime.name if runtime else "unknown",
             model=self.settings.model,
