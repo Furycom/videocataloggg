@@ -29,6 +29,7 @@ _ALLOWED_STRUCTURE: Dict[str, Any] = {
     "api": "*",
     "assistant": "*",
     "structure": "*",
+    "learning": "*",
     "docpreview": "*",
     "textlite": "*",
     "textverify": "*",

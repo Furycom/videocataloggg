@@ -5,6 +5,8 @@ sqlite-utils
 numpy
 Pillow
 onnxruntime
+scikit-learn
+skl2onnx
 nvidia-ml-py
 opencv-python-headless
 fastapi

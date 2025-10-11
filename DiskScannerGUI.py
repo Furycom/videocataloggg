@@ -184,6 +184,9 @@ from gpu.capabilities import probe_gpu
 from gpu.runtime import get_hwaccel_args, select_provider
 from PIL import Image, ImageTk
 from visualreview import ReviewRunner, VisualReviewStore, load_visualreview_settings
+from learning import LearningEngine, LearningExamplePayload, load_learning_settings
+from learning.engine import ActiveItem
+from learning.db import count_examples
 
 try:
     from assistant import AssistantService, AssistantStatus
@@ -2237,6 +2240,18 @@ class App:
         self.textlite_worker: Optional[threading.Thread] = None
         self.textlite_cancel: Optional[CancellationToken] = None
         self.textlite_rows: Dict[str, dict] = {}
+        self.learning_settings = load_learning_settings(_SETTINGS if isinstance(_SETTINGS, dict) else {})
+        self.learning_status_var = StringVar(value="Learning idle.")
+        self.learning_metrics_var = StringVar(value="Model: —")
+        self.learning_auc_var = StringVar(value="AUC: —")
+        self.learning_brier_var = StringVar(value="Brier: —")
+        self.learning_ece_var = StringVar(value="ECE: —")
+        self.learning_labels_var = StringVar(value="Labels: 0")
+        self.learning_queue_rows: Dict[str, ActiveItem] = {}
+        self.learning_tree: Optional[ttk.Treeview] = None
+        self.learning_confirm_button: Optional[ttk.Button] = None
+        self.learning_reject_button: Optional[ttk.Button] = None
+        self.learning_open_button: Optional[ttk.Button] = None
         quality_cfg: Dict[str, object] = {}
         if isinstance(_SETTINGS, dict):
             maybe_quality = _SETTINGS.get("quality")
@@ -4045,6 +4060,108 @@ class App:
 
         preview_notebook.add(textverify_tab, text="Plot cross-check")
 
+        learning_tab = ttk.Frame(preview_notebook, padding=(12, 12), style="Card.TFrame")
+        learning_tab.columnconfigure(0, weight=1)
+        learning_tab.rowconfigure(2, weight=1)
+        ttk.Label(learning_tab, textvariable=self.learning_status_var, style="Subtle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        metrics_frame = ttk.Frame(learning_tab, style="Card.TFrame")
+        metrics_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        metrics_frame.columnconfigure(0, weight=1)
+        ttk.Label(metrics_frame, textvariable=self.learning_metrics_var, style="HeaderSubtitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        stats_row = ttk.Frame(metrics_frame, style="Card.TFrame")
+        stats_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(stats_row, textvariable=self.learning_auc_var, style="Subtle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(stats_row, textvariable=self.learning_brier_var, style="Subtle.TLabel").grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Label(stats_row, textvariable=self.learning_ece_var, style="Subtle.TLabel").grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
+        )
+        ttk.Label(stats_row, textvariable=self.learning_labels_var, style="Subtle.TLabel").grid(
+            row=0, column=3, sticky="w", padx=(12, 0)
+        )
+        button_row = ttk.Frame(metrics_frame, style="Card.TFrame")
+        button_row.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(button_row, text="Train now", command=self._learning_train_now).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(
+            button_row,
+            text="Export reliability…",
+            command=self._learning_export_reliability,
+        ).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(
+            button_row,
+            text="Reset model (keep labels)",
+            command=self._learning_reset_model,
+        ).grid(row=0, column=2)
+
+        queue_frame = ttk.Frame(learning_tab, style="Card.TFrame")
+        queue_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        queue_frame.columnconfigure(0, weight=1)
+        queue_frame.rowconfigure(0, weight=1)
+        columns = ("path", "p_correct", "uncertainty", "confidence", "reasons")
+        self.learning_tree = ttk.Treeview(
+            queue_frame,
+            columns=columns,
+            show="headings",
+            style="Card.Treeview",
+            height=10,
+        )
+        headings = {
+            "path": "Item",
+            "p_correct": "p_correct",
+            "uncertainty": "Uncertainty",
+            "confidence": "Rule conf",
+            "reasons": "Top reasons",
+        }
+        widths = {
+            "path": 320,
+            "p_correct": 100,
+            "uncertainty": 110,
+            "confidence": 100,
+            "reasons": 320,
+        }
+        for key in columns:
+            self.learning_tree.heading(key, text=headings[key])
+            anchor = W if key in {"path", "reasons"} else E
+            self.learning_tree.column(key, anchor=anchor, width=widths[key], stretch=True)
+        self.learning_tree.grid(row=0, column=0, sticky="nsew")
+        learning_scroll = ttk.Scrollbar(queue_frame, orient="vertical", command=self.learning_tree.yview)
+        learning_scroll.grid(row=0, column=1, sticky="ns")
+        self.learning_tree.configure(yscrollcommand=learning_scroll.set)
+        self.learning_tree.bind("<<TreeviewSelect>>", self._on_learning_select)
+
+        learning_actions = ttk.Frame(learning_tab, style="Card.TFrame")
+        learning_actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        self.learning_confirm_button = ttk.Button(
+            learning_actions,
+            text="Confirm ID",
+            command=self._learning_confirm_selected,
+            state="disabled",
+        )
+        self.learning_confirm_button.grid(row=0, column=0, sticky="w")
+        self.learning_reject_button = ttk.Button(
+            learning_actions,
+            text="Reject",
+            command=self._learning_reject_selected,
+            state="disabled",
+        )
+        self.learning_reject_button.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.learning_open_button = ttk.Button(
+            learning_actions,
+            text="Open folder",
+            command=self._learning_open_folder,
+            state="disabled",
+        )
+        self.learning_open_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
+
+        preview_notebook.add(learning_tab, text="Teach the System")
+
         self.structure_tree.bind("<<TreeviewSelect>>", self._on_structure_tree_select)
 
         summary_frame = ttk.Frame(parent, style="Card.TFrame")
@@ -4055,6 +4172,7 @@ class App:
             style="Subtle.TLabel",
         ).grid(row=0, column=0, sticky="w")
         self._clear_structure_preview()
+        self._refresh_learning_panel()
 
     def _build_audit_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -7056,6 +7174,7 @@ class App:
             self.structure_status_var.set(f"{len(rows)} folders queued for manual review.")
         else:
             self.structure_status_var.set("Manual review queue is empty.")
+        self._refresh_learning_panel()
 
     def _load_structure_data(self, label: str) -> Tuple[Optional[Dict[str, int]], List[Dict[str, object]]]:
         shard = shard_path_for(label)
@@ -7126,6 +7245,315 @@ class App:
         finally:
             conn.close()
         return summary, rows
+
+    def _refresh_learning_panel(self) -> None:
+        if not self.learning_settings.enable:
+            self.learning_status_var.set("Learning disabled in settings.")
+            self.learning_metrics_var.set("Model: disabled")
+            self.learning_auc_var.set("AUC: —")
+            self.learning_brier_var.set("Brier: —")
+            self.learning_ece_var.set("ECE: —")
+            self.learning_labels_var.set("Labels: 0")
+            if self.learning_tree:
+                self.learning_tree.delete(*self.learning_tree.get_children())
+            if self.learning_confirm_button:
+                self.learning_confirm_button.configure(state="disabled")
+            if self.learning_reject_button:
+                self.learning_reject_button.configure(state="disabled")
+            if self.learning_open_button:
+                self.learning_open_button.configure(state="disabled")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            self.learning_status_var.set("Select a drive label to view learning queue.")
+            self.learning_metrics_var.set("Model: —")
+            self.learning_auc_var.set("AUC: —")
+            self.learning_brier_var.set("Brier: —")
+            self.learning_ece_var.set("ECE: —")
+            self.learning_labels_var.set("Labels: 0")
+            if self.learning_tree:
+                self.learning_tree.delete(*self.learning_tree.get_children())
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            self.learning_status_var.set("Shard database not found for this drive.")
+            if self.learning_tree:
+                self.learning_tree.delete(*self.learning_tree.get_children())
+            return
+        conn = sqlite3.connect(str(shard))
+        try:
+            engine = LearningEngine(conn, working_dir=WORKING_DIR_PATH, settings=self.learning_settings)
+            metrics = engine.metrics or {}
+            version = engine.model_version or "—"
+            self.learning_metrics_var.set(f"Model: {version}")
+            auc = metrics.get("auc")
+            brier = metrics.get("brier")
+            ece = metrics.get("ece")
+            n_labels = count_examples(conn)
+            self.learning_auc_var.set("AUC: {:.3f}".format(float(auc)) if isinstance(auc, (int, float)) else "AUC: —")
+            self.learning_brier_var.set(
+                "Brier: {:.4f}".format(float(brier)) if isinstance(brier, (int, float)) else "Brier: —"
+            )
+            self.learning_ece_var.set("ECE: {:.3f}".format(float(ece)) if isinstance(ece, (int, float)) else "ECE: —")
+            self.learning_labels_var.set(f"Labels: {int(n_labels)}")
+            limit = min(50, self.learning_settings.active.top_n)
+            queue = engine.build_active_queue(limit=limit)
+        except Exception as exc:
+            self.learning_status_var.set(f"Learning unavailable: {exc}")
+            if self.learning_tree:
+                self.learning_tree.delete(*self.learning_tree.get_children())
+            return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.learning_queue_rows.clear()
+        if self.learning_tree:
+            self.learning_tree.delete(*self.learning_tree.get_children())
+            for index, item in enumerate(queue):
+                iid = f"learn-{index}"
+                reasons = ", ".join(item.reasons[:3]) if item.reasons else ""
+                self.learning_queue_rows[iid] = item
+                self.learning_tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=(
+                        item.path,
+                        f"{item.p_correct:.3f}",
+                        f"{item.uncertainty:.3f}",
+                        f"{item.source_confidence:.3f}",
+                        reasons,
+                    ),
+                )
+        if queue:
+            self.learning_status_var.set(f"{len(queue)} items awaiting feedback.")
+            if self.learning_tree:
+                first = next(iter(self.learning_queue_rows), None)
+                if first:
+                    self.learning_tree.selection_set(first)
+                    self.learning_tree.focus(first)
+                    self._on_learning_select()
+        else:
+            self.learning_status_var.set("Learning queue is empty.")
+            if self.learning_confirm_button:
+                self.learning_confirm_button.configure(state="disabled")
+            if self.learning_reject_button:
+                self.learning_reject_button.configure(state="disabled")
+            if self.learning_open_button:
+                self.learning_open_button.configure(state="disabled")
+
+    def _learning_train_now(self) -> None:
+        if not self.learning_settings.enable:
+            messagebox.showinfo("Learning", "Learning subsystem is disabled in settings.")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showinfo("Learning", "Select a drive label first.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror("Learning", "Shard database not found for this drive.")
+            return
+        self.learning_status_var.set("Training model…")
+        self.root.update_idletasks()
+        conn = sqlite3.connect(str(shard))
+        try:
+            engine = LearningEngine(conn, working_dir=WORKING_DIR_PATH, settings=self.learning_settings)
+            current = count_examples(conn)
+            needed = self.learning_settings.min_labels
+            if current < max(needed, 2):
+                messagebox.showinfo(
+                    "Learning",
+                    f"Need at least {needed} labels before training (currently {current}).",
+                )
+                self.learning_status_var.set("Learning idle.")
+                return
+            artifacts = engine.train()
+            if artifacts is None:
+                messagebox.showinfo(
+                    "Learning",
+                    "Not enough labeled examples to train a model yet.",
+                )
+                self.learning_status_var.set("Learning idle.")
+                return
+            messagebox.showinfo(
+                "Learning",
+                f"Model {artifacts.version} trained successfully.",
+            )
+        except Exception as exc:
+            messagebox.showerror("Learning", f"Training failed: {exc}")
+            self.learning_status_var.set("Training failed.")
+            return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.learning_status_var.set("Training complete.")
+        self._refresh_learning_panel()
+
+    def _learning_export_reliability(self) -> None:
+        if not self.learning_settings.enable:
+            messagebox.showinfo("Learning", "Learning subsystem is disabled in settings.")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showinfo("Learning", "Select a drive label first.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror("Learning", "Shard database not found for this drive.")
+            return
+        conn = sqlite3.connect(str(shard))
+        reliability = None
+        try:
+            engine = LearningEngine(conn, working_dir=WORKING_DIR_PATH, settings=self.learning_settings)
+            metrics = engine.metrics or {}
+            reliability = metrics.get("reliability") if isinstance(metrics, dict) else None
+        except Exception as exc:
+            messagebox.showerror("Learning", f"Unable to load reliability data: {exc}")
+            return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not reliability:
+            messagebox.showinfo("Learning", "No reliability data available yet; train a model first.")
+            return
+        destination = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+            title="Export reliability curve",
+        )
+        if not destination:
+            return
+        try:
+            with open(destination, "w", encoding="utf-8") as handle:
+                json.dump(reliability, handle, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Learning", f"Failed to export reliability data: {exc}")
+            return
+        messagebox.showinfo("Learning", f"Reliability data exported to {destination}.")
+
+    def _learning_reset_model(self) -> None:
+        if not self.learning_settings.enable:
+            messagebox.showinfo("Learning", "Learning subsystem is disabled in settings.")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showinfo("Learning", "Select a drive label first.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror("Learning", "Shard database not found for this drive.")
+            return
+        conn = sqlite3.connect(str(shard))
+        try:
+            conn.execute("DELETE FROM learn_models")
+            conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Learning", f"Failed to reset model metadata: {exc}")
+            return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.learning_status_var.set("Model metadata cleared.")
+        self._refresh_learning_panel()
+
+    def _get_selected_learning_item(self) -> Optional[ActiveItem]:
+        if not self.learning_tree:
+            return None
+        selection = self.learning_tree.selection()
+        if not selection:
+            return None
+        return self.learning_queue_rows.get(selection[0])
+
+    def _on_learning_select(self, _event: Optional[object] = None) -> None:
+        item = self._get_selected_learning_item()
+        state = "normal" if item else "disabled"
+        if self.learning_confirm_button:
+            self.learning_confirm_button.configure(state=state)
+        if self.learning_reject_button:
+            self.learning_reject_button.configure(state=state)
+        if self.learning_open_button:
+            self.learning_open_button.configure(state=state)
+
+    def _store_learning_label(self, item: ActiveItem, value: int, source: str) -> bool:
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showinfo("Learning", "Select a drive label first.")
+            return False
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror("Learning", "Shard database not found for this drive.")
+            return False
+        conn = sqlite3.connect(str(shard))
+        try:
+            engine = LearningEngine(conn, working_dir=WORKING_DIR_PATH, settings=self.learning_settings)
+            payload = LearningExamplePayload(
+                path=item.path,
+                label=int(value),
+                label_source=source,
+                features=dict(item.features),
+            )
+            engine.record_feedback(payload)
+            conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Learning", f"Failed to record feedback: {exc}")
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return True
+
+    def _learning_confirm_selected(self) -> None:
+        item = self._get_selected_learning_item()
+        if not item:
+            return
+        if self._store_learning_label(item, 1, "user_confirm"):
+            self.learning_status_var.set("Recorded confirmation.")
+            self._refresh_learning_panel()
+
+    def _learning_reject_selected(self) -> None:
+        item = self._get_selected_learning_item()
+        if not item:
+            return
+        if self._store_learning_label(item, 0, "user_reject"):
+            self.learning_status_var.set("Recorded rejection.")
+            self._refresh_learning_panel()
+
+    def _learning_open_folder(self) -> None:
+        item = self._get_selected_learning_item()
+        if not item:
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showinfo("Learning", "Select a drive label first.")
+            return
+        target = str(item.path)
+        try:
+            candidate = Path(target)
+        except Exception:
+            candidate = None
+        resolved = None
+        if candidate is not None and candidate.is_absolute():
+            resolved = str(candidate)
+        else:
+            resolved = self._resolve_textverify_abs_path(label, target)
+        if not resolved:
+            messagebox.showinfo(
+                "Learning",
+                "Unable to resolve absolute path for this item. Configure the mount path for this drive.",
+            )
+            return
+        self._open_path_in_explorer(resolved)
 
     def _get_selected_structure_row(self) -> Optional[dict]:
         if not hasattr(self, "structure_tree"):

@@ -166,6 +166,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         },
         "max_candidates": 5,
     },
+    "learning": {
+        "enable": True,
+        "algo": "logreg",
+        "calibration": "auto",
+        "k_folds": 5,
+        "min_labels": 200,
+        "retrain_every_labels": 100,
+        "class_weight": "balanced",
+        "active": {"strategy": "uncertainty_diversity", "topN": 200},
+    },
     "docpreview": {
         "enable": False,
         "max_pages": 6,
