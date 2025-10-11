@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from .config import AssistantSettings
 from .controller import AssistantController
+from .episode_flow import EpisodeAssistant
 from .llm_client import LLMClient
 from .rag import VectorIndex
 from .runtime import RuntimeManager
@@ -52,6 +53,7 @@ class AssistantService:
         self.history: List[BaseMessage] = []
         self.session_id: Optional[str] = None
         self._lock = threading.Lock()
+        self.episode_assistant = EpisodeAssistant(self.tooling)
 
     # ------------------------------------------------------------------
     def ensure_ready(self) -> AssistantStatus:
@@ -63,6 +65,7 @@ class AssistantService:
         else:
             self.vector_index.ensure_ready()
         self.tooling.reset_budget(self.settings.tool_budget)
+        self.episode_assistant = EpisodeAssistant(self.tooling)
         client = LLMClient(runtime, self.settings.model, temperature=self.settings.temperature, ctx=self.settings.ctx)
         self.controller = AssistantController(client, self.tooling, system_prompt=SYSTEM_PROMPT)
         self._ensure_memory_tables()
@@ -88,6 +91,16 @@ class AssistantService:
                 status = self.start_session()
             else:
                 status = self.status()
+            if self.episode_assistant.can_handle(text):
+                result = self.episode_assistant.run(text)
+                answer_text = result.get("answer", "No answer produced.")
+                self.history = [*self.history, HumanMessage(content=text), AIMessage(content=answer_text)][-8:]
+                self._persist_exchange(text, answer_text)
+                return {
+                    "answer": answer_text,
+                    "tool_log": result.get("tool_log", []),
+                    "status": self.status(),
+                }
             rag_snippets = []
             if use_rag and self.settings.rag.enable:
                 hits = self.vector_index.search(text)
