@@ -4,6 +4,7 @@ import { getMovies, thumbUrl } from '../api/client';
 import type { MovieRow, PaginatedResponse } from '../api/types';
 import { useDetailDrawer } from '../hooks/useDetailDrawer';
 import { useIntersectionObserver } from '../hooks/useIntersectionObserver';
+import { useLiveCatalog } from '../hooks/useLiveCatalog';
 import styles from './MoviesPage.module.css';
 
 interface MovieFilters {
@@ -42,6 +43,8 @@ export default function MoviesPage() {
   const [error, setError] = useState<string | null>(null);
   const drawer = useDetailDrawer();
   const sentinel = useRef<HTMLDivElement | null>(null);
+  const live = useLiveCatalog();
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const effectiveFilters = useMemo(() => ({ ...filters }), [filters]);
 
@@ -93,6 +96,24 @@ export default function MoviesPage() {
     },
     { rootMargin: '200px' },
   );
+
+  useEffect(() => {
+    const unsubscribe = live.subscribe(event => {
+      if (!['movie_upsert', 'item_quality_update'].includes(event.kind)) return;
+      if (refreshTimer.current) return;
+      refreshTimer.current = setTimeout(() => {
+        fetchPage(0, true);
+        refreshTimer.current = null;
+      }, 750);
+    });
+    return () => {
+      unsubscribe();
+      if (refreshTimer.current) {
+        clearTimeout(refreshTimer.current);
+        refreshTimer.current = null;
+      }
+    };
+  }, [fetchPage, live]);
 
   const handleChange = (key: keyof MovieFilters, value: string | boolean) => {
     setFilters(prev => ({ ...prev, [key]: value }));

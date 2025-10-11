@@ -397,6 +397,49 @@ class CatalogSearchResponse(BaseModel):
     results: List[CatalogSearchHit] = Field(
         default_factory=list, description="Combined movie/episode hits ordered by relevance."
     )
+
+
+class AssistantAskSource(BaseModel):
+    type: str
+    ref: str
+
+
+class AssistantToolCall(BaseModel):
+    tool: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantAskRequest(BaseModel):
+    item_id: str = Field(..., description="Catalog item identifier." )
+    mode: str = Field("context", description="Only 'context' mode is supported.")
+    question: str = Field(..., min_length=1, description="Question the assistant should answer.")
+    tool_budget: Optional[int] = Field(
+        None,
+        ge=1,
+        le=50,
+        description="Optional override for the maximum number of tool calls allowed.",
+    )
+    rag: Optional[bool] = Field(
+        True,
+        description="Enable retrieval-augmented generation snippets when answering.",
+    )
+
+
+class AssistantAskResponse(BaseModel):
+    answer_markdown: str
+    sources: List[AssistantAskSource]
+    tool_calls: List[AssistantToolCall]
+    elapsed_ms: int
+    status: Dict[str, Any]
+
+
+class AssistantStatusResponse(BaseModel):
+    requested: bool
+    gpu_ready: bool
+    enabled: bool
+    message: str
+    gpu: Dict[str, Any]
+    runtime: Optional[Dict[str, Any]] = None
 class FeatureVectorResponse(BaseModel):
     """Single feature vector payload."""
 

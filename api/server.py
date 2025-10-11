@@ -3,20 +3,36 @@ from __future__ import annotations
 
 import logging
 import time
+import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth import APIKeyAuth
+from .assistant_gateway import AssistantGateway
 from .db import DataAccess
 from .models import (
+    AssistantAskRequest,
+    AssistantAskResponse,
+    AssistantStatusResponse,
     CatalogEpisodesResponse,
     CatalogItemDetailResponse,
     CatalogMoviesResponse,
@@ -56,6 +72,9 @@ from .models import (
 )
 from semantic import SemanticPhaseError
 
+from .events import CatalogEventBroker
+from .vector_worker import VectorRefreshWorker
+
 LOGGER = logging.getLogger("videocatalog.api")
 
 
@@ -91,6 +110,20 @@ def create_app(config: APIServerConfig) -> FastAPI:
 
     auth_dependency = APIKeyAuth(config.api_key)
     data = config.data_access
+    event_broker = CatalogEventBroker(data)
+    vector_worker = VectorRefreshWorker(data)
+    assistant_gateway = AssistantGateway(data)
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        await event_broker.start()
+        await vector_worker.start()
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await event_broker.stop()
+        await vector_worker.stop()
+        assistant_gateway.shutdown()
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):  # type: ignore[override]
@@ -150,10 +183,100 @@ def create_app(config: APIServerConfig) -> FastAPI:
             return None
         return f"/v1/catalog/thumb?id={token}"
 
+    @app.get("/v1/catalog/subscribe")
+    async def catalog_subscribe(
+        request: Request,
+        last_seq: Optional[int] = Query(None, ge=0),
+        api_key: Optional[str] = Query(None),
+    ) -> StreamingResponse:
+        expected_key = (config.api_key or "").strip()
+        provided = request.headers.get("x-api-key") or (api_key or "").strip()
+        if not expected_key or not provided or provided.strip() != expected_key:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        async def event_stream():
+            try:
+                async for event in event_broker.subscribe(last_seq=last_seq or 0):
+                    payload = {
+                        "seq": event.seq,
+                        "ts_utc": event.ts_utc,
+                        "kind": event.kind,
+                        "payload": event.payload,
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    if await request.is_disconnected():
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.debug("SSE stream stopped: %s", exc)
+
+        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
+
+    @app.websocket("/v1/catalog/subscribe")
+    async def catalog_subscribe_ws(websocket: WebSocket):
+        expected_key = (config.api_key or "").strip()
+        provided = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+        if not expected_key or not provided or provided.strip() != expected_key:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        try:
+            try:
+                last_seq_value = int(websocket.query_params.get("last_seq", "0"))
+            except ValueError:
+                last_seq_value = 0
+            async for event in event_broker.subscribe(last_seq=last_seq_value):
+                payload = {
+                    "seq": event.seq,
+                    "ts_utc": event.ts_utc,
+                    "kind": event.kind,
+                    "payload": event.payload,
+                }
+                await websocket.send_json(payload)
+        except WebSocketDisconnect:
+            return
+        except Exception as exc:
+            LOGGER.debug("WebSocket stream closed: %s", exc)
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
     @app.get("/v1/health", response_model=HealthResponse)
     def health_check(_: str = Depends(auth_dependency)) -> HealthResponse:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return HealthResponse(ok=True, version=config.app_version, time_utc=now)
+
+    @app.get("/v1/assistant/status", response_model=AssistantStatusResponse)
+    def assistant_status(_: str = Depends(auth_dependency)) -> AssistantStatusResponse:
+        return AssistantStatusResponse(**assistant_gateway.status())
+
+    @app.post("/v1/assistant/ask", response_model=AssistantAskResponse)
+    def assistant_ask(
+        request: AssistantAskRequest,
+        _: str = Depends(auth_dependency),
+    ) -> AssistantAskResponse:
+        if request.mode != "context":
+            raise HTTPException(status_code=400, detail="unsupported assistant mode")
+        detail = data.catalog_item_detail(request.item_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="catalog item not found")
+        try:
+            result = assistant_gateway.ask_context(
+                request.item_id,
+                detail,
+                request.question,
+                tool_budget=request.tool_budget,
+                use_rag=bool(request.rag),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            LOGGER.exception("Assistant ask failed: %s", exc)
+            raise HTTPException(status_code=500, detail="assistant error") from exc
+        return AssistantAskResponse(**result)
 
     @app.get("/v1/drives", response_model=DrivesResponse)
     def drives(_: str = Depends(auth_dependency)) -> DrivesResponse:

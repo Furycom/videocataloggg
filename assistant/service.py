@@ -4,8 +4,9 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -111,7 +112,7 @@ class AssistantService:
 
     def start_session(self, scope: str = "global") -> AssistantStatus:
         with self._lock:
-            status = self.ensure_ready()
+            self.ensure_ready()
             self.session_id = self._ensure_session(scope)
             self.history = self._load_recent_history(limit=12)
             return status
@@ -162,6 +163,65 @@ class AssistantService:
                 "answer": answer.content,
                 "tool_log": tool_log,
                 "status": self.status(),
+            }
+
+    def ask_context(
+        self,
+        item_id: str,
+        item_payload: Dict[str, object],
+        question: str,
+        *,
+        tool_budget: Optional[int] = None,
+        use_rag: bool = True,
+    ) -> Dict[str, object]:
+        """Ask a contextual question anchored to a catalog item."""
+
+        with self._lock:
+            self.ensure_ready()
+            if tool_budget is not None and tool_budget > 0:
+                budget = min(int(tool_budget), self.settings.tool_budget)
+                self.tooling.reset_budget(max(1, budget))
+            else:
+                self.tooling.reset_budget(self.settings.tool_budget)
+            context_blob = json.dumps(item_payload, ensure_ascii=False, indent=2, sort_keys=True)
+            prompt = (
+                "You must ground your answer on the provided catalog item context.\n"
+                "If a tool budget is exhausted you must stop and summarise.\n"
+                "Context follows in JSON format.\n"
+                f"Item ID: {item_id}\n"
+                f"Context:```json\n{context_blob}\n```\n"
+                "Answer the user question using markdown and list the data sources you relied on.\n"
+                f"Question: {question.strip()}"
+            )
+            start = time.perf_counter()
+            result = self.ask(prompt, use_rag=use_rag)
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            answer_text = str(result.get("answer", ""))
+            tool_log = result.get("tool_log", [])
+            status_payload = result.get("status")
+            status_dict = (
+                asdict(status_payload)
+                if isinstance(status_payload, AssistantStatus)
+                else status_payload
+            )
+            sources = [{"type": "catalog", "ref": item_id}]
+            for entry in tool_log:
+                payload = entry.get("payload") if isinstance(entry, dict) else None
+                if isinstance(payload, dict):
+                    ref = payload.get("source") or payload.get("table") or payload.get("ref")
+                    if ref:
+                        sources.append({"type": entry.get("tool", "tool"), "ref": str(ref)})
+            formatted_tool_calls = []
+            for call in tool_log:
+                tool_name = call.get("tool") if isinstance(call, dict) else None
+                payload = call.get("payload") if isinstance(call, dict) else None
+                formatted_tool_calls.append({"tool": tool_name, "payload": payload})
+            return {
+                "answer_markdown": answer_text,
+                "sources": sources,
+                "tool_calls": formatted_tool_calls,
+                "elapsed_ms": elapsed_ms,
+                "status": status_dict,
             }
 
     def refresh_index(self) -> None:

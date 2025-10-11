@@ -25,6 +25,11 @@ export function useApiKey(): [string | null, (key: string | null) => void] {
       // ignore
     }
     setApiKeyState(value);
+    try {
+      window.dispatchEvent(new CustomEvent('videocatalog-api-key-changed'));
+    } catch {
+      // ignore
+    }
   }, []);
 
   return [apiKey, update];

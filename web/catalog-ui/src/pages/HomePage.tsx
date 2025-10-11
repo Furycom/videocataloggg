@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import { getSummary } from '../api/client';
 import type { CatalogSummary } from '../api/types';
 import { useDetailDrawer } from '../hooks/useDetailDrawer';
+import { useLiveCatalog } from '../hooks/useLiveCatalog';
 import styles from './HomePage.module.css';
 
 export default function HomePage() {
@@ -10,8 +11,9 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const drawer = useDetailDrawer();
+  const live = useLiveCatalog();
 
-  useEffect(() => {
+  const refresh = useCallback(() => {
     setLoading(true);
     setError(null);
     getSummary()
@@ -19,6 +21,18 @@ export default function HomePage() {
       .catch(err => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    return live.subscribe(event => {
+      if (['movie_upsert', 'episode_upsert', 'item_quality_update'].includes(event.kind)) {
+        refresh();
+      }
+    });
+  }, [live, refresh]);
 
   return (
     <div className={styles.container}>
