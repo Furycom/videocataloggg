@@ -69,6 +69,24 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "max_video_frames": 2,
         "prefer_ffmpeg": True,
     },
+    "quality": {
+        "enable": True,
+        "timeout_s": 8,
+        "gentle_sleep_ms": 3,
+        "max_parallel": 1,
+        "thresholds": {
+            "low_bitrate_per_mp": 1500,
+            "audio_min_channels": 2,
+            "expect_subs": False,
+            "runtime_tolerance_pct": 10,
+        },
+        "labels": {
+            "res_480p_maxh": 576,
+            "res_720p_maxh": 800,
+            "res_1080p_maxh": 1200,
+            "res_2160p_minh": 1600,
+        },
+    },
     "disk_marker": {
         "enable": False,
         "filename": ".videocatalog.id",

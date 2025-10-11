@@ -15,6 +15,8 @@ from types import SimpleNamespace
 import scan_drive
 from structure import load_structure_settings as load_structure_config
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
+from quality import QualitySettings, run_for_shard as run_quality_for_shard
+from quality.ffprobe import ffprobe_available as quality_ffprobe_available
 from textverify import TextVerifySettings
 from robust import CancellationToken
 from musicnames import parse_music_name, score_parse_result
@@ -2074,6 +2076,8 @@ class App:
         self.textverify_keywords_bar = None
         self.textverify_summary_widget = None
         self.textverify_plot_widget = None
+        self.textverify_quality_var = StringVar(value="Quality: —")
+        self.textverify_quality_notes = StringVar(value="")
         doc_cfg: Dict[str, object] = {}
         if isinstance(_SETTINGS, dict):
             maybe_doc = _SETTINGS.get("docpreview")
@@ -2097,6 +2101,31 @@ class App:
         self.docpreview_worker: Optional[threading.Thread] = None
         self.docpreview_cancel: Optional[CancellationToken] = None
         self.docpreview_rows: Dict[str, dict] = {}
+        quality_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_quality = _SETTINGS.get("quality")
+            if isinstance(maybe_quality, dict):
+                quality_cfg = maybe_quality
+        self.quality_config = QualitySettings.from_mapping(quality_cfg)
+        self.quality_enable_var = IntVar(value=1 if self.quality_config.enable else 0)
+        self.quality_expect_subs_var = IntVar(
+            value=1 if self.quality_config.thresholds.expect_subs else 0
+        )
+        self.quality_timeout_var = IntVar(value=int(round(self.quality_config.timeout_s)))
+        self.quality_min_score_var = IntVar(value=0)
+        self.quality_max_score_var = IntVar(value=100)
+        self.quality_resolution_var = StringVar(value="any")
+        self.quality_missing_subs_var = IntVar(value=0)
+        self.quality_mono_var = IntVar(value=0)
+        self.quality_status_var = StringVar(value="Quality idle.")
+        self.quality_reason_var = StringVar(value="Select a row to view details.")
+        self.quality_progress_total = IntVar(value=0)
+        self.quality_progress_done = IntVar(value=0)
+        self.quality_worker: Optional[threading.Thread] = None
+        self.quality_cancel: Optional[CancellationToken] = None
+        self.quality_rows: Dict[str, dict] = {}
+        self._quality_ffprobe_missing = not quality_ffprobe_available()
+        self.quality_run_button: Optional[ttk.Button] = None
 
         music_cfg: Dict[str, object] = {}
         if isinstance(_SETTINGS, dict):
@@ -2268,6 +2297,9 @@ class App:
         self._build_menu()
         self._build_form()
         self._build_tables()
+
+        if self._quality_ffprobe_missing:
+            self.show_banner("ffprobe not found — Quality disabled", level="ERROR")
 
         self.refresh_tool_statuses(initial=True)
         self._refresh_gpu_status()
@@ -2871,6 +2903,10 @@ class App:
         self.structure_tab.columnconfigure(0, weight=1)
         self.structure_tab.rowconfigure(1, weight=1)
         self.main_notebook.add(self.structure_tab, text="Structure")
+        self.quality_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.quality_tab.columnconfigure(0, weight=1)
+        self.quality_tab.rowconfigure(2, weight=1)
+        self.main_notebook.add(self.quality_tab, text="Quality")
         self.docpreview_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
         self.docpreview_tab.columnconfigure(0, weight=1)
         self.docpreview_tab.rowconfigure(1, weight=1)
@@ -2885,6 +2921,7 @@ class App:
         self._build_search_plus_tab(self.search_plus_tab)
         self._build_reports_tab(self.reports_tab)
         self._build_structure_tab(self.structure_tab)
+        self._build_quality_tab(self.quality_tab)
         self._build_docpreview_tab(self.docpreview_tab)
         self._build_music_tab(self.music_tab)
 
@@ -3701,6 +3738,15 @@ class App:
         ttk.Label(status_frame, textvariable=self.textverify_score_var, style="Strong.TLabel").grid(
             row=3, column=0, sticky="w", pady=(4, 0)
         )
+        ttk.Label(status_frame, textvariable=self.textverify_quality_var).grid(
+            row=4, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(
+            status_frame,
+            textvariable=self.textverify_quality_notes,
+            style="Subtle.TLabel",
+            wraplength=360,
+        ).grid(row=5, column=0, sticky="w")
 
         metrics = ttk.Frame(textverify_tab, style="Card.TFrame")
         metrics.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -3788,6 +3834,247 @@ class App:
             style="Subtle.TLabel",
         ).grid(row=0, column=0, sticky="w")
         self._clear_structure_preview()
+
+    def _build_quality_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(3, weight=1)
+
+        controls = ttk.LabelFrame(
+            parent,
+            text="Video Quality Report",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        controls.grid(row=0, column=0, sticky="ew")
+        for col in range(4):
+            controls.columnconfigure(col, weight=1 if col in (1, 3) else 0)
+
+        ttk.Checkbutton(
+            controls,
+            text="Enable quality scoring",
+            variable=self.quality_enable_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Checkbutton(
+            controls,
+            text="Expect subtitles",
+            variable=self.quality_expect_subs_var,
+        ).grid(row=0, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(controls, text="Timeout (s):").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        timeout_spin = Spinbox(
+            controls,
+            from_=2,
+            to=60,
+            textvariable=self.quality_timeout_var,
+            width=6,
+            justify="center",
+        )
+        timeout_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        timeout_spin.grid(row=1, column=1, sticky="w", padx=(8, 24), pady=(12, 0))
+
+        actions = ttk.Frame(controls, style="Card.TFrame")
+        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        actions.columnconfigure(3, weight=1)
+        self.quality_run_button = ttk.Button(
+            actions, text="Run report", command=self.start_quality_job, style="Accent.TButton"
+        )
+        self.quality_run_button.grid(row=0, column=0, sticky="w")
+        ttk.Button(actions, text="Cancel", command=self.cancel_quality_job).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(actions, text="Refresh results", command=self.refresh_quality_results).grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
+        )
+
+        progress_frame = ttk.Frame(parent, style="Card.TFrame", padding=(16, 12))
+        progress_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        progress_frame.columnconfigure(0, weight=1)
+        self.quality_progress_bar = ttk.Progressbar(
+            progress_frame,
+            mode="determinate",
+            maximum=1,
+            value=0,
+        )
+        self.quality_progress_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            progress_frame,
+            textvariable=self.quality_status_var,
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        filters = ttk.LabelFrame(
+            parent,
+            text="Filters",
+            padding=(16, 12),
+            style="Card.TLabelframe",
+        )
+        filters.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        for col in range(6):
+            filters.columnconfigure(col, weight=1 if col in (1, 3, 5) else 0)
+
+        ttk.Label(filters, text="Score ≥").grid(row=0, column=0, sticky="w")
+        min_spin = Spinbox(
+            filters,
+            from_=0,
+            to=100,
+            textvariable=self.quality_min_score_var,
+            width=6,
+            justify="center",
+        )
+        min_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        min_spin.grid(row=0, column=1, sticky="w", padx=(6, 18))
+
+        ttk.Label(filters, text="Score ≤").grid(row=0, column=2, sticky="w")
+        max_spin = Spinbox(
+            filters,
+            from_=0,
+            to=100,
+            textvariable=self.quality_max_score_var,
+            width=6,
+            justify="center",
+        )
+        max_spin.configure(
+            bg=self.colors["content"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            highlightthickness=0,
+            relief="flat",
+        )
+        max_spin.grid(row=0, column=3, sticky="w", padx=(6, 18))
+
+        ttk.Label(filters, text="Resolution").grid(row=0, column=4, sticky="w")
+        resolution_options = ["any", "<=480p", "720p", "1080p", "1440p", "2160p", "unknown"]
+        self.quality_resolution_combo = ttk.Combobox(
+            filters,
+            state="readonly",
+            values=resolution_options,
+            textvariable=self.quality_resolution_var,
+            width=10,
+        )
+        self.quality_resolution_combo.grid(row=0, column=5, sticky="w")
+
+        ttk.Checkbutton(
+            filters,
+            text="Missing subtitles",
+            variable=self.quality_missing_subs_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(
+            filters,
+            text="Mono / low audio",
+            variable=self.quality_mono_var,
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(filters, text="Apply", command=self.refresh_quality_results).grid(
+            row=1, column=5, sticky="e"
+        )
+
+        results = ttk.LabelFrame(
+            parent,
+            text="Latest quality measurements",
+            padding=(16, 16),
+            style="Card.TLabelframe",
+        )
+        results.grid(row=3, column=0, sticky=(N, S, E, W), pady=(12, 0))
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(0, weight=1)
+        columns = (
+            "score",
+            "resolution",
+            "video",
+            "duration",
+            "audio_channels",
+            "audio_langs",
+            "subs",
+            "updated",
+            "path",
+        )
+        self.quality_tree = ttk.Treeview(
+            results,
+            columns=columns,
+            show="headings",
+            height=12,
+            style="Card.Treeview",
+        )
+        headings = {
+            "score": "Score",
+            "resolution": "Resolution",
+            "video": "Video codec",
+            "duration": "Duration",
+            "audio_channels": "Audio ch",
+            "audio_langs": "Audio langs",
+            "subs": "Subs",
+            "updated": "Updated",
+            "path": "Path",
+        }
+        widths = {
+            "score": 70,
+            "resolution": 90,
+            "video": 120,
+            "duration": 90,
+            "audio_channels": 90,
+            "audio_langs": 120,
+            "subs": 120,
+            "updated": 150,
+            "path": 420,
+        }
+        anchors = {
+            "score": E,
+            "resolution": W,
+            "video": W,
+            "duration": E,
+            "audio_channels": E,
+            "audio_langs": W,
+            "subs": W,
+            "updated": W,
+            "path": W,
+        }
+        for key in columns:
+            self.quality_tree.heading(key, text=headings[key])
+            self.quality_tree.column(key, width=widths[key], anchor=anchors[key], stretch=True)
+        self.quality_tree.grid(row=0, column=0, sticky=(N, S, E, W))
+        quality_scroll = ttk.Scrollbar(results, orient="vertical", command=self.quality_tree.yview)
+        quality_scroll.grid(row=0, column=1, sticky=(N, S))
+        self.quality_tree.configure(yscrollcommand=quality_scroll.set)
+        self.quality_tree.bind("<<TreeviewSelect>>", self._on_quality_selection)
+        self.quality_tree.bind("<Double-1>", lambda _event: self.open_quality_folder())
+
+        actions = ttk.Frame(parent, style="Card.TFrame")
+        actions.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(actions, text="Open folder", command=self.open_quality_folder).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(actions, text="Copy path", command=self.copy_quality_path).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+
+        ttk.Label(
+            parent,
+            textvariable=self.quality_reason_var,
+            style="Subtle.TLabel",
+            wraplength=840,
+        ).grid(row=5, column=0, sticky="ew", pady=(8, 0))
+
+        self.refresh_quality_results()
+        if self._quality_ffprobe_missing and self.quality_run_button is not None:
+            try:
+                self.quality_run_button.configure(state="disabled")
+            except Exception:
+                pass
+            self.quality_status_var.set(
+                "ffprobe not found. Install FFmpeg to enable quality scoring."
+            )
 
     def _build_docpreview_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -3985,6 +4272,27 @@ class App:
         }
         return payload
 
+    def _quality_payload(self) -> Dict[str, object]:
+        payload = {
+            "enable": bool(self.quality_enable_var.get()),
+            "timeout_s": max(1, int(self.quality_timeout_var.get() or 1)),
+            "gentle_sleep_ms": self.quality_config.gentle_sleep_ms,
+            "max_parallel": self.quality_config.max_parallel,
+            "thresholds": {
+                "low_bitrate_per_mp": self.quality_config.thresholds.low_bitrate_per_mp,
+                "audio_min_channels": self.quality_config.thresholds.audio_min_channels,
+                "expect_subs": bool(self.quality_expect_subs_var.get()),
+                "runtime_tolerance_pct": self.quality_config.thresholds.runtime_tolerance_pct,
+            },
+            "labels": {
+                "res_480p_maxh": self.quality_config.labels.res_480p_maxh,
+                "res_720p_maxh": self.quality_config.labels.res_720p_maxh,
+                "res_1080p_maxh": self.quality_config.labels.res_1080p_maxh,
+                "res_2160p_minh": self.quality_config.labels.res_2160p_minh,
+            },
+        }
+        return payload
+
     def _docpreview_gentle_sleep(self) -> float:
         mount = self.path_var.get().strip() or "."
         settings_dict = _SETTINGS if isinstance(_SETTINGS, dict) else {}
@@ -3993,6 +4301,18 @@ class App:
             return 0.05 if perf_cfg.gentle_io else 0.0
         except Exception:
             return 0.0
+
+    def _quality_gentle_sleep(self) -> float:
+        base = max(0.0, self.quality_config.gentle_sleep_ms / 1000.0)
+        mount = self.path_var.get().strip() or "."
+        settings_dict = _SETTINGS if isinstance(_SETTINGS, dict) else {}
+        try:
+            perf_cfg = resolve_performance_config(mount, settings=settings_dict)
+            if getattr(perf_cfg, "gentle_io", False):
+                return max(base, 0.05)
+        except Exception:
+            return base
+        return base
 
     def _reset_docpreview_progress(self) -> None:
         self.docpreview_progress_total.set(0)
@@ -4004,6 +4324,12 @@ class App:
             self.docpreview_log.delete("1.0", "end")
             self.docpreview_log.configure(state="disabled")
 
+    def _reset_quality_progress(self) -> None:
+        self.quality_progress_total.set(0)
+        self.quality_progress_done.set(0)
+        if hasattr(self, "quality_progress_bar"):
+            self.quality_progress_bar.configure(maximum=1, value=0)
+
     def _append_docpreview_log(self, line: str) -> None:
         if not hasattr(self, "docpreview_log"):
             return
@@ -4011,6 +4337,100 @@ class App:
         self.docpreview_log.insert("end", line + "\n")
         self.docpreview_log.see("end")
         self.docpreview_log.configure(state="disabled")
+
+    def _format_quality_duration(self, seconds: Optional[float]) -> str:
+        if seconds is None:
+            return "—"
+        try:
+            total = int(float(seconds))
+        except (TypeError, ValueError):
+            return "—"
+        if total <= 0:
+            return "—"
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:d}:{secs:02d}"
+
+    def _quality_resolution_for(self, height: Optional[int]) -> str:
+        if height is None:
+            return "unknown"
+        try:
+            value = int(height)
+        except (TypeError, ValueError):
+            return "unknown"
+        labels = self.quality_config.labels
+        if value <= labels.res_480p_maxh:
+            return "<=480p"
+        if value <= labels.res_720p_maxh:
+            return "720p"
+        if value <= labels.res_1080p_maxh:
+            return "1080p"
+        if value >= labels.res_2160p_minh:
+            return "2160p"
+        return "1440p"
+
+    def _get_selected_quality_row(self) -> Optional[dict]:
+        if not hasattr(self, "quality_tree"):
+            return None
+        selection = self.quality_tree.selection()
+        if not selection:
+            return None
+        return self.quality_rows.get(selection[0])
+
+    def _on_quality_selection(self, _event: Optional[object] = None) -> None:
+        row = self._get_selected_quality_row()
+        if not row:
+            self.quality_reason_var.set("Select a row to view quality notes.")
+            return
+        reasons = row.get("reasons") if isinstance(row, dict) else None
+        text = self._format_quality_reasons(reasons if isinstance(reasons, dict) else {})
+        self.quality_reason_var.set(text)
+
+    def _format_quality_reasons(self, reasons: Dict[str, object]) -> str:
+        if not reasons:
+            return "No additional notes recorded for this file."
+        lines: List[str] = []
+        def add(line: str) -> None:
+            if line and line not in lines:
+                lines.append(line)
+
+        for key, value in reasons.items():
+            if key == "low_bitrate_per_mp":
+                try:
+                    add(f"Low bitrate density ≈ {float(value):.0f} kbps/MP")
+                except (TypeError, ValueError):
+                    add("Low bitrate density")
+            elif key == "audio_channels":
+                add(f"Limited audio channels ({value})")
+            elif key == "audio_channels_unknown":
+                add("Audio channel count unavailable")
+            elif key == "missing_subs":
+                add("No local subtitles detected")
+            elif key == "runtime_mismatch":
+                try:
+                    delta = int(value)
+                except (TypeError, ValueError):
+                    delta = 0
+                if delta:
+                    minutes = delta // 60
+                    add(f"Runtime mismatch (Δ {minutes} min)")
+                else:
+                    add("Runtime mismatch")
+            elif key == "runtime_match":
+                add("Runtime matches reference metadata")
+            elif key == "multi_audio_langs":
+                add(f"Multiple audio languages ({value})")
+            elif key == "multi_sub_langs":
+                add(f"Multiple subtitle languages ({value})")
+            elif key == "resolution":
+                add(f"Resolution label: {value}")
+            elif key == "status":
+                add(f"Probe status: {value}")
+            elif key == "message":
+                add(f"Probe message: {value}")
+        return "; ".join(lines)
 
     def start_docpreview_job(self) -> None:
         if self.docpreview_worker and self.docpreview_worker.is_alive():
@@ -4081,6 +4501,213 @@ class App:
         if self.docpreview_cancel:
             self.docpreview_cancel.set()
             self.docpreview_status_var.set("Cancelling doc preview…")
+
+    def start_quality_job(self) -> None:
+        if self.quality_worker and self.quality_worker.is_alive():
+            messagebox.showwarning("Quality report", "A quality report is already running.")
+            return
+        if not bool(self.quality_enable_var.get()):
+            messagebox.showinfo("Quality report", "Enable the quality toggle before running.")
+            return
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showerror("Quality report", "Fill the Disk Label field first.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            messagebox.showerror("Quality report", f"Shard database not found for '{label}'.")
+            return
+        if not quality_ffprobe_available():
+            messagebox.showerror("Quality report", "ffprobe not found on PATH. Install FFmpeg to enable quality scoring.")
+            return
+        payload = self._quality_payload()
+        self.quality_config = QualitySettings.from_mapping(payload)
+        try:
+            update_settings(WORKING_DIR_PATH, quality=payload)
+        except Exception:
+            pass
+        if isinstance(_SETTINGS, dict):
+            _SETTINGS["quality"] = dict(payload)
+        self._reset_quality_progress()
+        self.quality_status_var.set("Quality report running…")
+        gentle_sleep = self._quality_gentle_sleep()
+        cancel_token = CancellationToken()
+        self.quality_cancel = cancel_token
+
+        def progress(payload: Dict[str, object]) -> None:
+            self.worker_queue.put({"type": "quality-progress", "payload": payload})
+
+        def worker() -> None:
+            try:
+                summary = run_quality_for_shard(
+                    shard,
+                    settings=self.quality_config,
+                    progress_callback=progress,
+                    cancellation=cancel_token,
+                    gentle_sleep=gentle_sleep,
+                    mount_path=Path(self.path_var.get().strip()) if self.path_var.get().strip() else None,
+                    long_path_mode="auto",
+                )
+            except Exception as exc:
+                self.worker_queue.put({"type": "quality-complete", "error": str(exc)})
+                return
+            summary_data = {
+                "processed": summary.processed,
+                "updated": summary.updated,
+                "skipped": summary.skipped,
+                "errors": summary.errors,
+                "elapsed_s": summary.elapsed_s,
+                "ffprobe_missing": summary.ffprobe_missing,
+            }
+            self.worker_queue.put({"type": "quality-complete", "summary": summary_data})
+
+        self.quality_worker = threading.Thread(target=worker, daemon=True)
+        self.quality_worker.start()
+
+    def cancel_quality_job(self) -> None:
+        if self.quality_cancel:
+            self.quality_cancel.set()
+            self.quality_status_var.set("Cancelling quality report…")
+
+    def refresh_quality_results(self) -> None:
+        if not hasattr(self, "quality_tree"):
+            return
+        self.quality_tree.delete(*self.quality_tree.get_children())
+        self.quality_rows.clear()
+        label = self.label_var.get().strip()
+        if not label:
+            self.quality_status_var.set("Quality idle. Select a drive to view results.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            self.quality_status_var.set("Shard database not found for this drive.")
+            return
+        try:
+            conn = sqlite3.connect(shard)
+            conn.row_factory = sqlite3.Row
+            table_present = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='video_quality'"
+            ).fetchone()
+            if not table_present:
+                self.quality_status_var.set("Quality tables not found for this drive.")
+                return
+            limit = 500
+            rows = conn.execute(
+                """
+                SELECT q.path, q.container, q.duration_s, q.width, q.height, q.video_codec,
+                       q.video_bitrate_kbps, q.audio_codecs, q.audio_channels_max, q.audio_langs,
+                       q.subs_present, q.subs_langs, q.score, q.reasons_json, q.updated_utc
+                FROM video_quality AS q
+                LEFT JOIN inventory AS inv ON inv.path = q.path
+                WHERE inv.drive_label = ?
+                ORDER BY q.updated_utc DESC
+                LIMIT ?
+                """,
+                (label, limit),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            self.quality_status_var.set(f"Quality query failed: {exc}")
+            return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not rows:
+            self.quality_status_var.set("Quality report has not been run yet for this drive.")
+            return
+        try:
+            min_score = max(0, int(self.quality_min_score_var.get()))
+        except (TypeError, ValueError):
+            min_score = 0
+        try:
+            max_score = min(100, int(self.quality_max_score_var.get()))
+        except (TypeError, ValueError):
+            max_score = 100
+        resolution_filter = (self.quality_resolution_var.get() or "any").strip().lower()
+        filter_missing_subs = bool(self.quality_missing_subs_var.get())
+        filter_mono = bool(self.quality_mono_var.get())
+        total = 0
+        limit_hit = len(rows) >= limit
+        for row in rows:
+            score = row["score"] if row["score"] is not None else 0
+            if score < min_score or score > max_score:
+                continue
+            res_label = self._quality_resolution_for(row["height"])
+            if resolution_filter != "any" and res_label.lower() != resolution_filter:
+                continue
+            reasons_raw = row["reasons_json"] or "{}"
+            try:
+                reasons = json.loads(reasons_raw)
+                if not isinstance(reasons, dict):
+                    reasons = {}
+            except Exception:
+                reasons = {}
+            subs_present = int(row["subs_present"] or 0)
+            if filter_missing_subs and subs_present:
+                continue
+            audio_channels = row["audio_channels_max"]
+            try:
+                audio_channels_val = int(audio_channels) if audio_channels is not None else None
+            except (TypeError, ValueError):
+                audio_channels_val = None
+            if filter_mono:
+                min_channels = max(1, int(self.quality_config.thresholds.audio_min_channels))
+                low_flag = "audio_channels" in reasons or "audio_channels_unknown" in reasons
+                if audio_channels_val is not None:
+                    if audio_channels_val >= min_channels:
+                        continue
+                elif not low_flag:
+                    continue
+            duration_text = self._format_quality_duration(row["duration_s"])
+            audio_langs = row["audio_langs"] or "—"
+            subs_langs = row["subs_langs"] or ("none" if not subs_present else "yes")
+            values = (
+                row["score"] if row["score"] is not None else 0,
+                res_label,
+                row["video_codec"] or row["container"] or "—",
+                duration_text,
+                audio_channels_val if audio_channels_val is not None else "—",
+                audio_langs,
+                subs_langs,
+                row["updated_utc"] or "",
+                row["path"] or "",
+            )
+            item = self.quality_tree.insert("", "end", values=values)
+            self.quality_rows[item] = {
+                "path": row["path"],
+                "score": row["score"],
+                "reasons": reasons,
+            }
+            total += 1
+        if limit_hit:
+            self.quality_status_var.set(f"Quality entries: {total} (showing up to {limit})")
+        else:
+            self.quality_status_var.set(f"Quality entries: {total}")
+        self._on_quality_selection()
+
+    def open_quality_folder(self) -> None:
+        row = self._get_selected_quality_row()
+        if not row:
+            return
+        path = row.get("path")
+        if path:
+            self._open_path_in_explorer(path)
+
+    def copy_quality_path(self) -> None:
+        row = self._get_selected_quality_row()
+        if not row:
+            return
+        path = row.get("path") or ""
+        if not path:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+            self._show_toast("Quality path copied to clipboard", "info")
+        except Exception as exc:
+            messagebox.showerror("Quality report", f"Unable to copy path: {exc}")
+
 
     def _get_selected_docpreview_row(self) -> Optional[dict]:
         if not hasattr(self, "docpreview_tree"):
@@ -5101,6 +5728,8 @@ class App:
         self.textverify_ner_var.set("NER overlap: —")
         self.textverify_keywords_var.set("Keyword overlap: —")
         self.textverify_keywords_list.set("")
+        self.textverify_quality_var.set("Quality: —")
+        self.textverify_quality_notes.set("")
         self.textverify_current_path = None
         self.textverify_current_info.clear()
         for widget in (
@@ -5321,6 +5950,126 @@ class App:
         except Exception:
             return str(mount / candidate)
 
+    def _load_quality_details(
+        self,
+        shard: Path,
+        rel_path: Optional[str],
+        abs_path: Optional[str],
+    ) -> None:
+        self.textverify_quality_var.set("Quality: —")
+        self.textverify_quality_notes.set("")
+        if not rel_path:
+            return
+        conn: Optional[sqlite3.Connection] = None
+        row: Optional[sqlite3.Row] = None
+        try:
+            conn = sqlite3.connect(str(shard))
+            conn.row_factory = sqlite3.Row
+            has_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='video_quality'"
+            ).fetchone()
+            if not has_table:
+                self.textverify_quality_var.set("Quality: not measured yet.")
+                self.textverify_quality_notes.set(
+                    "Run the quality report to generate quality metadata."
+                )
+                return
+            candidates: List[str] = []
+
+            def _push(value: Optional[str]) -> None:
+                if not value:
+                    return
+                text = str(value).strip()
+                if not text:
+                    return
+                variants = {text}
+                if "\\" in text:
+                    variants.add(text.replace("\\", "/"))
+                if "/" in text:
+                    variants.add(text.replace("/", "\\"))
+                for variant in variants:
+                    if variant and variant not in candidates:
+                        candidates.append(variant)
+
+            _push(rel_path)
+            _push(abs_path)
+            for candidate in candidates:
+                row = conn.execute(
+                    """
+                    SELECT container, duration_s, width, height, video_codec,
+                           video_bitrate_kbps, audio_codecs, audio_channels_max,
+                           audio_langs, subs_present, subs_langs, score, reasons_json,
+                           updated_utc
+                    FROM video_quality
+                    WHERE path = ?
+                    """,
+                    (candidate,),
+                ).fetchone()
+                if row:
+                    break
+        except sqlite3.DatabaseError:
+            self.textverify_quality_var.set("Quality: unavailable.")
+            self.textverify_quality_notes.set("Quality lookup failed.")
+            return
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if not row:
+            self.textverify_quality_var.set("Quality: not measured yet.")
+            self.textverify_quality_notes.set(
+                "Run the quality report to generate quality metadata."
+            )
+            return
+        reasons_raw = row["reasons_json"] or "{}"
+        try:
+            reasons = json.loads(reasons_raw)
+            if not isinstance(reasons, dict):
+                reasons = {}
+        except Exception:
+            reasons = {}
+        score_value = row["score"]
+        parts: List[str] = []
+        if score_value is None:
+            parts.append("Unscored")
+        else:
+            try:
+                parts.append(f"Score {int(score_value)}")
+            except (TypeError, ValueError):
+                parts.append(f"Score {score_value}")
+        width = row["width"]
+        height = row["height"]
+        dims_text: Optional[str] = None
+        try:
+            if width and height:
+                dims_text = f"{int(width)}×{int(height)}"
+        except (TypeError, ValueError):
+            dims_text = None
+        res_label = self._quality_resolution_for(row["height"])
+        if dims_text and res_label != "unknown":
+            parts.append(f"{dims_text} ({res_label})")
+        elif dims_text:
+            parts.append(dims_text)
+        elif res_label != "unknown":
+            parts.append(res_label)
+        codec = row["video_codec"] or row["container"]
+        if codec:
+            parts.append(str(codec))
+        audio_channels = row["audio_channels_max"]
+        try:
+            if audio_channels:
+                parts.append(f"Audio {int(audio_channels)} ch")
+        except (TypeError, ValueError):
+            pass
+        updated = row["updated_utc"]
+        if updated:
+            parts.append(f"Updated {updated}")
+        summary = " • ".join(parts) if parts else "Not measured"
+        self.textverify_quality_var.set(f"Quality: {summary}")
+        self.textverify_quality_notes.set(self._format_quality_reasons(reasons))
+
     def _load_textverify_details(self, row: dict) -> None:
         label = self.label_var.get().strip()
         if not label:
@@ -5335,6 +6084,10 @@ class App:
         if not key:
             self._clear_textverify_panel()
             return
+        rel_path: Optional[str] = None
+        title: Optional[str] = None
+        year: Optional[object] = None
+        artifact: Optional[sqlite3.Row] = None
         conn = sqlite3.connect(shard)
         conn.row_factory = sqlite3.Row
         try:
@@ -5346,7 +6099,7 @@ class App:
                 if not video_row or not video_row["main_video_path"]:
                     self._clear_textverify_panel("No video path recorded for this folder.")
                     return
-                rel_path = video_row["main_video_path"]
+                rel_path = str(video_row["main_video_path"])
                 title = video_row["parsed_title"]
                 year = video_row["parsed_year"]
             else:
@@ -5357,7 +6110,7 @@ class App:
                 if not video_row or not video_row["episode_path"]:
                     self._clear_textverify_panel("Episode profile missing video path.")
                     return
-                rel_path = video_row["episode_path"]
+                rel_path = str(video_row["episode_path"])
                 title = video_row["parsed_title"]
                 year = None
             artifact = conn.execute(
@@ -5372,8 +6125,21 @@ class App:
                 conn.close()
             except Exception:
                 pass
+        rel_path_str = str(rel_path) if rel_path is not None else None
+        abs_path = self._resolve_textverify_abs_path(label, rel_path_str) if rel_path_str else None
         if not artifact:
             self._clear_textverify_panel("No plot cross-check cached for this item.")
+            if rel_path_str:
+                self._load_quality_details(shard, rel_path_str, abs_path)
+                self.textverify_current_path = abs_path
+                self.textverify_current_info = {
+                    "title": title,
+                    "year": year,
+                    "item_type": item_type,
+                    "rel_path": rel_path_str,
+                    "label": label,
+                    "folder_path": row.get("folder_path"),
+                }
             return
         has_subs = bool(artifact["has_local_subs"])
         lang = artifact["subs_lang"] or "—"
@@ -5434,13 +6200,14 @@ class App:
             self.textverify_plot_widget.delete("1.0", "end")
             self.textverify_plot_widget.insert("1.0", plot_text or "No official plot available.")
             self.textverify_plot_widget.configure(state="disabled")
-        abs_path = self._resolve_textverify_abs_path(label, str(rel_path))
+        if rel_path_str:
+            self._load_quality_details(shard, rel_path_str, abs_path)
         self.textverify_current_path = abs_path
         self.textverify_current_info = {
             "title": title,
             "year": year,
             "item_type": item_type,
-            "rel_path": str(rel_path),
+            "rel_path": rel_path_str,
             "label": label,
             "folder_path": row.get("folder_path"),
         }
@@ -7941,6 +8708,57 @@ class App:
             if hasattr(self, "docpreview_progress_bar"):
                 current_max = float(self.docpreview_progress_bar["maximum"] or 1)
                 self.docpreview_progress_bar.configure(value=current_max)
+        elif etype == "quality-progress":
+            payload = event.get("payload") or {}
+            total = int(payload.get("total") or 0)
+            processed = int(payload.get("processed") or 0)
+            updated = int(payload.get("updated") or 0)
+            skipped = int(payload.get("skipped") or 0)
+            errors = int(payload.get("errors") or 0)
+            self.quality_progress_total.set(total)
+            self.quality_progress_done.set(processed)
+            if total <= 0:
+                self.quality_progress_bar.configure(maximum=1, value=0)
+            else:
+                self.quality_progress_bar.configure(maximum=total, value=processed)
+            status = (
+                f"Quality report • {processed}/{total} processed "
+                f"(updated={updated}, skipped={skipped}, errors={errors})"
+            )
+            if payload.get("score") is not None:
+                status += f" last_score={payload.get('score')}"
+            if payload.get("error"):
+                status += " (error)"
+            self.quality_status_var.set(status)
+        elif etype == "quality-complete":
+            self.quality_worker = None
+            self.quality_cancel = None
+            summary = event.get("summary") or {}
+            error = event.get("error")
+            if error:
+                message = f"Quality report failed: {error}"
+                self.quality_status_var.set(message)
+                messagebox.showerror("Quality report", message)
+            else:
+                if summary.get("ffprobe_missing"):
+                    self.quality_status_var.set("Quality report skipped — ffprobe not available.")
+                    self.show_banner("ffprobe not found — Quality disabled", level="ERROR")
+                else:
+                    processed = int(summary.get("processed") or 0)
+                    updated = int(summary.get("updated") or 0)
+                    skipped = int(summary.get("skipped") or 0)
+                    errors = int(summary.get("errors") or 0)
+                    elapsed = float(summary.get("elapsed_s") or 0.0)
+                    status = (
+                        "Quality report complete — "
+                        f"processed={processed} updated={updated} skipped={skipped} "
+                        f"errors={errors} elapsed={elapsed:.1f}s"
+                    )
+                    self.quality_status_var.set(status)
+                    self.refresh_quality_results()
+            if hasattr(self, "quality_progress_bar"):
+                current_max = float(self.quality_progress_bar["maximum"] or 1)
+                self.quality_progress_bar.configure(value=current_max)
         elif etype == "music-progress":
             payload = event.get("payload") or {}
             total = int(payload.get("music_total") or 0)
@@ -8162,7 +8980,7 @@ class App:
             self.stop_evt = None
 
     def refresh_all(self):
-        self.refresh_drives(); self.refresh_jobs(); self.refresh_structure_view()
+        self.refresh_drives(); self.refresh_jobs(); self.refresh_structure_view(); self.refresh_quality_results()
 
     def refresh_drives(self):
         self.tree.delete(*self.tree.get_children())
