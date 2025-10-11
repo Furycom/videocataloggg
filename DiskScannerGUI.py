@@ -3,7 +3,7 @@
 # Dossier base: C:\Users\Administrator\VideoCatalog
 
 import io
-import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser, base64, csv
+import os, sys, json, time, shutil, sqlite3, threading, subprocess, zipfile, queue, webbrowser, base64, csv, urllib.parse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, asdict
 from functools import lru_cache
@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import scan_drive
 from structure import load_structure_settings as load_structure_config
 from docpreview import DocPreviewSettings, run_for_shard as run_docpreview_for_shard
+from textverify import TextVerifySettings
 from robust import CancellationToken
 from musicnames import parse_music_name, score_parse_result
 
@@ -1793,6 +1794,12 @@ class App:
         self._maintenance_window: Optional[MaintenanceDialog] = None
         self._last_scan_label: Optional[str] = None
         self.structure_settings = load_structure_config(_SETTINGS if isinstance(_SETTINGS, dict) else {})
+        textverify_cfg: Dict[str, object] = {}
+        if isinstance(_SETTINGS, dict):
+            maybe_tv = _SETTINGS.get("textverify")
+            if isinstance(maybe_tv, dict):
+                textverify_cfg = maybe_tv
+        self.textverify_config = TextVerifySettings.from_mapping(textverify_cfg)
         self.structure_worker: Optional[threading.Thread] = None
         self.structure_status_var = StringVar(value="Structure profiling idle.")
         self.structure_summary_var = StringVar(value="No structure data available yet.")
@@ -1808,6 +1815,23 @@ class App:
         self._structure_contact_sheet_image: Optional[Image.Image] = None
         self._structure_keyframe_photos: list[ImageTk.PhotoImage] = []
         self._structure_keyframe_images: list[Image.Image] = []
+        self.textverify_status_var = StringVar(value="Plot cross-check idle.")
+        self.textverify_lang_var = StringVar(value="Subtitles: —")
+        self.textverify_source_var = StringVar(value="Plot source: —")
+        self.textverify_score_var = StringVar(value="Match score: —")
+        self.textverify_semantic_var = StringVar(value="Semantic: —")
+        self.textverify_ner_var = StringVar(value="NER overlap: —")
+        self.textverify_keywords_var = StringVar(value="Keyword overlap: —")
+        self.textverify_summary_text = StringVar(value="")
+        self.textverify_plot_text = StringVar(value="")
+        self.textverify_keywords_list = StringVar(value="")
+        self.textverify_current_path: Optional[str] = None
+        self.textverify_current_info: Dict[str, object] = {}
+        self.textverify_semantic_bar = None
+        self.textverify_ner_bar = None
+        self.textverify_keywords_bar = None
+        self.textverify_summary_widget = None
+        self.textverify_plot_widget = None
         doc_cfg: Dict[str, object] = {}
         if isinstance(_SETTINGS, dict):
             maybe_doc = _SETTINGS.get("docpreview")
@@ -3326,6 +3350,97 @@ class App:
         self.structure_keyframe_hint.grid(row=0, column=0, sticky="nwe", pady=(12, 0))
         preview_notebook.add(keyframes_tab, text="Keyframes")
 
+        textverify_tab = ttk.Frame(preview_notebook, padding=(12, 12), style="Card.TFrame")
+        textverify_tab.columnconfigure(0, weight=1)
+        textverify_tab.rowconfigure(2, weight=1)
+        status_frame = ttk.Frame(textverify_tab, style="Card.TFrame")
+        status_frame.grid(row=0, column=0, sticky="ew")
+        status_frame.columnconfigure(0, weight=1)
+        ttk.Label(status_frame, textvariable=self.textverify_status_var, style="Subtle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(status_frame, textvariable=self.textverify_lang_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(status_frame, textvariable=self.textverify_source_var).grid(row=2, column=0, sticky="w")
+        ttk.Label(status_frame, textvariable=self.textverify_score_var, style="Strong.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(4, 0)
+        )
+
+        metrics = ttk.Frame(textverify_tab, style="Card.TFrame")
+        metrics.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        metrics.columnconfigure(1, weight=1)
+        ttk.Label(metrics, textvariable=self.textverify_semantic_var).grid(row=0, column=0, sticky="w")
+        self.textverify_semantic_bar = ttk.Progressbar(metrics, maximum=100, value=0)
+        self.textverify_semantic_bar.grid(row=0, column=1, sticky="ew", padx=(12, 0))
+        ttk.Label(metrics, textvariable=self.textverify_ner_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.textverify_ner_bar = ttk.Progressbar(metrics, maximum=100, value=0)
+        self.textverify_ner_bar.grid(row=1, column=1, sticky="ew", padx=(12, 0))
+        ttk.Label(metrics, textvariable=self.textverify_keywords_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.textverify_keywords_bar = ttk.Progressbar(metrics, maximum=100, value=0)
+        self.textverify_keywords_bar.grid(row=2, column=1, sticky="ew", padx=(12, 0))
+
+        text_frames = ttk.Frame(textverify_tab, style="Card.TFrame")
+        text_frames.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        text_frames.columnconfigure(0, weight=1)
+        text_frames.columnconfigure(1, weight=1)
+        summary_box = ttk.LabelFrame(
+            text_frames,
+            text="Subtitle summary",
+            padding=(8, 8),
+            style="Card.TLabelframe",
+        )
+        summary_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        summary_box.columnconfigure(0, weight=1)
+        self.textverify_summary_widget = ScrolledText(summary_box, height=10, wrap="word")
+        self.textverify_summary_widget.configure(
+            state="disabled",
+            background=self.colors["content"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+        )
+        self.textverify_summary_widget.grid(row=0, column=0, sticky="nsew")
+
+        plot_box = ttk.LabelFrame(
+            text_frames,
+            text="Official plot",
+            padding=(8, 8),
+            style="Card.TLabelframe",
+        )
+        plot_box.grid(row=0, column=1, sticky="nsew")
+        plot_box.columnconfigure(0, weight=1)
+        self.textverify_plot_widget = ScrolledText(plot_box, height=10, wrap="word")
+        self.textverify_plot_widget.configure(
+            state="disabled",
+            background=self.colors["content"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+        )
+        self.textverify_plot_widget.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(
+            textverify_tab,
+            textvariable=self.textverify_keywords_list,
+            style="Subtle.TLabel",
+            wraplength=360,
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        actions = ttk.Frame(textverify_tab, style="Card.TFrame")
+        actions.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(actions, text="Open folder", command=self.open_textverify_folder).grid(row=0, column=0, sticky="w")
+        ttk.Button(actions, text="Copy path", command=self.copy_textverify_path).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(
+            actions,
+            text="Search TMDb/IMDb",
+            command=self.search_textverify_online,
+        ).grid(row=0, column=2, sticky="w", padx=(12, 0))
+
+        preview_notebook.add(textverify_tab, text="Plot cross-check")
+
         self.structure_tree.bind("<<TreeviewSelect>>", self._on_structure_tree_select)
 
         summary_frame = ttk.Frame(parent, style="Card.TFrame")
@@ -4637,6 +4752,38 @@ class App:
                 text="Select a queue item to load keyframes."
             )
             self.structure_keyframe_hint.grid(row=0, column=0, sticky="nwe", pady=(12, 0))
+        self._clear_textverify_panel()
+
+    def _clear_textverify_panel(self, message: Optional[str] = None) -> None:
+        status = message or "Select a queue item to load plot cross-check."
+        self.textverify_status_var.set(status)
+        self.textverify_lang_var.set("Subtitles: —")
+        self.textverify_source_var.set("Plot source: —")
+        self.textverify_score_var.set("Match score: —")
+        self.textverify_semantic_var.set("Semantic: —")
+        self.textverify_ner_var.set("NER overlap: —")
+        self.textverify_keywords_var.set("Keyword overlap: —")
+        self.textverify_keywords_list.set("")
+        self.textverify_current_path = None
+        self.textverify_current_info.clear()
+        for widget in (
+            self.textverify_summary_widget,
+            self.textverify_plot_widget,
+        ):
+            if widget is not None:
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.configure(state="disabled")
+        for bar in (
+            self.textverify_semantic_bar,
+            self.textverify_ner_bar,
+            self.textverify_keywords_bar,
+        ):
+            if bar is not None:
+                try:
+                    bar.configure(value=0)
+                except Exception:
+                    pass
 
     def _on_structure_tree_select(self, _event: Optional[object] = None) -> None:
         row = self._get_selected_structure_row()
@@ -4684,6 +4831,7 @@ class App:
             return
         self._update_structure_contact_sheet(sheet, image)
         self._populate_structure_keyframes(image, sheet.frame_count)
+        self._load_textverify_details(row)
 
     def _update_structure_contact_sheet(
         self,
@@ -4794,6 +4942,172 @@ class App:
             )
             self.structure_keyframe_hint.grid(row=0, column=0, sticky="nwe", pady=(12, 0))
 
+    def _lookup_mount_for_label(self, label: str) -> Optional[Path]:
+        if not label:
+            return None
+        shard = shard_path_for(label)
+        if not shard.exists():
+            return None
+        try:
+            conn = sqlite3.connect(shard)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT mount_path FROM drives WHERE label = ? ORDER BY scanned_at DESC LIMIT 1",
+                (label,),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not row:
+            return None
+        mount_value = row["mount_path"]
+        if not mount_value:
+            return None
+        try:
+            return Path(str(mount_value))
+        except Exception:
+            return None
+
+    def _resolve_textverify_abs_path(self, label: str, relative: str) -> Optional[str]:
+        candidate = Path(relative)
+        if candidate.is_absolute():
+            return str(candidate)
+        mount = self._lookup_mount_for_label(label)
+        if mount is None:
+            return None
+        try:
+            return str((mount / candidate).resolve())
+        except Exception:
+            return str(mount / candidate)
+
+    def _load_textverify_details(self, row: dict) -> None:
+        label = self.label_var.get().strip()
+        if not label:
+            self._clear_textverify_panel("Select a drive label to load plot cross-check.")
+            return
+        shard = shard_path_for(label)
+        if not shard.exists():
+            self._clear_textverify_panel("Shard database not found for this drive.")
+            return
+        item_type = row.get("item_type") or "folder"
+        key = row.get("folder_path") if item_type == "folder" else row.get("item_key")
+        if not key:
+            self._clear_textverify_panel()
+            return
+        conn = sqlite3.connect(shard)
+        conn.row_factory = sqlite3.Row
+        try:
+            if item_type == "folder":
+                video_row = conn.execute(
+                    "SELECT main_video_path, parsed_title, parsed_year FROM folder_profile WHERE folder_path = ?",
+                    (key,),
+                ).fetchone()
+                if not video_row or not video_row["main_video_path"]:
+                    self._clear_textverify_panel("No video path recorded for this folder.")
+                    return
+                rel_path = video_row["main_video_path"]
+                title = video_row["parsed_title"]
+                year = video_row["parsed_year"]
+            else:
+                video_row = conn.execute(
+                    "SELECT episode_path, parsed_title FROM tv_episode_profile WHERE episode_path = ?",
+                    (key,),
+                ).fetchone()
+                if not video_row or not video_row["episode_path"]:
+                    self._clear_textverify_panel("Episode profile missing video path.")
+                    return
+                rel_path = video_row["episode_path"]
+                title = video_row["parsed_title"]
+                year = None
+            artifact = conn.execute(
+                "SELECT * FROM textverify_artifacts WHERE path = ?",
+                (rel_path,),
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._clear_textverify_panel(f"Plot cross-check lookup failed: {exc}")
+            return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not artifact:
+            self._clear_textverify_panel("No plot cross-check cached for this item.")
+            return
+        has_subs = bool(artifact["has_local_subs"])
+        lang = artifact["subs_lang"] or "—"
+        lines_used = artifact["subs_lines_used"] or 0
+        summary_text = artifact["summary"] or ""
+        plot_text = artifact["plot_excerpt"] or ""
+        plot_source = artifact["plot_source"] or "none"
+        semantic = float(artifact["semantic_sim"] or 0.0)
+        ner = float(artifact["ner_overlap"] or 0.0)
+        keyword_score = float(artifact["keyword_overlap"] or 0.0)
+        aggregated = float(artifact["aggregated_score"] or 0.0)
+        updated = artifact["updated_utc"] or ""
+        keywords_raw = artifact["keywords"] or ""
+        keywords_list: List[str] = []
+        if isinstance(keywords_raw, str):
+            try:
+                parsed_keywords = json.loads(keywords_raw)
+                if isinstance(parsed_keywords, list):
+                    keywords_list = [str(item) for item in parsed_keywords if str(item).strip()]
+                else:
+                    keywords_list = [kw.strip() for kw in keywords_raw.split(",") if kw.strip()]
+            except Exception:
+                keywords_list = [kw.strip() for kw in keywords_raw.split(",") if kw.strip()]
+        elif isinstance(keywords_raw, (list, tuple)):
+            keywords_list = [str(item) for item in keywords_raw if str(item).strip()]
+        keyword_display = ", ".join(keywords_list)
+        subtitle_label = "none" if not has_subs else f"{lang} ({lines_used} lines)"
+        self.textverify_status_var.set(f"Updated {updated}" if updated else "Plot cross-check available.")
+        self.textverify_lang_var.set(f"Subtitles: {subtitle_label}")
+        self.textverify_source_var.set(f"Plot source: {plot_source}")
+        self.textverify_score_var.set(f"Match score: {aggregated:.0%}")
+        self.textverify_semantic_var.set(f"Semantic: {semantic:.0%}")
+        self.textverify_ner_var.set(f"NER overlap: {ner:.0%}")
+        self.textverify_keywords_var.set(f"Keyword overlap: {keyword_score:.0%}")
+        self.textverify_keywords_list.set(f"Keywords: {keyword_display}" if keyword_display else "Keywords: —")
+        if self.textverify_semantic_bar is not None:
+            try:
+                self.textverify_semantic_bar.configure(value=int(round(semantic * 100)))
+            except Exception:
+                pass
+        if self.textverify_ner_bar is not None:
+            try:
+                self.textverify_ner_bar.configure(value=int(round(ner * 100)))
+            except Exception:
+                pass
+        if self.textverify_keywords_bar is not None:
+            try:
+                self.textverify_keywords_bar.configure(value=int(round(keyword_score * 100)))
+            except Exception:
+                pass
+        if self.textverify_summary_widget is not None:
+            self.textverify_summary_widget.configure(state="normal")
+            self.textverify_summary_widget.delete("1.0", "end")
+            self.textverify_summary_widget.insert("1.0", summary_text or "No subtitle summary available.")
+            self.textverify_summary_widget.configure(state="disabled")
+        if self.textverify_plot_widget is not None:
+            self.textverify_plot_widget.configure(state="normal")
+            self.textverify_plot_widget.delete("1.0", "end")
+            self.textverify_plot_widget.insert("1.0", plot_text or "No official plot available.")
+            self.textverify_plot_widget.configure(state="disabled")
+        abs_path = self._resolve_textverify_abs_path(label, str(rel_path))
+        self.textverify_current_path = abs_path
+        self.textverify_current_info = {
+            "title": title,
+            "year": year,
+            "item_type": item_type,
+            "rel_path": str(rel_path),
+            "label": label,
+            "folder_path": row.get("folder_path"),
+        }
+
     def _open_keyframe_dialog(self, index: int) -> None:
         if index < 0 or index >= len(self._structure_keyframe_images):
             return
@@ -4808,6 +5122,43 @@ class App:
         label = ttk.Label(window, image=photo)
         label.grid(row=0, column=0, padx=12, pady=12)
         window.bind("<Escape>", lambda _event: window.destroy())
+
+    def open_textverify_folder(self) -> None:
+        path = self.textverify_current_path
+        if not path:
+            messagebox.showinfo(
+                "Plot Cross-Check",
+                "Path unavailable. Ensure the drive mount path is configured.",
+            )
+            return
+        self._open_path_in_explorer(path)
+
+    def copy_textverify_path(self) -> None:
+        path = self.textverify_current_path
+        if not path:
+            messagebox.showinfo("Plot Cross-Check", "No path available to copy.")
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+            self._show_toast("Path copied to clipboard", "info")
+        except Exception as exc:
+            messagebox.showerror("Plot Cross-Check", f"Unable to copy path: {exc}")
+
+    def search_textverify_online(self) -> None:
+        info = dict(self.textverify_current_info)
+        title = info.get("title")
+        if not title:
+            folder = info.get("folder_path") or info.get("rel_path")
+            if not folder:
+                messagebox.showinfo("Plot Cross-Check", "No title available for search.")
+                return
+            title = Path(str(folder)).name
+        query = urllib.parse.quote(str(title))
+        webbrowser.open(f"https://www.themoviedb.org/search?query={query}")
+        webbrowser.open_new_tab(
+            f"https://www.imdb.com/find/?s=tt&ttype=tv,movie&q={query}"
+        )
 
     def start_visualreview_job(self) -> None:
         if self.visualreview_worker and self.visualreview_worker.is_alive():

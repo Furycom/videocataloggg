@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source .venv/bin/activate
-python DiskScannerGUI.py
+python VideoCatalog/DiskScannerGUI.py

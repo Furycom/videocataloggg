@@ -122,6 +122,36 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "keywords_topk": 10,
         "gpu_allowed": True,
     },
+    "textverify": {
+        "enable": True,
+        "targets": "low-medium",
+        "subs_sample": {
+            "max_lines": 400,
+            "head_lines": 150,
+            "mid_lines": 100,
+            "tail_lines": 150,
+            "max_chars": 20000,
+        },
+        "summary_tokens": 120,
+        "keywords_topk": 12,
+        "models": {
+            "embed": "paraphrase-multilingual-MiniLM-L12-v2",
+            "summarizer": "sshleifer/distilbart-cnn-12-6",
+        },
+        "weights": {
+            "semantic": 0.55,
+            "ner_overlap": 0.25,
+            "keyword_overlap": 0.20,
+        },
+        "thresholds": {
+            "boost_strong": 0.80,
+            "boost_medium": 0.65,
+            "flag_diverge": 0.40,
+        },
+        "max_items_per_run": 200,
+        "gentle_sleep_ms": 3,
+        "gpu_allowed": True,
+    },
     "visualreview": {
         "enable": False,
         "frames_per_video": 9,
