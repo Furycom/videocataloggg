@@ -31,6 +31,12 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - The tab renders five sections: an overview (totals, average size, and per-category counts), top extensions (by count and total bytes), largest files, heaviest folders (aggregated to the selected depth), and recent changes (files modified in the last *X* days). Column headers are clickable to sort in place.
 - Use **Export CSV…** or **Export JSON…** to dump the current result sets. CSV exports create one file per section and JSON bundles everything into a single structured document. Files land under `<working_dir>/exports/reports/` with timestamped names.
 
+## Audit pack
+
+- Open the **Audit** tab to review library health at a glance. The dashboard shows video/episode totals, confidence buckets, duplicate pairs, unresolved IDs, optional quality flags, and the most recent baseline snapshot. A delta summary highlights items added or resolved since the last baseline. Runs are fully asynchronous so the GUI remains responsive, and the export-folder link opens the latest artifacts directly in the OS file manager.
+- CLI users can trigger the same workflows with `scan_drive.py --audit` (summary), `--audit-export` (generate CSV/JSON exports), `--audit-baseline` (create a new baseline snapshot), and `--audit-delta` (compare the current catalog with the most recent baseline). Results print concise metrics in the console and reuse the working directory configured in `settings.json`.
+- Exports land under `<working_dir>/exports/audit/<timestamp>/` and include low-confidence queues (movies and episodes), probable duplicate pairs, unresolved IDs with top candidates, optional video-quality flags, and JSON reports for API health plus drive status. Baseline snapshots are stored in SQLite (`audit_baseline`) and a `baseline.json` file inside the export folder for easy sharing.
+
 ## Local read-only API
 
 - Launch the service directly with `python videocatalog_api.py --api-key <KEY>` (optional `--host`, `--port`, and repeated `--cors` flags override `settings.json`). On start the CLI prints `API listening on http://<host>:<port>` so other tools can probe it locally.
