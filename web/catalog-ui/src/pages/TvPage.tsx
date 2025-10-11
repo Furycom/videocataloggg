@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { getEpisodes, getSeasons, getSeries, thumbUrl } from '../api/client';
 import type { EpisodeRow, PaginatedResponse, SeriesRow, SeasonRow } from '../api/types';
 import { useDetailDrawer } from '../hooks/useDetailDrawer';
+import { useLiveCatalog } from '../hooks/useLiveCatalog';
 import styles from './TvPage.module.css';
 
 interface SeriesFilters {
@@ -27,10 +28,11 @@ export default function TvPage() {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const drawer = useDetailDrawer();
+  const live = useLiveCatalog();
 
   const effectiveFilters = useMemo(() => ({ ...filters }), [filters]);
 
-  useEffect(() => {
+  const loadSeries = useCallback(() => {
     setLoadingSeries(true);
     setError(null);
     getSeries({
@@ -43,12 +45,38 @@ export default function TvPage() {
         setSeries(response.results);
         setPagination({ next_offset: response.next_offset, offset: response.offset });
         if (response.results.length > 0) {
-          setSelectedSeries(response.results[0]);
+          const matched = response.results.find(item => item.id === selectedSeries?.id);
+          setSelectedSeries(matched ?? response.results[0]);
+        } else {
+          setSelectedSeries(null);
         }
       })
       .catch(err => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoadingSeries(false));
-  }, [effectiveFilters]);
+  }, [effectiveFilters, selectedSeries]);
+
+  useEffect(() => {
+    loadSeries();
+  }, [loadSeries]);
+
+  const loadEpisodes = useCallback(
+    async (seriesId: string, seasonNumber?: number) => {
+      setLoadingDetail(true);
+      try {
+        const [seasonResponse, episodeResponse] = await Promise.all([
+          getSeasons(seriesId),
+          getEpisodes(seriesId, seasonNumber),
+        ]);
+        setSeasons(seasonResponse.seasons);
+        setEpisodes(episodeResponse.episodes);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setLoadingDetail(false);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!selectedSeries) {
@@ -56,15 +84,19 @@ export default function TvPage() {
       setEpisodes([]);
       return;
     }
-    setLoadingDetail(true);
-    Promise.all([getSeasons(selectedSeries.id), getEpisodes(selectedSeries.id)])
-      .then(([seasonResponse, episodeResponse]) => {
-        setSeasons(seasonResponse.seasons);
-        setEpisodes(episodeResponse.episodes);
-      })
-      .catch(err => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoadingDetail(false));
-  }, [selectedSeries]);
+    loadEpisodes(selectedSeries.id);
+  }, [loadEpisodes, selectedSeries]);
+
+  useEffect(() => {
+    return live.subscribe(event => {
+      if (event.kind === 'series_upsert') {
+        loadSeries();
+      }
+      if (event.kind === 'episode_upsert' && selectedSeries) {
+        loadEpisodes(selectedSeries.id);
+      }
+    });
+  }, [live, loadEpisodes, loadSeries, selectedSeries]);
 
   const filteredEpisodes = episodes;
 
@@ -129,14 +161,8 @@ export default function TvPage() {
                 <button
                   key={season.id}
                   className={styles.seasonPill}
-                  onClick={async () => {
-                    setLoadingDetail(true);
-                    try {
-                      const response = await getEpisodes(selectedSeries.id, season.season_number ?? undefined);
-                      setEpisodes(response.episodes);
-                    } finally {
-                      setLoadingDetail(false);
-                    }
+                  onClick={() => {
+                    loadEpisodes(selectedSeries.id, season.season_number ?? undefined);
                   }}
                 >
                   S{season.season_number ?? '?'} · {season.episodes_found ?? '?'} eps

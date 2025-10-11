@@ -6,6 +6,7 @@ import binascii
 import json
 import os
 import sqlite3
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +32,8 @@ from semantic import (
     SemanticTranscriber,
 )
 from semantic.db import semantic_connection
+
+LOGGER = logging.getLogger("videocatalog.api.db")
 
 _DEFAULT_LIMIT = 100
 _MAX_PAGE_SIZE = 500
@@ -129,6 +132,12 @@ class DataAccess:
             max_page = _MAX_PAGE_SIZE
         self.default_limit = min(default_limit, max_page)
         self.max_page_size = max_page
+
+    @property
+    def settings_payload(self) -> Dict[str, Any]:
+        """Return a copy of the loaded settings payload."""
+
+        return dict(self._settings)
     def refresh_settings(self) -> None:
         """Reload settings.json from disk."""
 
@@ -148,6 +157,142 @@ class DataAccess:
     # ------------------------------------------------------------------
     # Catalog helpers
     # ------------------------------------------------------------------
+
+    def ensure_event_stream_schema(self) -> None:
+        """Ensure auxiliary tables used for live event streaming exist."""
+
+        try:
+            conn = connect(self.catalog_path, read_only=False, check_same_thread=False)
+        except sqlite3.DatabaseError as exc:
+            LOGGER.warning("Unable to open catalog DB for event schema: %s", exc)
+            return
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events_queue (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                    kind TEXT NOT NULL,
+                    payload_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_queue_kind_seq ON events_queue(kind, seq)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vectors_pending (
+                    doc_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    ts_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                )
+                """
+            )
+        except sqlite3.DatabaseError as exc:
+            LOGGER.warning("Failed to ensure event schema: %s", exc)
+        finally:
+            conn.close()
+
+    def fetch_events(self, after_seq: int, *, limit: int = 256) -> List[Dict[str, Any]]:
+        """Return catalog events newer than ``after_seq`` ordered by sequence."""
+
+        with self._catalog() as conn:
+            try:
+                cursor = conn.execute(
+                    """
+                    SELECT seq, ts_utc, kind, payload_json
+                    FROM events_queue
+                    WHERE seq > ?
+                    ORDER BY seq ASC
+                    LIMIT ?
+                    """,
+                    (int(after_seq), int(limit)),
+                )
+            except sqlite3.DatabaseError:
+                return []
+            rows = cursor.fetchall()
+        events: List[Dict[str, Any]] = []
+        for row in rows:
+            payload: Dict[str, Any] = {}
+            raw_payload = row["payload_json"]
+            if raw_payload:
+                try:
+                    payload = json.loads(raw_payload)
+                    if not isinstance(payload, dict):
+                        payload = {"value": payload}
+                except Exception:
+                    payload = {"raw": raw_payload}
+            events.append(
+                {
+                    "seq": int(row["seq"]),
+                    "ts_utc": row["ts_utc"],
+                    "kind": row["kind"],
+                    "payload": payload,
+                }
+            )
+        return events
+
+    def latest_event_seq(self) -> int:
+        with self._catalog() as conn:
+            try:
+                cursor = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events_queue")
+                row = cursor.fetchone()
+            except sqlite3.DatabaseError:
+                return 0
+        if not row:
+            return 0
+        try:
+            return int(row[0] or 0)
+        except Exception:
+            return 0
+
+    def dequeue_vectors_pending(self, *, limit: int = 32) -> List[Dict[str, Any]]:
+        """Pop a batch of pending vector document identifiers."""
+
+        try:
+            conn = connect(self.catalog_path, read_only=False, check_same_thread=False)
+        except sqlite3.DatabaseError as exc:
+            LOGGER.debug("Unable to open catalog DB for vectors_pending: %s", exc)
+            return []
+        rows: List[sqlite3.Row] = []
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                SELECT doc_id, kind, ts_utc
+                FROM vectors_pending
+                ORDER BY ts_utc ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            rows = cursor.fetchall()
+            if rows:
+                conn.executemany(
+                    "DELETE FROM vectors_pending WHERE doc_id = ?",
+                    [(row["doc_id"],) for row in rows],
+                )
+            conn.commit()
+        except sqlite3.DatabaseError as exc:
+            LOGGER.debug("Failed to dequeue vectors_pending: %s", exc)
+            try:
+                conn.rollback()
+            except sqlite3.DatabaseError:
+                pass
+            return []
+        finally:
+            conn.close()
+        payload: List[Dict[str, Any]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "doc_id": str(row["doc_id"]),
+                    "kind": str(row["kind"]),
+                    "ts_utc": row["ts_utc"],
+                }
+            )
+        return payload
 
     def _iter_drive_labels(self) -> Iterator[str]:
         """Yield all known drive labels registered in the catalog database."""

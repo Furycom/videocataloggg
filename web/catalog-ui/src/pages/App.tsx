@@ -4,6 +4,8 @@ import AppShell from '../components/AppShell';
 import { DetailDrawer } from '../components/DetailDrawer';
 import { useApiKey } from '../hooks/useApiKey';
 import { DetailDrawerProvider, useDetailDrawer } from '../hooks/useDetailDrawer';
+import { AssistantStatusProvider } from '../hooks/useAssistantStatus';
+import { LiveCatalogProvider } from '../hooks/useLiveCatalog';
 import HomePage from './HomePage';
 import MoviesPage from './MoviesPage';
 import SearchPage from './SearchPage';
@@ -51,11 +53,15 @@ function AppRoutes() {
 function InnerApp() {
   const [apiKey, setApiKey] = useApiKey();
   return (
-    <DetailDrawerProvider>
-      <AppShell rightPanel={<ApiKeyBadge apiKey={apiKey} onUpdate={setApiKey} />}>
-        <AppRoutes />
-      </AppShell>
-    </DetailDrawerProvider>
+    <AssistantStatusProvider>
+      <LiveCatalogProvider>
+        <DetailDrawerProvider>
+          <AppShell rightPanel={<ApiKeyBadge apiKey={apiKey} onUpdate={setApiKey} />}>
+            <AppRoutes />
+          </AppShell>
+        </DetailDrawerProvider>
+      </LiveCatalogProvider>
+    </AssistantStatusProvider>
   );
 }
 

@@ -139,3 +139,37 @@ export interface SearchResponse {
   query: string;
   results: SearchHit[];
 }
+
+export interface CatalogEventPayload {
+  seq: number;
+  kind: string;
+  ts_utc?: string | null;
+  payload: Record<string, unknown>;
+}
+
+export interface AssistantStatus {
+  requested: boolean;
+  gpu_ready: boolean;
+  enabled: boolean;
+  message: string;
+  gpu: Record<string, unknown>;
+  runtime?: Record<string, unknown>;
+}
+
+export interface AssistantAskSource {
+  type: string;
+  ref: string;
+}
+
+export interface AssistantToolCall {
+  tool?: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface AssistantAskResponse {
+  answer_markdown: string;
+  sources: AssistantAskSource[];
+  tool_calls: AssistantToolCall[];
+  elapsed_ms: number;
+  status: Record<string, unknown>;
+}

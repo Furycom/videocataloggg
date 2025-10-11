@@ -49,6 +49,47 @@
   gap: 0.5rem;
 }
 
+.liveIndicator {
+  margin-left: 1.25rem;
+  padding: 0.25rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.live-online {
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35);
+  color: #22c55e;
+}
+
+.live-connecting {
+  box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.45);
+  color: #facc15;
+}
+
+.live-offline {
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.45);
+  color: #f87171;
+}
+
+.bannerWarn,
+.bannerCritical {
+  padding: 0.5rem 2rem;
+  font-weight: 600;
+}
+
+.bannerWarn {
+  background: rgba(250, 204, 21, 0.12);
+  color: #facc15;
+}
+
+.bannerCritical {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+}
+
 .content {
   flex: 1;
   padding: 1.5rem 2rem 3rem;

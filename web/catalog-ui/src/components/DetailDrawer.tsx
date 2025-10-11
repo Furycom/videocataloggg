@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { FormEventHandler, useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
 
-import { getItemDetail, openFolder, thumbUrl } from '../api/client';
-import type { EpisodeDetail, MovieDetail } from '../api/types';
+import { askAssistant, getItemDetail, openFolder, thumbUrl } from '../api/client';
+import type { AssistantAskResponse, EpisodeDetail, MovieDetail } from '../api/types';
+import { useAssistantStatus } from '../hooks/useAssistantStatus';
 import styles from './DetailDrawer.module.css';
 
 export type DetailKind = 'movie' | 'episode' | 'series';
@@ -22,6 +23,7 @@ export function DetailDrawer({ state, onClose }: DetailDrawerProps) {
   const [error, setError] = useState<string | null>(null);
   const [movie, setMovie] = useState<MovieDetail | null>(null);
   const [episode, setEpisode] = useState<EpisodeDetail | null>(null);
+  const { status: assistantStatus } = useAssistantStatus();
 
   useEffect(() => {
     let active = true;
@@ -153,10 +155,147 @@ export function DetailDrawer({ state, onClose }: DetailDrawerProps) {
                   Send to Manual Review
                 </button>
               </div>
+              {state?.id && (
+                <AskAiPanel
+                  itemId={state.id}
+                  kind={state.kind}
+                  title={movie?.title ?? episode?.title ?? ''}
+                  disabledReason={!assistantStatus?.enabled ? assistantStatus?.message : undefined}
+                />
+              )}
             </div>
           </div>
         )}
       </aside>
     </div>
+  );
+}
+
+interface AskAiPanelProps {
+  itemId: string;
+  kind: DetailKind;
+  title: string;
+  disabledReason?: string;
+}
+
+const QUICK_PROMPTS: Array<{ label: string; prompt: string }> = [
+  { label: 'What is this about?', prompt: 'Summarise this title in two sentences.' },
+  { label: 'Similar titles', prompt: 'Suggest similar titles already in my library.' },
+  { label: 'Why low confidence?', prompt: 'Explain the likely reasons for low confidence on this item.' },
+  { label: 'Subtitle status', prompt: 'Do I have subtitles in French or other languages?' },
+];
+
+function AskAiPanel({ itemId, kind, title, disabledReason }: AskAiPanelProps) {
+  const [question, setQuestion] = useState('');
+  const [answer, setAnswer] = useState<AssistantAskResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const ask = async (prompt?: string) => {
+    const finalPrompt = (prompt ?? question).trim();
+    if (!finalPrompt) return;
+    setLoading(true);
+    setError(null);
+    setAnswer(null);
+    try {
+      const response = await askAssistant(itemId, finalPrompt);
+      setAnswer(response);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const onSubmit: FormEventHandler<HTMLFormElement> = event => {
+    event.preventDefault();
+    ask();
+  };
+
+  const onQuickPrompt = (prompt: string) => {
+    setQuestion(prompt);
+    ask(prompt);
+  };
+
+  const disabled = Boolean(disabledReason);
+
+  return (
+    <section className={styles.aiPanel} aria-label="Ask AI">
+      <header className={styles.aiHeader}>
+        <h3>Ask AI</h3>
+        <span className={styles.aiContext}>{kind === 'episode' ? 'Episode context' : 'Movie context'}</span>
+      </header>
+      {disabled ? (
+        <p className={styles.aiDisabled}>{disabledReason}</p>
+      ) : (
+        <>
+          <form className={styles.aiForm} onSubmit={onSubmit}>
+            <label className={styles.aiLabel} htmlFor="ai-question">
+              Question about {title || 'this item'}
+            </label>
+            <textarea
+              id="ai-question"
+              className={styles.aiInput}
+              rows={3}
+              value={question}
+              placeholder="Ask about quality, subtitles, or similar titles…"
+              onChange={event => setQuestion(event.target.value)}
+            />
+            <div className={styles.aiActions}>
+              <button type="submit" className={styles.aiSubmit} disabled={loading}>
+                {loading ? 'Thinking…' : 'Ask'}
+              </button>
+              <button
+                type="button"
+                className={styles.aiTask}
+                onClick={() => alert('Task capture is not yet implemented in this build.')}
+              >
+                Create task
+              </button>
+            </div>
+          </form>
+          <div className={styles.aiChips}>
+            {QUICK_PROMPTS.map(chip => (
+              <button
+                key={chip.label}
+                type="button"
+                onClick={() => onQuickPrompt(chip.prompt)}
+                disabled={loading}
+              >
+                {chip.label}
+              </button>
+            ))}
+          </div>
+          {error && <p className={styles.aiError}>{error}</p>}
+          {answer && (
+            <div className={styles.aiAnswerBox}>
+              <p className={styles.aiAnswer}>{answer.answer_markdown}</p>
+              {answer.sources.length > 0 && (
+                <details className={styles.aiSources}>
+                  <summary>Sources & tools</summary>
+                  <ul>
+                    {answer.sources.map(source => (
+                      <li key={`${source.type}:${source.ref}`}>
+                        <strong>{source.type}:</strong> {source.ref}
+                      </li>
+                    ))}
+                  </ul>
+                  {answer.tool_calls.length > 0 && (
+                    <ul className={styles.aiTools}>
+                      {answer.tool_calls.map((call, index) => (
+                        <li key={`${call.tool ?? 'tool'}-${index}`}>
+                          <strong>{call.tool ?? 'tool'}:</strong>{' '}
+                          <code>{JSON.stringify(call.payload ?? {}, null, 2)}</code>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </details>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </section>
   );
 }

@@ -1,4 +1,6 @@
 import type {
+  AssistantAskResponse,
+  AssistantStatus,
   CatalogSummary,
   EpisodeDetail,
   EpisodeRow,
@@ -11,8 +13,9 @@ import type {
 } from './types';
 
 const API_BASE = '/v1/catalog';
+const ASSISTANT_BASE = '/v1/assistant';
 
-function resolveApiKey(): string | null {
+export function getStoredApiKey(): string | null {
   try {
     return localStorage.getItem('videocatalog_api_key');
   } catch {
@@ -26,7 +29,7 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     'Content-Type': 'application/json',
     ...(init && init.headers ? init.headers : {}),
   };
-  const apiKey = resolveApiKey();
+  const apiKey = getStoredApiKey();
   if (apiKey && !(headers as Record<string, string>)['X-API-Key']) {
     (headers as Record<string, string>)['X-API-Key'] = apiKey;
   }
@@ -112,4 +115,25 @@ export function thumbUrl(token?: string | null): string | null {
     return token;
   }
   return `${API_BASE}/thumb?id=${encodeURIComponent(token)}`;
+}
+
+export async function getAssistantStatus(): Promise<AssistantStatus> {
+  return fetchJson<AssistantStatus>(`${ASSISTANT_BASE}/status`);
+}
+
+export async function askAssistant(
+  itemId: string,
+  question: string,
+  options?: { toolBudget?: number; rag?: boolean },
+): Promise<AssistantAskResponse> {
+  return fetchJson<AssistantAskResponse>(`${ASSISTANT_BASE}/ask`, {
+    method: 'POST',
+    body: JSON.stringify({
+      item_id: itemId,
+      mode: 'context',
+      question,
+      tool_budget: options?.toolBudget,
+      rag: options?.rag,
+    }),
+  });
 }
