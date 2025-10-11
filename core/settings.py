@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable
+
+from .settings_schema import SETTINGS_VALIDATOR
 
 from .paths import get_default_settings_paths
 
 __all__ = [
     "DEFAULT_SETTINGS",
+    "SETTINGS_VERSION",
     "load_settings",
     "merge_defaults",
     "save_settings",
     "update_settings",
 ]
 
+SETTINGS_VERSION = 2
+
+
 DEFAULT_SETTINGS: Dict[str, Any] = {
+    "version": SETTINGS_VERSION,
     "fingerprints": {
         "enable_video_tmk": False,
         "enable_audio_chroma": False,
@@ -268,6 +276,36 @@ def merge_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
     return _merge(DEFAULT_SETTINGS, data or {})
 
 
+def _apply_migrations(settings: Dict[str, Any], working_dir: Path) -> Dict[str, Any]:
+    version = settings.get("version")
+    try:
+        version_int = int(version)
+    except (TypeError, ValueError):
+        version_int = 0
+    if version_int < SETTINGS_VERSION:
+        # Future migrations can be added here.
+        settings["version"] = SETTINGS_VERSION
+    return settings
+
+
+def _log_unknown_keys(settings: Dict[str, Any], working_dir: Path) -> None:
+    unknown = list(SETTINGS_VALIDATOR.unknown_keys(settings))
+    if not unknown:
+        return
+    logs_dir = working_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts": time.time(),
+        "unknown": unknown,
+    }
+    target = logs_dir / "settings_unknown.json"
+    try:
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        return
+
+
 def load_settings(working_dir: Path) -> Dict[str, Any]:
     data: Dict[str, Any] = {}
     for candidate in get_default_settings_paths(working_dir):
@@ -284,12 +322,15 @@ def load_settings(working_dir: Path) -> Dict[str, Any]:
             data = loaded
             break
     merged = merge_defaults(data)
+    merged = _apply_migrations(merged, working_dir)
     merged.setdefault("working_dir", str(working_dir))
+    _log_unknown_keys(merged, working_dir)
     return merged
 
 
 def save_settings(settings: Dict[str, Any], working_dir: Path) -> None:
     merged = merge_defaults(dict(settings))
+    merged = _apply_migrations(merged, working_dir)
     merged.setdefault("working_dir", str(working_dir))
     path = working_dir / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
