@@ -151,6 +151,7 @@ export interface AssistantStatus {
   requested: boolean;
   gpu_ready: boolean;
   enabled: boolean;
+  disabled_by_gpu: boolean;
   message: string;
   gpu: Record<string, unknown>;
   runtime?: Record<string, unknown>;
@@ -172,4 +173,25 @@ export interface AssistantAskResponse {
   tool_calls: AssistantToolCall[];
   elapsed_ms: number;
   status: Record<string, unknown>;
+}
+
+export interface RealtimeClientStatus {
+  client_id: string;
+  last_seen_utc: string | null;
+  stale: boolean;
+}
+
+export interface RealtimeStatus {
+  ts_utc: string;
+  ws_connected: number;
+  sse_connected: number;
+  events_pushed_total: number;
+  events_dropped_total: number;
+  event_lag_ms_p50: number | null;
+  event_lag_ms_p95: number | null;
+  last_event_utc: string | null;
+  last_event_age_ms: number | null;
+  ai_requests_total: number;
+  ai_errors_total: number;
+  client?: RealtimeClientStatus | null;
 }

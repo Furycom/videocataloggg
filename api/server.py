@@ -5,6 +5,7 @@ import logging
 import time
 import asyncio
 import json
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from assistant_webmon import WebMonitor
+
 from .auth import APIKeyAuth
 from .assistant_gateway import AssistantGateway
 from .db import DataAccess
@@ -33,6 +36,9 @@ from .models import (
     AssistantAskRequest,
     AssistantAskResponse,
     AssistantStatusResponse,
+    RealtimeHeartbeatRequest,
+    RealtimeHeartbeatResponse,
+    RealtimeStatusResponse,
     CatalogEpisodesResponse,
     CatalogItemDetailResponse,
     CatalogMoviesResponse,
@@ -110,7 +116,8 @@ def create_app(config: APIServerConfig) -> FastAPI:
 
     auth_dependency = APIKeyAuth(config.api_key)
     data = config.data_access
-    event_broker = CatalogEventBroker(data)
+    web_monitor = WebMonitor(data.working_dir)
+    event_broker = CatalogEventBroker(data, monitor=web_monitor)
     vector_worker = VectorRefreshWorker(data)
     assistant_gateway = AssistantGateway(data)
 
@@ -118,11 +125,13 @@ def create_app(config: APIServerConfig) -> FastAPI:
     async def _startup() -> None:
         await event_broker.start()
         await vector_worker.start()
+        await web_monitor.start()
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         await event_broker.stop()
         await vector_worker.stop()
+        await web_monitor.stop()
         assistant_gateway.shutdown()
 
     @app.middleware("http")
@@ -188,12 +197,17 @@ def create_app(config: APIServerConfig) -> FastAPI:
         request: Request,
         last_seq: Optional[int] = Query(None, ge=0),
         api_key: Optional[str] = Query(None),
+        client_id: Optional[str] = Query(None, min_length=4, max_length=128),
     ) -> StreamingResponse:
         expected_key = (config.api_key or "").strip()
         provided = request.headers.get("x-api-key") or (api_key or "").strip()
         if not expected_key or not provided or provided.strip() != expected_key:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        assigned_client = client_id or secrets.token_hex(8)
+
         async def event_stream():
+            connection_key = web_monitor.register(client_id=assigned_client, transport="sse")
+            web_monitor.heartbeat(client_id=assigned_client, transport="sse")
             try:
                 async for event in event_broker.subscribe(last_seq=last_seq or 0):
                     payload = {
@@ -202,6 +216,8 @@ def create_app(config: APIServerConfig) -> FastAPI:
                         "kind": event.kind,
                         "payload": event.payload,
                     }
+                    web_monitor.record_event_delivery(ts_utc=event.ts_utc)
+                    web_monitor.heartbeat(client_id=assigned_client, transport="sse")
                     yield f"data: {json.dumps(payload)}\n\n"
                     if await request.is_disconnected():
                         break
@@ -209,8 +225,14 @@ def create_app(config: APIServerConfig) -> FastAPI:
                 raise
             except Exception as exc:
                 LOGGER.debug("SSE stream stopped: %s", exc)
+            finally:
+                web_monitor.unregister(connection_key)
 
-        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Realtime-Transport": "sse",
+        }
         return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
     @app.websocket("/v1/catalog/subscribe")
@@ -220,7 +242,11 @@ def create_app(config: APIServerConfig) -> FastAPI:
         if not expected_key or not provided or provided.strip() != expected_key:
             await websocket.close(code=4401)
             return
+        assigned_client = websocket.query_params.get("client_id") or secrets.token_hex(8)
+        connection_key: Optional[str] = None
         await websocket.accept()
+        connection_key = web_monitor.register(client_id=assigned_client, transport="ws")
+        web_monitor.heartbeat(client_id=assigned_client, transport="ws")
         try:
             try:
                 last_seq_value = int(websocket.query_params.get("last_seq", "0"))
@@ -234,15 +260,35 @@ def create_app(config: APIServerConfig) -> FastAPI:
                     "payload": event.payload,
                 }
                 await websocket.send_json(payload)
+                web_monitor.record_event_delivery(ts_utc=event.ts_utc)
+                web_monitor.heartbeat(client_id=assigned_client, transport="ws")
         except WebSocketDisconnect:
             return
         except Exception as exc:
             LOGGER.debug("WebSocket stream closed: %s", exc)
         finally:
+            if connection_key:
+                web_monitor.unregister(connection_key)
             try:
                 await websocket.close()
             except Exception:
                 pass
+
+    @app.get("/v1/catalog/realtime/status", response_model=RealtimeStatusResponse)
+    def realtime_status(
+        client_id: Optional[str] = Query(None, min_length=4, max_length=128),
+        _: str = Depends(auth_dependency),
+    ) -> RealtimeStatusResponse:
+        snapshot = web_monitor.snapshot(client_id=client_id)
+        return RealtimeStatusResponse(**snapshot)
+
+    @app.post("/v1/catalog/realtime/heartbeat", response_model=RealtimeHeartbeatResponse)
+    def realtime_heartbeat(
+        payload: RealtimeHeartbeatRequest,
+        _: str = Depends(auth_dependency),
+    ) -> RealtimeHeartbeatResponse:
+        web_monitor.heartbeat(client_id=payload.client_id, transport=payload.transport)
+        return RealtimeHeartbeatResponse(acknowledged=True, ts_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
     @app.get("/v1/health", response_model=HealthResponse)
     def health_check(_: str = Depends(auth_dependency)) -> HealthResponse:
@@ -260,6 +306,11 @@ def create_app(config: APIServerConfig) -> FastAPI:
     ) -> AssistantAskResponse:
         if request.mode != "context":
             raise HTTPException(status_code=400, detail="unsupported assistant mode")
+        status_payload = assistant_gateway.status()
+        if not status_payload.get("enabled", False):
+            web_monitor.record_ai_request(error=True)
+            message = status_payload.get("message") or "assistant unavailable"
+            raise HTTPException(status_code=409, detail=message)
         detail = data.catalog_item_detail(request.item_id)
         if detail is None:
             raise HTTPException(status_code=404, detail="catalog item not found")
@@ -272,10 +323,13 @@ def create_app(config: APIServerConfig) -> FastAPI:
                 use_rag=bool(request.rag),
             )
         except RuntimeError as exc:
+            web_monitor.record_ai_request(error=True)
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
+            web_monitor.record_ai_request(error=True)
             LOGGER.exception("Assistant ask failed: %s", exc)
             raise HTTPException(status_code=500, detail="assistant error") from exc
+        web_monitor.record_ai_request(error=False)
         return AssistantAskResponse(**result)
 
     @app.get("/v1/drives", response_model=DrivesResponse)

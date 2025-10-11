@@ -1,13 +1,18 @@
 import { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
-import { getStoredApiKey } from '../api/client';
+import { getStoredApiKey, sendRealtimeHeartbeat } from '../api/client';
 import type { CatalogEventPayload } from '../api/types';
 
 type LiveStatus = 'connecting' | 'online' | 'offline';
 
 interface LiveCatalogContextValue {
   status: LiveStatus;
+  transport: 'ws' | 'sse';
   lastEvent: CatalogEventPayload | null;
+  lastEventUtc: string | null;
+  lastEventReceivedAt: number | null;
+  fallbackActive: boolean;
+  clientId: string;
   connectionError: string | null;
   subscribe(listener: (event: CatalogEventPayload) => void): () => void;
 }
@@ -30,19 +35,69 @@ function buildQuery(params: Record<string, string | number | undefined>): string
   return query ? `?${query}` : '';
 }
 
+function ensureClientId(): string {
+  const key = 'videocatalog-web-client-id';
+  try {
+    const existing = localStorage.getItem(key);
+    if (existing && existing.length >= 8) {
+      return existing;
+    }
+    const generated = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+    localStorage.setItem(key, generated);
+    return generated;
+  } catch {
+    return Math.random().toString(36).slice(2);
+  }
+}
+
 export function LiveCatalogProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<LiveStatus>('connecting');
   const [error, setError] = useState<string | null>(null);
   const [lastEvent, setLastEvent] = useState<CatalogEventPayload | null>(null);
+  const [lastEventUtc, setLastEventUtc] = useState<string | null>(null);
+  const [lastEventAt, setLastEventAt] = useState<number | null>(null);
+  const [transport, setTransport] = useState<'ws' | 'sse'>('ws');
+  const [fallbackActive, setFallbackActive] = useState(false);
+
   const listeners = useRef(new Set<(event: CatalogEventPayload) => void>());
   const seqRef = useRef<number>(0);
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sourceRef = useRef<EventSource | WebSocket | null>(null);
   const sseFallbackRef = useRef<boolean>(false);
+  const clientIdRef = useRef<string>(ensureClientId());
+  const transportRef = useRef<'ws' | 'sse'>('ws');
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const sendHeartbeat = useCallback(() => {
+    const apiKey = getStoredApiKey();
+    if (!apiKey) return;
+    sendRealtimeHeartbeat(clientIdRef.current, transportRef.current).catch(err => {
+      console.debug('Heartbeat failed', err);
+    });
+  }, []);
+
+  const startHeartbeat = useCallback(() => {
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+    }
+    sendHeartbeat();
+    heartbeatRef.current = setInterval(() => {
+      sendHeartbeat();
+    }, 30000);
+  }, [sendHeartbeat]);
+
+  const stopHeartbeat = useCallback(() => {
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
+    }
+  }, []);
 
   const dispatch = useCallback((event: CatalogEventPayload) => {
     seqRef.current = Math.max(seqRef.current, event.seq ?? 0);
     setLastEvent(event);
+    setLastEventUtc(event.ts_utc ?? null);
+    setLastEventAt(Date.now());
     listeners.current.forEach(listener => {
       try {
         listener(event);
@@ -73,7 +128,8 @@ export function LiveCatalogProvider({ children }: { children: ReactNode }) {
       }
       sourceRef.current = null;
     }
-  }, []);
+    stopHeartbeat();
+  }, [stopHeartbeat]);
 
   const connect = useCallback(() => {
     teardown();
@@ -81,28 +137,45 @@ export function LiveCatalogProvider({ children }: { children: ReactNode }) {
     if (!apiKey) {
       setStatus('offline');
       setError('API key required for live updates.');
+      stopHeartbeat();
       return;
     }
-    const query = buildQuery({ api_key: apiKey, last_seq: seqRef.current || undefined });
+    setStatus('connecting');
+    const params = {
+      api_key: apiKey,
+      last_seq: seqRef.current || undefined,
+      client_id: clientIdRef.current,
+    };
+    const query = buildQuery(params);
     if (!sseFallbackRef.current && 'WebSocket' in window) {
       try {
         const ws = new WebSocket(toWebSocketUrl(`/v1/catalog/subscribe${query}`));
         sourceRef.current = ws;
         ws.onopen = () => {
+          transportRef.current = 'ws';
+          setTransport('ws');
+          sseFallbackRef.current = false;
+          setFallbackActive(false);
           setStatus('online');
           setError(null);
+          startHeartbeat();
         };
         ws.onerror = () => {
           setStatus('offline');
           setError('WebSocket connection failed; retrying…');
           sseFallbackRef.current = true;
+          setFallbackActive(true);
+          stopHeartbeat();
           ws.close();
           scheduleReconnect();
         };
         ws.onclose = () => {
+          stopHeartbeat();
           if (!sseFallbackRef.current) {
             setStatus('offline');
             setError('WebSocket disconnected; retrying…');
+            scheduleReconnect();
+          } else {
             scheduleReconnect();
           }
         };
@@ -118,19 +191,29 @@ export function LiveCatalogProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         console.warn('WebSocket unavailable, falling back to SSE', err);
         sseFallbackRef.current = true;
+        setFallbackActive(true);
       }
     }
     try {
-      const url = `/v1/catalog/subscribe${buildQuery({ api_key: apiKey, last_seq: seqRef.current || undefined })}`;
+      const url = `/v1/catalog/subscribe${buildQuery({
+        api_key: apiKey,
+        last_seq: seqRef.current || undefined,
+        client_id: clientIdRef.current,
+      })}`;
       const sse = new EventSource(url);
       sourceRef.current = sse;
       sse.onopen = () => {
+        transportRef.current = 'sse';
+        setTransport('sse');
         setStatus('online');
         setError(null);
+        setFallbackActive(sseFallbackRef.current);
+        startHeartbeat();
       };
       sse.onerror = () => {
         setStatus('offline');
         setError('Live connection lost; retrying…');
+        stopHeartbeat();
         sse.close();
         scheduleReconnect();
       };
@@ -146,9 +229,10 @@ export function LiveCatalogProvider({ children }: { children: ReactNode }) {
       console.error('Unable to establish live connection', err);
       setStatus('offline');
       setError('Unable to connect to live updates.');
+      stopHeartbeat();
       scheduleReconnect();
     }
-  }, [dispatch, scheduleReconnect, teardown]);
+  }, [dispatch, scheduleReconnect, startHeartbeat, stopHeartbeat, teardown]);
 
   useEffect(() => {
     connect();
@@ -174,8 +258,18 @@ export function LiveCatalogProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ status, lastEvent, connectionError: error, subscribe }),
-    [status, lastEvent, error, subscribe],
+    () => ({
+      status,
+      transport,
+      lastEvent,
+      lastEventUtc,
+      lastEventReceivedAt: lastEventAt,
+      fallbackActive,
+      clientId: clientIdRef.current,
+      connectionError: error,
+      subscribe,
+    }),
+    [status, transport, lastEvent, lastEventUtc, lastEventAt, fallbackActive, error, subscribe],
   );
 
   return <LiveCatalogContext.Provider value={value}>{children}</LiveCatalogContext.Provider>;
