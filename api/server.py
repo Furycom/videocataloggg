@@ -30,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 
 from assistant_webmon import WebMonitor
 from orchestrator.api import OrchestratorConfig, OrchestratorService
+from diagnostics.api import DiagnosticsAPI
 
 from .auth import APIKeyAuth
 from .assistant_gateway import AssistantGateway
@@ -172,6 +173,7 @@ def create_app(config: APIServerConfig) -> FastAPI:
     event_broker = CatalogEventBroker(data, monitor=web_monitor)
     vector_worker = VectorRefreshWorker(data, orchestrator=orchestrator_service)
     assistant_gateway = AssistantGateway(data)
+    diagnostics_api = DiagnosticsAPI(data.working_dir, data.settings_payload)
     lan_only = bool(config.lan_only)
 
     @app.on_event("startup")
@@ -1296,6 +1298,7 @@ def create_app(config: APIServerConfig) -> FastAPI:
         return SemanticOperationResponse(ok=True, action="transcribe", stats=stats)
 
     app.include_router(orchestrator_service.router())
+    app.include_router(diagnostics_api.router())
 
     dist_dir = (
         Path(__file__).resolve().parent.parent / "web" / "catalog-ui" / "dist"
