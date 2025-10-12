@@ -26,6 +26,7 @@ _ALLOWED_STRUCTURE: Dict[str, Any] = {
     "disk_marker": "*",
     "delta_scan": "*",
     "gpu": "*",
+    "orchestrator": "*",
     "api": "*",
     "assistant": "*",
     "structure": "*",

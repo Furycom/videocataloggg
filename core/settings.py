@@ -114,6 +114,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "min_free_vram_mb": 512,
         "max_gpu_workers": 2,
     },
+    "orchestrator": {
+        "enable": True,
+        "poll_ms": 500,
+        "gpu": {"hard_requirement": True, "safety_margin_mb": 1024},
+        "concurrency": {"heavy_ai_gpu": 1, "light_cpu": 2, "io_light": 2},
+        "backoff": {"base_s": 30, "max_s": 600},
+        "lease_ttl_s": 120,
+        "heartbeat_s": 5,
+    },
     "api": {
         "enabled_default": False,
         "host": "127.0.0.1",
