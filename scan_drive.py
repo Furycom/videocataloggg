@@ -3239,6 +3239,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Allow GPU usage for text verification models (overrides settings).",
     )
     parser.add_argument(
+        "--tests-prepare",
+        action="store_true",
+        help="Generate synthetic fixtures for VideoCatalog smoke tests.",
+    )
+    parser.add_argument(
+        "--tests-smoke",
+        action="store_true",
+        help="Run the VideoCatalog smoke test suite.",
+    )
+    parser.add_argument(
+        "--tests-open-last",
+        action="store_true",
+        help="Print the path to the most recent smoke test summary.",
+    )
+    parser.add_argument(
+        "--tests-only",
+        dest="tests_only",
+        help="Comma-separated list of smoke tests to run (used with --tests-smoke).",
+    )
+    parser.add_argument(
         "--no-textverify-gpu",
         dest="textverify_gpu",
         action="store_false",
@@ -4853,6 +4873,66 @@ def _wait_for_dashboard_action(dashboard, *, timeout: float = 180.0) -> Optional
     return {"status": "timeout"}
 
 
+def _run_tests_cli(args: argparse.Namespace, settings_data: Dict[str, Any]) -> Optional[int]:
+    if not any(
+        [
+            getattr(args, "tests_prepare", False),
+            getattr(args, "tests_smoke", False),
+            getattr(args, "tests_open_last", False),
+        ]
+    ):
+        return None
+    try:
+        from tests import api as tests_api
+    except Exception as exc:
+        print(f"[ERROR] Smoke test utilities unavailable: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        tests_settings = tests_api.load_tests_settings(settings_data)
+    except Exception as exc:
+        print(f"[ERROR] Unable to load smoke test settings: {exc}", file=sys.stderr)
+        return 1
+
+    exit_code: Optional[int] = None
+    if getattr(args, "tests_prepare", False):
+        result = tests_api.prepare_fixture_data(tests_settings)
+        print(f"Fixtures prepared under {result.root}")
+        if result.warnings:
+            for warning in result.warnings:
+                print(f"[WARN] {warning}")
+        exit_code = 0
+
+    if getattr(args, "tests_open_last", False):
+        summary = tests_api.open_last_report()
+        if summary is None:
+            print("No smoke test reports found yet.")
+        else:
+            print(f"Latest smoke test summary: {summary}")
+        exit_code = 0 if exit_code is None else exit_code
+
+    if getattr(args, "tests_smoke", False):
+        only_raw = getattr(args, "tests_only", None)
+        only = [name.strip() for name in only_raw.split(",") if name.strip()] if only_raw else None
+        try:
+            suite = tests_api.run_smoke(settings_data, only=only)
+        except RuntimeError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return 2
+        passes = sum(1 for result in suite.results if result.status == "PASS")
+        failures = sum(1 for result in suite.results if result.status == "FAIL")
+        skips = sum(1 for result in suite.results if result.status == "SKIP")
+        print(
+            "Smoke tests status: {status} (pass={p} fail={f} skip={s})".format(
+                status=suite.status, p=passes, f=failures, s=skips
+            )
+        )
+        print(f"Report: {suite.run_dir / 'summary.md'}")
+        exit_code = 0 if suite.status == "PASS" else (1 if suite.status == "FAIL" else 2)
+
+    return exit_code if exit_code is not None else 0
+
+
 def _run_backup_cli(args: argparse.Namespace, settings_data: Dict[str, Any]) -> Optional[int]:
     actions = [
         bool(getattr(args, "backup_create", False)),
@@ -4998,6 +5078,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     settings_data = load_settings(WORKING_DIR_PATH)
+    tests_exit = _run_tests_cli(args, settings_data)
+    if tests_exit is not None:
+        return tests_exit
     backup_exit = _run_backup_cli(args, settings_data)
     if backup_exit is not None:
         return backup_exit

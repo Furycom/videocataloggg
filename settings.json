@@ -104,6 +104,25 @@
       "refresh_on_start": false
     }
   },
+  "tests": {
+    "enable": true,
+    "gate_on_fail": true,
+    "timeouts_s": {
+      "default": 15,
+      "gpu": 30
+    },
+    "fixtures": {
+      "regen_on_mismatch": false
+    },
+    "gpu_required_tests": [
+      "vectors_refresh",
+      "assistant_tools"
+    ],
+    "report_formats": [
+      "markdown",
+      "junit"
+    ]
+  },
   "assistant_dashboard": {
     "enable": true,
     "flush_every_s": 10,

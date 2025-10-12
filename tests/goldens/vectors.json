@@ -1,0 +1,17 @@
+{
+  "hits": [
+    {
+      "doc_id": "text:3",
+      "score": 0.8253
+    },
+    {
+      "doc_id": "text:2",
+      "score": 0.8253
+    },
+    {
+      "doc_id": "text:1",
+      "score": 0.8253
+    }
+  ],
+  "index_entries": 3
+}

@@ -24,3 +24,4 @@ env_scan_*.txt
 # Platform detritus
 .DS_Store
 Thumbs.db
+C:/

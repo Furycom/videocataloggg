@@ -1,0 +1,12 @@
+[
+  {
+    "episode_file": "Example Show - S01E01 - Pilot.mkv",
+    "season": 1,
+    "subtitle_count": 0
+  },
+  {
+    "episode_file": "Example Show - S01E02 - Orbit.mkv",
+    "season": 1,
+    "subtitle_count": 1
+  }
+]

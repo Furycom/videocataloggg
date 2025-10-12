@@ -29,6 +29,7 @@ _ALLOWED_STRUCTURE: Dict[str, Any] = {
     "orchestrator": "*",
     "api": "*",
     "assistant": "*",
+    "tests": "*",
     "structure": "*",
     "learning": "*",
     "docpreview": "*",

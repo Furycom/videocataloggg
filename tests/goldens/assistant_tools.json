@@ -1,0 +1,25 @@
+{
+  "answer_markdown": "1. Top semantic hit recorded.\n2. Tool budget honoured.",
+  "sources": [
+    {
+      "ref": "text:3",
+      "type": "vector"
+    },
+    {
+      "ref": "text:2",
+      "type": "vector"
+    }
+  ],
+  "tool_calls": [
+    {
+      "payload": {
+        "query": "matrix",
+        "results": [
+          "text:3",
+          "text:2"
+        ]
+      },
+      "tool": "db_search_semantic"
+    }
+  ]
+}

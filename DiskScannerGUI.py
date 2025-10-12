@@ -192,6 +192,8 @@ from learning import LearningEngine, LearningExamplePayload, load_learning_setti
 from learning.engine import ActiveItem
 from learning.db import count_examples
 from assistant_monitor import AssistantDashboard, get_dashboard
+from tests import api as tests_api
+from tests.smoke_runner import TestsSettings
 
 try:
     from assistant import AssistantService, AssistantStatus
@@ -2198,6 +2200,19 @@ class App:
         self.textverify_score_var = StringVar(value="Match score: —")
         self.textverify_semantic_var = StringVar(value="Semantic: —")
         self.textverify_ner_var = StringVar(value="NER overlap: —")
+        try:
+            self.tests_settings: TestsSettings = tests_api.load_tests_settings(
+                _SETTINGS if isinstance(_SETTINGS, dict) else {}
+            )
+        except Exception:
+            self.tests_settings = TestsSettings()
+        self.tests_status_var = StringVar(value="Smoke tests not run yet.")
+        self.tests_counts_var = StringVar(value="Pass: –, Fail: –, Skip: –")
+        self.tests_gate_var = IntVar(value=1 if self.tests_settings.gate_on_fail else 0)
+        self.tests_fixture_dir = WORKING_DIR_PATH / "testdata"
+        self.tests_last_report_path: Optional[Path] = None
+        self.tests_running = False
+        self.tests_buttons: Dict[str, ttk.Button] = {}
         self.textverify_keywords_var = StringVar(value="Keyword overlap: —")
         self.textverify_summary_text = StringVar(value="")
         self.textverify_plot_text = StringVar(value="")
@@ -3223,6 +3238,10 @@ class App:
         self.assistant_tab.rowconfigure(1, weight=1)
         self.assistant_tab.rowconfigure(2, weight=1)
         self.main_notebook.add(self.assistant_tab, text="Assistant")
+        self.tests_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.tests_tab.columnconfigure(0, weight=1)
+        self.tests_tab.rowconfigure(0, weight=1)
+        self.main_notebook.add(self.tests_tab, text="Tests")
         self.debug_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
         self.debug_tab.columnconfigure(0, weight=1)
         self.debug_tab.rowconfigure(1, weight=1)
@@ -3240,6 +3259,7 @@ class App:
         self._build_docpreview_tab(self.docpreview_tab)
         self._build_music_tab(self.music_tab)
         self._build_assistant_tab(self.assistant_tab)
+        self._build_tests_tab(self.tests_tab)
         self._build_debug_tab(self.debug_tab)
 
     def _build_dashboard_controls(self, parent: ttk.Frame) -> None:
@@ -9754,6 +9774,131 @@ class App:
                 subprocess.Popen(["xdg-open", folder])
         except Exception as exc:
             messagebox.showerror("Quick Search", f"Unable to open folder: {exc}")
+
+    def _build_tests_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        frame = ttk.LabelFrame(parent, text="Smoke suite", padding=(16, 12), style="Card.TLabelframe")
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        frame.columnconfigure(0, weight=1)
+
+        ttk.Label(frame, text=f"Fixtures: {self.tests_fixture_dir}", style="Subtle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+
+        buttons = ttk.Frame(frame, style="Card.TFrame")
+        buttons.grid(row=1, column=0, sticky="w", pady=(8, 8))
+        prepare_btn = ttk.Button(buttons, text="Prepare fixtures", command=self.on_tests_prepare)
+        prepare_btn.grid(row=0, column=0, padx=(0, 8))
+        run_btn = ttk.Button(buttons, text="Run smoke suite", command=self.on_tests_run)
+        run_btn.grid(row=0, column=1, padx=(0, 8))
+        open_btn = ttk.Button(buttons, text="Open last report", command=self.on_tests_open_last)
+        open_btn.grid(row=0, column=2)
+        self.tests_buttons.update({"prepare": prepare_btn, "run": run_btn, "open": open_btn})
+
+        ttk.Label(frame, textvariable=self.tests_status_var, style="Value.TLabel").grid(
+            row=2, column=0, sticky="w"
+        )
+        ttk.Label(frame, textvariable=self.tests_counts_var, style="Subtle.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(2, 0)
+        )
+
+        gate_row = ttk.Frame(frame, style="Card.TFrame")
+        gate_row.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            gate_row,
+            text="Gate orchestrator GPU jobs when smoke tests fail",
+            variable=self.tests_gate_var,
+            command=self.on_tests_toggle_gate,
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(
+            frame,
+            text=(
+                "Available tests: structure_parse, tv_mapping, apiguard_cache, "
+                "textlite_preview, quality_headers, visualreview_keyframe, "
+                "vectors_refresh, assistant_tools"
+            ),
+            style="Subtle.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=5, column=0, sticky="w", pady=(8, 0))
+
+    def on_tests_prepare(self) -> None:
+        if self.tests_running:
+            return
+        try:
+            result = tests_api.prepare_fixture_data(self.tests_settings)
+        except Exception as exc:
+            messagebox.showerror("Smoke tests", f"Failed to prepare fixtures: {exc}")
+            return
+        self.tests_status_var.set(f"Fixtures prepared under {result.root}")
+        if result.warnings:
+            messagebox.showwarning("Smoke tests", "\n".join(result.warnings))
+
+    def on_tests_open_last(self) -> None:
+        path = self.tests_last_report_path or tests_api.open_last_report()
+        if path is None:
+            messagebox.showinfo("Smoke tests", "No smoke test reports available yet.")
+            return
+        self.tests_last_report_path = path
+        self._open_path_in_explorer(str(path))
+
+    def on_tests_run(self) -> None:
+        if self.tests_running:
+            return
+        self.tests_running = True
+        self.tests_status_var.set("Running smoke tests…")
+        for button in self.tests_buttons.values():
+            button.state(["disabled"])
+        thread = threading.Thread(target=self._run_tests_thread, daemon=True)
+        thread.start()
+
+    def _run_tests_thread(self) -> None:
+        try:
+            suite = tests_api.run_smoke(_SETTINGS if isinstance(_SETTINGS, dict) else {})
+        except Exception as exc:
+            self.root.after(0, lambda: self._complete_tests_run(error=str(exc)))
+            return
+        self.root.after(0, lambda: self._complete_tests_run(suite=suite))
+
+    def _complete_tests_run(self, suite: Optional[object] = None, error: Optional[str] = None) -> None:
+        self.tests_running = False
+        for button in self.tests_buttons.values():
+            button.state(["!disabled"])
+        if error is not None:
+            messagebox.showerror("Smoke tests", error)
+            self.tests_status_var.set("Smoke tests failed.")
+            return
+        if suite is None:
+            self.tests_status_var.set("Smoke tests completed.")
+            return
+        try:
+            status = suite.status
+            timestamp = suite.timestamp
+            passes = sum(1 for result in suite.results if result.status == "PASS")
+            failures = sum(1 for result in suite.results if result.status == "FAIL")
+            skips = sum(1 for result in suite.results if result.status == "SKIP")
+            report_path = suite.run_dir / "summary.md"
+        except Exception:
+            self.tests_status_var.set("Smoke tests completed (unparsed results).")
+            return
+        self.tests_last_report_path = report_path
+        self.tests_status_var.set(f"Last run {status} at {timestamp}")
+        self.tests_counts_var.set(f"Pass: {passes}, Fail: {failures}, Skip: {skips}")
+        if status != "PASS":
+            messagebox.showwarning("Smoke tests", f"Smoke tests finished with status {status}.")
+
+    def on_tests_toggle_gate(self) -> None:
+        value = bool(self.tests_gate_var.get())
+        self.tests_settings.gate_on_fail = value
+        update_settings(WORKING_DIR_PATH, tests={"gate_on_fail": value})
+        if isinstance(_SETTINGS, dict):
+            section = _SETTINGS.setdefault("tests", {})
+            section["gate_on_fail"] = value
+        if not value:
+            gate_path = EXPORTS_DIR_PATH / "testruns" / "gate.json"
+            gate_path.unlink(missing_ok=True)
+
 
     # ----- Search+ helpers -------------------------------------------------
     def start_search_plus(self) -> None:

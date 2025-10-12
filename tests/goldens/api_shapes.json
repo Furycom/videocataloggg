@@ -1,0 +1,45 @@
+{
+  "opensubtitles": {
+    "items": [
+      {
+        "file_name": "Example.Show.S01E01.srt",
+        "language": "en",
+        "score": 0.95
+      }
+    ]
+  },
+  "snapshot": {
+    "opensubtitles": {
+      "entries": 1,
+      "keys": [
+        "stub-hash-001"
+      ]
+    },
+    "tmdb": {
+      "entries": 2,
+      "keys": [
+        "[\"tv/123\", [[\"api_key\", \"stub\"], [\"language\", \"en-US\"]]]",
+        "[\"tv/123/season/1\", [[\"api_key\", \"stub\"], [\"language\", \"en-US\"]]]"
+      ]
+    }
+  },
+  "tmdb_season": {
+    "episodes": [
+      {
+        "episode_number": 1,
+        "name": "Pilot",
+        "season_number": 1
+      },
+      {
+        "episode_number": 2,
+        "name": "Orbit",
+        "season_number": 1
+      }
+    ]
+  },
+  "tmdb_tv": {
+    "id": 123,
+    "name": "Example Show",
+    "number_of_seasons": 1
+  }
+}

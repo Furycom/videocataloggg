@@ -1,0 +1,12 @@
+{
+  "audio": [],
+  "container": "mov,mp4,m4a,3gp,3g2,mj2",
+  "duration": 3.0,
+  "video": {
+    "avg_frame_rate": "25/1",
+    "bit_rate_kbps": 7058,
+    "codec": "h264",
+    "height": 240,
+    "width": 320
+  }
+}

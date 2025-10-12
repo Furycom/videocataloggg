@@ -30,18 +30,31 @@ class ApiGuard:
         self.tmdb_api_key = tmdb_api_key
         self._lock = threading.Lock()
         self._tmdb_cache_path = self.cache_dir / "tmdb_cache.json"
+        self._opensub_cache_path = self.cache_dir / "opensubtitles_cache.json"
         self._tmdb_cache: Dict[str, Dict[str, object]] = {}
+        self._opensub_cache: Dict[str, Dict[str, object]] = {}
         self._tmdb_budget: Dict[str, int] = {}
         self._dashboard = dashboard
         self.last_cache_hit: bool = False
         self._load_tmdb_cache()
+        self._load_opensubtitles_cache()
 
     # ------------------------------------------------------------------
-    def tmdb_lookup(self, endpoint: str, params: Optional[Dict[str, object]] = None, *, ttl: int = 3600) -> Dict[str, object]:
-        if not self.tmdb_api_key:
-            raise RuntimeError("TMDB API key missing. Configure structure.tmdb.api_key in settings.")
+    def tmdb_lookup(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, object]] = None,
+        *,
+        ttl: int = 3600,
+        cache_only: bool = False,
+    ) -> Dict[str, object]:
         params = dict(params or {})
-        params.setdefault("api_key", self.tmdb_api_key)
+        # Avoid leaking actual API keys in cache keys during cache-only probes.
+        api_key = self.tmdb_api_key or params.get("api_key") or ""
+        if not cache_only:
+            if not api_key:
+                raise RuntimeError("TMDB API key missing. Configure structure.tmdb.api_key in settings.")
+        params.setdefault("api_key", api_key)
         cache_key = json.dumps([endpoint, sorted(params.items())], sort_keys=True)
         with self._lock:
             cached = self._tmdb_cache.get(cache_key)
@@ -49,6 +62,9 @@ class ApiGuard:
                 self.last_cache_hit = True
                 self._report_api_event(cache_hit=True, cache_size=len(self._tmdb_cache))
                 return cached["payload"]
+            if cache_only:
+                self.last_cache_hit = bool(cached)
+                return dict(cached["payload"]) if cached else {}
             if not self._consume_budget("tmdb", limit_per_minute=35):
                 self._report_api_event(cache_hit=None, status_code=429, remaining=0)
                 raise RuntimeError("TMDB rate limit reached for this minute; try again later.")
@@ -90,6 +106,52 @@ class ApiGuard:
             self._tmdb_cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as exc:
             LOGGER.warning("Failed to persist TMDB cache: %s", exc)
+
+    # ------------------------------------------------------------------
+    def _load_opensubtitles_cache(self) -> None:
+        if not self._opensub_cache_path.exists():
+            return
+        try:
+            payload = json.loads(self._opensub_cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.warning("Failed to load OpenSubtitles cache: %s", exc)
+            return
+        if isinstance(payload, dict):
+            entries = payload.get("entries")
+            if isinstance(entries, dict):
+                self._opensub_cache = {str(key): value for key, value in entries.items() if isinstance(value, dict)}
+
+    def opensubtitles_lookup(
+        self,
+        oshash: str,
+        *,
+        cache_only: bool = False,
+    ) -> Dict[str, object]:
+        key = str(oshash)
+        with self._lock:
+            payload = self._opensub_cache.get(key)
+            if payload:
+                self.last_cache_hit = True
+                return dict(payload)
+            self.last_cache_hit = False
+        if cache_only:
+            return {}
+        raise RuntimeError("OpenSubtitles cache miss and live lookup disabled in this context.")
+
+    def cache_snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            tmdb_keys = sorted(self._tmdb_cache.keys())
+            opensub_keys = sorted(self._opensub_cache.keys())
+            return {
+                "tmdb": {
+                    "entries": len(tmdb_keys),
+                    "keys": tmdb_keys,
+                },
+                "opensubtitles": {
+                    "entries": len(opensub_keys),
+                    "keys": opensub_keys,
+                },
+            }
 
     def _consume_budget(self, bucket: str, *, limit_per_minute: int) -> bool:
         now = int(time.time())
