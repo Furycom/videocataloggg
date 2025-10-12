@@ -28,8 +28,7 @@ langchain-core==0.2.34
 langchain-community==0.2.12
 sentence-transformers==3.0.1
 huggingface-hub==0.24.6
-hnswlib==0.8.0
-# llama-cpp-python-cuBLAS wheels are not published for Windows; use the CPU build instead.
-# GPU acceleration can still be enabled manually by following the README instructions.
-llama-cpp-python==0.2.90
 faiss-cpu==1.7.4
+#
+# Optional dependencies (llama-cpp-python, hnswlib) are installed by the Windows launcher so
+# it can provide clearer error messages and continue when build tools are unavailable.

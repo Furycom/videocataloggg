@@ -38,6 +38,22 @@ function Test-PythonModule {
     }
 }
 
+function Invoke-PipInstall {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$PythonExe,
+        [string]$PipExe
+    )
+
+    if ($PipExe) {
+        & $PipExe @Arguments
+    } else {
+        & $PythonExe -m pip @Arguments
+    }
+
+    return $LASTEXITCODE
+}
+
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Resolve-Path (Join-Path $scriptRoot '..')
 Set-Location $root
@@ -216,14 +232,55 @@ try {
         }
         Write-Warn 'uvicorn not found, installing required Python packages.'
         Write-Info "Installing dependencies from $requirementsPath"
-        if ($pipExe) {
-            & $pipExe install -r $requirementsPath
-        } else {
-            & $pythonExe -m pip install -r $requirementsPath
-        }
-        if ($LASTEXITCODE -ne 0) {
+        $baseInstallArgs = @('install', '-r', $requirementsPath)
+        $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe
+        if ($exitCode -ne 0) {
             throw 'Dependency installation failed.'
         }
+
+        $pyVersionText = (& $pythonExe -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")').Trim()
+        $pyVersionParts = $pyVersionText.Split('.')
+        $pyTag = $null
+        if ($pyVersionParts.Length -ge 2) {
+            $pyTag = "cp{0}{1}" -f $pyVersionParts[0], $pyVersionParts[1]
+        }
+
+        $optionalPackages = @()
+
+        if ($pyTag) {
+            $llamaWheel = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.2.90/llama_cpp_python-0.2.90-$pyTag-$pyTag-win_amd64.whl"
+            $optionalPackages += [pscustomobject]@{
+                Name = 'llama-cpp-python'
+                Requirement = "llama-cpp-python @ $llamaWheel"
+                ForceBinary = $false
+                FailureMessage = "Local llama.cpp runtime will be unavailable. Install the Visual C++ Build Tools or install the prebuilt wheel manually from $llamaWheel."
+            }
+        }
+
+        $optionalPackages += [pscustomobject]@{
+            Name = 'hnswlib'
+            Requirement = 'hnswlib==0.8.0'
+            ForceBinary = $false
+            FailureMessage = 'Falling back to FAISS/simple similarity search. Install the Visual C++ Build Tools to enable the hnswlib backend.'
+        }
+
+        foreach ($package in $optionalPackages) {
+            if (-not $package.Requirement) { continue }
+            $args = @('install')
+            if ($package.ForceBinary) {
+                $args += '--only-binary=:all:'
+            }
+            $args += $package.Requirement
+            Write-Info "Installing optional dependency $($package.Name)"
+            $result = Invoke-PipInstall -Arguments $args -PythonExe $pythonExe -PipExe $pipExe
+            if ($result -eq 0) {
+                Write-Info "Optional dependency $($package.Name) installed."
+                continue
+            }
+
+            Write-Warn "Unable to install optional dependency $($package.Name). $($package.FailureMessage)"
+        }
+
         if (-not (Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn')) {
             throw 'uvicorn is still unavailable after installation.'
         }
