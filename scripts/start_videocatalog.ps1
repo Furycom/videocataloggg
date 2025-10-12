@@ -50,7 +50,7 @@ $LauncherLog = Join-Path $logs "launcher_$launcherStamp.log"
 try {
     Start-Transcript -Path $LauncherLog -Append | Out-Null
 } catch {
-    Write-Warn "Failed to start transcript at $LauncherLog: $($_.Exception.Message)"
+    Write-Warn "Failed to start transcript at ${LauncherLog}: $($_.Exception.Message)"
 }
 
 foreach ($bootstrap in 'start_videocatalog.bat', 'start_videocatalog.ps1') {
@@ -59,7 +59,7 @@ foreach ($bootstrap in 'start_videocatalog.bat', 'start_videocatalog.ps1') {
         try {
             Unblock-File -Path $bootstrapPath -ErrorAction Stop
         } catch {
-            Write-Warn "Unable to unblock $bootstrapPath: $($_.Exception.Message)"
+            Write-Warn "Unable to unblock ${bootstrapPath}: $($_.Exception.Message)"
         }
     }
 }
