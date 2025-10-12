@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -195,6 +196,59 @@ class Scheduler:
 
     def is_paused(self) -> bool:
         return self._is_paused()
+
+    def active_jobs(self) -> List[Dict[str, Any]]:
+        finished: List[int] = []
+        active: List[Dict[str, Any]] = []
+        with self._lock:
+            items = list(self._running.items())
+        for job_id, handle in items:
+            if not handle.process.is_alive():
+                handle.process.join(timeout=0.1)
+                finished.append(job_id)
+                continue
+            active.append(
+                {
+                    "id": job_id,
+                    "resource": handle.resource,
+                    "started_utc": handle.started.isoformat(),
+                    "lease_owner": handle.lease_owner,
+                }
+            )
+        if finished:
+            with self._lock:
+                for job_id in finished:
+                    self._running.pop(job_id, None)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, kind, status, resource, started_utc FROM jobs WHERE status IN ('running','leased')"
+            ).fetchall()
+            for row in rows:
+                job_id = int(row["id"])
+                if any(existing["id"] == job_id for existing in active):
+                    continue
+                active.append(
+                    {
+                        "id": job_id,
+                        "kind": row["kind"],
+                        "status": row["status"],
+                        "resource": row["resource"],
+                        "started_utc": row["started_utc"],
+                    }
+                )
+        finally:
+            conn.close()
+        return active
+
+    def await_idle(self, *, timeout: float = 60.0, poll_interval: float = 0.5) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        poll = max(0.1, float(poll_interval))
+        while time.monotonic() < deadline:
+            if not self.active_jobs():
+                return True
+            time.sleep(poll)
+        return not self.active_jobs()
 
     # ------------------------------------------------------------------
     def cancel_job(self, job_id: int) -> None:
