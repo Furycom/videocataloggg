@@ -291,11 +291,12 @@ def _check_quality(settings: Dict[str, Any], working_dir: Path, diag: Dict[str, 
         duration = (time.perf_counter() - start) * 1000
         return SmokeItem(
             name="quality_headers",
-            status="FAIL",
-            severity="MAJOR",
-            message="ffprobe not available",
+            status="SKIP",
+            severity="INFO",
+            message="quality headers disabled (ffprobe not found)",
             duration_ms=duration,
-            hint="Install FFmpeg/ffprobe to inspect media headers.",
+            hint="Install FFmpeg/ffprobe to enable header analysis.",
+            data={"disabled": True},
         )
     duration = (time.perf_counter() - start) * 1000
     return SmokeItem(
