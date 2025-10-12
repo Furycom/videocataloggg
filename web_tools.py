@@ -41,9 +41,9 @@ def main(argv: list[str] | None = None) -> int:
     api_settings = settings.get("api") if isinstance(settings.get("api"), dict) else {}
     if isinstance(api_settings, dict):
         host = api_settings.get("host") or "127.0.0.1"
-        port = api_settings.get("port") or 8756
+        port = api_settings.get("port") or 27182
     else:
-        host, port = "127.0.0.1", 8756
+        host, port = "127.0.0.1", 27182
     base_default = args.api_base or f"http://{host}:{port}"
     api_base = (args.api_base or base_default or DEFAULT_BASE_URL).rstrip("/")
 

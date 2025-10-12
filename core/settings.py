@@ -139,7 +139,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "api": {
         "enabled_default": False,
         "host": "127.0.0.1",
-        "port": 8756,
+        "port": 27182,
         "api_key": None,
         "cors_origins": ["http://localhost", "http://127.0.0.1"],
         "default_limit": 100,

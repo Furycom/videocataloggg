@@ -225,15 +225,15 @@ if isinstance(_api_settings, dict):
     API_ENABLED_DEFAULT = bool(_api_settings.get("enabled_default", False))
     API_HOST_DEFAULT = str(_api_settings.get("host") or "127.0.0.1")
     try:
-        API_PORT_DEFAULT = int(_api_settings.get("port") or 8756)
+        API_PORT_DEFAULT = int(_api_settings.get("port") or 27182)
     except (TypeError, ValueError):
-        API_PORT_DEFAULT = 8756
+        API_PORT_DEFAULT = 27182
     API_KEY_PRESENT_DEFAULT = bool(str(_api_settings.get("api_key") or "").strip())
     API_KEY_VALUE_DEFAULT = str(_api_settings.get("api_key") or "").strip()
 else:
     API_ENABLED_DEFAULT = False
     API_HOST_DEFAULT = "127.0.0.1"
-    API_PORT_DEFAULT = 8756
+    API_PORT_DEFAULT = 27182
     API_KEY_PRESENT_DEFAULT = False
     API_KEY_VALUE_DEFAULT = ""
 
