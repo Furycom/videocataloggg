@@ -2,6 +2,75 @@
 
 Utilities for scanning large removable media libraries and keeping a SQLite-based catalog.
 
+## Windows 11 bootstrap & stabilization
+
+1. Install the NVIDIA Windows driver and Python 3.11+ (64-bit). Ensure `python` is on your `PATH` when you open PowerShell.
+2. Clone or unpack this repository somewhere under your profile (for example `C:\Users\you\Projects\VideoCatalog`).
+3. Launch an elevated PowerShell prompt, change to the repo root, and run:
+
+   ```powershell
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   .\stabilize.ps1
+   ```
+
+   The script prepares `%USERPROFILE%\VideoCatalog` as the writable home, downloads the assistant warmup models (Qwen2 0.5B
+   instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies from
+   `requirements-windows.txt`, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:8756`), and
+   executes the HTTP preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the
+   console. Rerun with `-SkipInstall` to reuse an existing virtual environment.
+
+4. On success the summary prints `PASS` for **Settings & Paths**, **Dependencies**, **Model cache**, **Database migrations**,
+   **API server**, **Orchestrator warmup**, **Preflight**, **Smoke**, and **Assistant status**. Any `FAIL` entry leaves the
+   stabilisation process with a non-zero exit code—consult the referenced log file for remediation steps.
+
+### Assistant model cache & warmup
+
+- The model download manifest lives at `working_dir\models\model_manifest.json` and records filenames, sizes, and SHA256 hashes
+  for the cached assets. Run `python -m assistant.model_cache --refresh` to force a re-download or when rotating models.
+- The orchestrator warmup enqueues `assistant_warmup` (GPU heavy) and `quality_headers` (CPU light) jobs and reports their final
+  status in the stabilization summary. Inspect `working_dir\logs\orchestrator.jsonl` if either job reports `FAIL`.
+
+### GPU requirements & troubleshooting
+
+- Heavy assistant workloads require an NVIDIA GPU with at least 8 GB of free VRAM. The bootstrap checks NVML and `nvidia-smi`; if
+  neither are available it writes `logs\gpu.disabled.banner` and the assistant API responds with
+  `AI disabled (GPU required: <reason>)`.
+- When the GPU probe fails, install the latest NVIDIA Studio/Game Ready driver and rerun `stabilize.ps1`. If CUDA support is
+  missing, install the CUDA Toolkit (`winget install -e --id Nvidia.CUDA`) followed by `pip install --upgrade onnxruntime-gpu`.
+- `ffprobe` is required for the `quality_headers` smoke test. Install FFmpeg and ensure `ffprobe.exe` resolves on `PATH`. Until
+  then, the diagnostics mark quality header checks as `SKIP` and write `logs\quality_headers.disabled`.
+
+### Diagnostics & smoke tests
+
+- The stabilisation script calls the HTTP wrappers for you, but they can be rerun manually once the API is up:
+
+  ```powershell
+  $env:VIDEOCATALOG_API_KEY = 'localdev'
+  python web_preflight.py --timeout 15
+  python web_smoke.py --timeout 20
+  ```
+
+  Both commands stream JSONL reports to `working_dir\logs\diagnostics` and return a non-zero exit code if a required check fails.
+- Realtime subscriptions and assistant responses are exercised during the smoke phase; failures usually indicate a missing API
+  key or that the assistant is still disabled by the GPU gate.
+
+### Serving the catalog UI
+
+- After `stabilize.ps1` reports success the API continues running. Visit `http://127.0.0.1:8756/catalog` in a browser and supply
+  the API key (`localdev` by default) when prompted. The UI streams data exclusively over localhost—`settings.json` enforces
+  `server.host = 127.0.0.1` and `lan_refuse = true`.
+- WebSocket and SSE subscribers are exposed via `/v1/catalog/subscribe`. Successful connections increment the `ws_clients` and
+  `sse_clients` counters returned by `GET /v1/health`.
+
+### Changing the catalog database path
+
+- `upgrade_db.py` keeps `settings.json` in sync with `%USERPROFILE%\VideoCatalog\catalog.db`. To override the location, edit
+  `settings.json` and update the `"catalog_db"` entry to the desired absolute path (for example
+  `"D:\\VideoCatalog\\catalog.db"`). On the next run the tool validates writability and regenerates the working directory
+  structure alongside the database.
+- Alternative locations can also be supplied via the `VIDEOCATALOG_HOME` environment variable—`resolve_working_dir()` will honour
+  the override and `stabilize.ps1` will create the same `data`, `logs`, `exports`, `backups`, and `vectors` hierarchy there.
+
 ## Disk Scanner GUI
 
 `DiskScannerGUI.py` provides a Tk-based interface for launching scans and reviewing job history.

@@ -146,6 +146,16 @@ def build_default_registry() -> JobRegistry:
 
     registry.register(
         JobSpec(
+            kind="quality_headers",
+            resource="light_cpu",
+            runner=_noop_light_job,
+            estimate_vram=lambda payload: 0,
+            estimate_runtime=lambda payload: int(payload.get("estimate_s", 90)),
+        )
+    )
+
+    registry.register(
+        JobSpec(
             kind="apiguard_warmup",
             resource="io_light",
             runner=_noop_light_job,

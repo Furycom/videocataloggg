@@ -386,7 +386,28 @@ def create_app(config: APIServerConfig) -> FastAPI:
     @app.get("/v1/health", response_model=HealthResponse)
     def health_check(_: str = Depends(auth_dependency)) -> HealthResponse:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return HealthResponse(ok=True, version=config.app_version, time_utc=now)
+        status_payload = assistant_gateway.status()
+        realtime = web_monitor.snapshot()
+        budget = status_payload.get("tool_budget") or assistant_gateway.tool_budget_snapshot()
+        try:
+            budget_total = int(budget.get("total")) if budget.get("total") is not None else None
+        except Exception:
+            budget_total = None
+        try:
+            budget_remaining = int(budget.get("remaining", 0))
+        except Exception:
+            budget_remaining = 0
+        return HealthResponse(
+            ok=True,
+            version=config.app_version,
+            time_utc=now,
+            gpu_ready=bool(status_payload.get("gpu_ready")),
+            ws_clients=int(realtime.get("ws_connected", 0) or 0),
+            sse_clients=int(realtime.get("sse_connected", 0) or 0),
+            tool_budget_remaining=max(0, budget_remaining),
+            tool_budget_total=budget_total,
+            last_event_age_ms=realtime.get("last_event_age_ms"),
+        )
 
     @app.get("/v1/assistant/status", response_model=AssistantStatusResponse)
     def assistant_status(_: str = Depends(auth_dependency)) -> AssistantStatusResponse:

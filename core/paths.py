@@ -241,13 +241,17 @@ def get_drive_types_path(working_dir: Path) -> Path:
 
 
 def ensure_working_dir_structure(working_dir: Path) -> None:
+    exports_dir = get_exports_dir(working_dir)
     for directory in (
         working_dir,
         get_data_dir(working_dir),
         get_shards_dir(working_dir),
         get_logs_dir(working_dir),
         get_scans_dir(working_dir),
-        get_exports_dir(working_dir),
+        exports_dir,
+        exports_dir / "backups",
+        working_dir / "backups",
+        working_dir / "vectors",
     ):
         directory.mkdir(parents=True, exist_ok=True)
 

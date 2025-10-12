@@ -41,6 +41,9 @@ class AssistantGateway:
 
     def _resolve_status_message(self) -> str:
         if not self._gpu_ready:
+            reason = self._gpu_info.get("error") or self._gpu_info.get("nv_error")
+            if reason:
+                return f"AI disabled (GPU required: {reason})"
             return "AI disabled (GPU required)"
         if not self._settings.enable:
             return "Assistant disabled in settings"
@@ -61,8 +64,10 @@ class AssistantGateway:
                 "has_nvidia": bool(self._gpu_info.get("has_nvidia")),
                 "name": self._gpu_info.get("name"),
                 "vram_bytes": self._gpu_info.get("vram_bytes"),
+                "error": self._gpu_info.get("error") or self._gpu_info.get("nv_error"),
             },
         }
+        payload["tool_budget"] = self.tool_budget_snapshot()
         service = self._service
         if service is not None:
             try:
@@ -70,6 +75,22 @@ class AssistantGateway:
             except Exception as exc:
                 LOGGER.debug("Unable to fetch assistant runtime status: %s", exc)
         return payload
+
+    def tool_budget_snapshot(self) -> Dict[str, int]:
+        total = int(self._settings.tool_budget)
+        remaining = 0
+        if self._gpu_ready and self._settings.enable:
+            remaining = total
+        service = self._service
+        if service is not None:
+            try:
+                status = service.status()
+                total = int(getattr(status, "tool_budget", total))
+                remaining = int(getattr(status, "remaining_budget", remaining))
+            except Exception as exc:
+                LOGGER.debug("Unable to read assistant tool budget: %s", exc)
+        remaining = max(0, min(total, remaining))
+        return {"total": max(0, total), "remaining": remaining}
 
     def ask_context(
         self,

@@ -29,6 +29,7 @@ _TINY_MODEL_BYTES = base64.b64decode(
 _NVML_LOCK = threading.Lock()
 _NVML_INITIALIZED = False
 _NVML_FAILED = False
+_NVML_FAILURE_REASON: Optional[str] = None
 
 _NVML_CACHE: Optional[Dict[str, object]] = None
 _ONNX_CACHE: Optional[Dict[str, Dict[str, object]]] = None
@@ -36,8 +37,11 @@ _FFMPEG_CACHE: Optional[Dict[str, bool]] = None
 
 
 def _ensure_nvml() -> bool:
-    global _NVML_INITIALIZED, _NVML_FAILED
-    if pynvml is None or _NVML_FAILED:
+    global _NVML_INITIALIZED, _NVML_FAILED, _NVML_FAILURE_REASON
+    if pynvml is None:
+        _NVML_FAILURE_REASON = "pynvml module not available"
+        return False
+    if _NVML_FAILED:
         return False
     with _NVML_LOCK:
         if _NVML_FAILED:
@@ -48,9 +52,11 @@ def _ensure_nvml() -> bool:
             pynvml.nvmlInit()  # type: ignore[attr-defined]
         except Exception as exc:  # pragma: no cover - optional dependency guard
             _NVML_FAILED = True
+            _NVML_FAILURE_REASON = str(exc) or "NVML initialisation failed"
             _LOGGER.debug("NVML init failed: %s", exc)
             return False
         _NVML_INITIALIZED = True
+        _NVML_FAILURE_REASON = None
         return True
 
 
@@ -124,6 +130,7 @@ def probe_nvml(*, refresh: bool = False) -> Dict[str, object]:
         "vram_bytes": None,
         "free_vram_bytes": None,
         "driver_version": None,
+        "error": None,
     }
 
     handle = None
@@ -160,6 +167,11 @@ def probe_nvml(*, refresh: bool = False) -> Dict[str, object]:
                 result["driver_version"] = driver.decode("utf-8", "ignore")
             elif driver:
                 result["driver_version"] = str(driver)
+        else:
+            result["error"] = "No NVIDIA GPU detected"
+    else:
+        if _NVML_FAILURE_REASON:
+            result["error"] = _NVML_FAILURE_REASON
 
     _NVML_CACHE = dict(result)
     return result
@@ -269,6 +281,7 @@ def probe_gpu(*, refresh: bool = False) -> Dict[str, object]:
         "nv_vram_bytes": nvml_info.get("vram_bytes"),
         "nv_free_vram_bytes": nvml_info.get("free_vram_bytes"),
         "nv_driver_version": nvml_info.get("driver_version"),
+        "nv_error": nvml_info.get("error"),
         "cuda_available": _cuda_runtime_available() if nvml_info.get("has_nvidia") else False,
         "onnx_cuda_ok": bool(provider_info["cuda"].get("ok")),
         "onnx_cuda_error": provider_info["cuda"].get("error"),

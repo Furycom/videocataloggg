@@ -8,11 +8,21 @@ from pydantic import BaseModel, Field
 
 
 class HealthResponse(BaseModel):
-    """Simple health response with application metadata."""
+    """Health response summarising server readiness and realtime status."""
 
     ok: bool = Field(True, description="Indicates the API server is reachable.")
     version: str = Field(..., description="Application version string.")
     time_utc: str = Field(..., description="Current UTC timestamp in ISO8601 format.")
+    gpu_ready: bool = Field(..., description="True when GPU prerequisites for AI workloads are satisfied.")
+    ws_clients: int = Field(..., description="Active WebSocket subscriber count.")
+    sse_clients: int = Field(..., description="Active Server-Sent Event subscriber count.")
+    tool_budget_remaining: int = Field(..., ge=0, description="Assistant tool call budget remaining for the active session.")
+    tool_budget_total: Optional[int] = Field(
+        None, ge=0, description="Configured assistant tool call budget when known."
+    )
+    last_event_age_ms: Optional[float] = Field(
+        None, description="Milliseconds since the last realtime catalog event was published."
+    )
 
 
 class DriveInfo(BaseModel):

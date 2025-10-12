@@ -1,5 +1,5 @@
 {
-  "catalog_db": "C:/Users/Administrator/VideoCatalog/catalog.db",
+  "catalog_db": "%USERPROFILE%\\VideoCatalog\\catalog.db",
   "diagnostics": {
     "enable": true,
     "gpu_hard_requirement": true,
@@ -106,7 +106,7 @@
     "enabled_default": false,
     "host": "127.0.0.1",
     "port": 8756,
-    "api_key": null,
+    "api_key": "localdev",
     "cors_origins": [
       "http://localhost",
       "http://127.0.0.1"
