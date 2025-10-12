@@ -205,24 +205,59 @@ try {
     if (-not $pythonCmd) {
         throw 'Python executable not found on PATH.'
     }
-    $pythonExe = $pythonCmd.Source
-    if (-not $pythonExe) { $pythonExe = $pythonCmd.Path }
-    if (-not $pythonExe) { $pythonExe = $pythonCmd.Definition }
-    Write-Info "Python detected at $pythonExe"
+    $systemPython = $pythonCmd.Source
+    if (-not $systemPython) { $systemPython = $pythonCmd.Path }
+    if (-not $systemPython) { $systemPython = $pythonCmd.Definition }
+    Write-Info "Python detected at $systemPython"
 
     $pipCmd = Get-Command pip -ErrorAction SilentlyContinue
     if ($pipCmd) {
-        $pipExe = $pipCmd.Source
-        if (-not $pipExe) { $pipExe = $pipCmd.Path }
-        if (-not $pipExe) { $pipExe = $pipCmd.Definition }
-        Write-Info "pip detected at $pipExe"
+        $systemPip = $pipCmd.Source
+        if (-not $systemPip) { $systemPip = $pipCmd.Path }
+        if (-not $systemPip) { $systemPip = $pipCmd.Definition }
+        Write-Info "pip detected at $systemPip"
     } else {
         Write-Warn 'pip executable not found on PATH. Falling back to python -m pip.'
+        $systemPip = $null
+    }
+
+    $venvPath = Join-Path $work 'venv'
+    $venvScripts = Join-Path $venvPath 'Scripts'
+    $venvPython = Join-Path $venvScripts 'python.exe'
+    $venvPip = Join-Path $venvScripts 'pip.exe'
+
+    if (-not (Test-Path $venvPython)) {
+        Write-Info "Creating Python virtual environment at $venvPath"
+        & $systemPython -m venv $venvPath
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
+            throw "Failed to create Python virtual environment at $venvPath"
+        }
+    }
+
+    $pythonExe = $venvPython
+    if (Test-Path $venvPip) {
+        $pipExe = $venvPip
+        Write-Info "Using virtual environment pip at $pipExe"
+    } else {
+        Write-Warn 'Virtual environment pip executable missing. Falling back to python -m pip.'
         $pipExe = $null
     }
+    Write-Info "Using virtual environment python at $pythonExe"
 
     $env:VIDEOCATALOG_HOME = $workFull
     $env:PYTHONUNBUFFERED = '1'
+
+    Write-Info 'Upgrading pip, setuptools, and wheel in the virtual environment.'
+    $bootstrapArgs = @('install', '--upgrade', 'pip', 'setuptools', 'wheel')
+    $bootstrapExit = Invoke-PipInstall -Arguments $bootstrapArgs -PythonExe $pythonExe -PipExe $pipExe
+    if ($bootstrapExit -ne 0) {
+        Write-Warn 'Failed to upgrade pip/setuptools/wheel. Continuing with existing versions.'
+    } else {
+        if (-not $pipExe -and (Test-Path $venvPip)) {
+            $pipExe = $venvPip
+            Write-Info "Detected pip at $pipExe after upgrade."
+        }
+    }
 
     $uvicornAvailable = Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn'
     if (-not $uvicornAvailable) {
@@ -232,7 +267,7 @@ try {
         }
         Write-Warn 'uvicorn not found, installing required Python packages.'
         Write-Info "Installing dependencies from $requirementsPath"
-        $baseInstallArgs = @('install', '-r', $requirementsPath)
+        $baseInstallArgs = @('install', '--upgrade', '-r', $requirementsPath)
         $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe
         if ($exitCode -ne 0) {
             throw 'Dependency installation failed.'
@@ -357,11 +392,13 @@ print(json.dumps(payload))
     Write-Info "GPU status: $gpuSummary"
 
     $orchLogStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $OrchLog = Join-Path $logs "orchestrator_$orchLogStamp.log"
-    $WebLog = Join-Path $logs "web_$orchLogStamp.log"
+    $OrchStdOutLog = Join-Path $logs "orchestrator_${orchLogStamp}_out.log"
+    $OrchStdErrLog = Join-Path $logs "orchestrator_${orchLogStamp}_err.log"
+    $WebStdOutLog = Join-Path $logs "web_${orchLogStamp}_out.log"
+    $WebStdErrLog = Join-Path $logs "web_${orchLogStamp}_err.log"
 
-    $orchProcess = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'orchestrator.scheduler', '--working-dir', $workFull) -WorkingDirectory $root -RedirectStandardOutput $OrchLog -RedirectStandardError $OrchLog -NoNewWindow -PassThru
-    Write-Info "Orchestrator starting (PID $($orchProcess.Id)) logging to $OrchLog"
+    $orchProcess = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'orchestrator.scheduler', '--working-dir', $workFull) -WorkingDirectory $root -RedirectStandardOutput $OrchStdOutLog -RedirectStandardError $OrchStdErrLog -NoNewWindow -PassThru
+    Write-Info "Orchestrator starting (PID $($orchProcess.Id)) logging stdout to $OrchStdOutLog and stderr to $OrchStdErrLog"
 
     $orchReady = $false
     $orchStart = Get-Date
@@ -369,8 +406,8 @@ print(json.dumps(payload))
         if ((Get-Date) - $orchStart -gt [TimeSpan]::FromSeconds(20)) {
             break
         }
-        if (Test-Path $OrchLog) {
-            $recent = Get-Content -Path $OrchLog -Tail 40 -ErrorAction SilentlyContinue
+        if (Test-Path $OrchStdOutLog) {
+            $recent = Get-Content -Path $OrchStdOutLog -Tail 40 -ErrorAction SilentlyContinue
             if ($recent -and ($recent -match 'ORCH_HEARTBEAT')) {
                 $orchReady = $true
                 break
@@ -388,8 +425,8 @@ print(json.dumps(payload))
 
     Write-Info 'Orchestrator heartbeat detected.'
 
-    $webProcess = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'videocatalog_api', '--host', '127.0.0.1', '--port', '27182') -WorkingDirectory $root -RedirectStandardOutput $WebLog -RedirectStandardError $WebLog -NoNewWindow -PassThru
-    Write-Info "Web server starting (PID $($webProcess.Id)) logging to $WebLog"
+    $webProcess = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'videocatalog_api', '--host', '127.0.0.1', '--port', '27182') -WorkingDirectory $root -RedirectStandardOutput $WebStdOutLog -RedirectStandardError $WebStdErrLog -NoNewWindow -PassThru
+    Write-Info "Web server starting (PID $($webProcess.Id)) logging stdout to $WebStdOutLog and stderr to $WebStdErrLog"
 
     $webReady = $false
     $webStart = Get-Date
@@ -397,8 +434,8 @@ print(json.dumps(payload))
         if ((Get-Date) - $webStart -gt [TimeSpan]::FromSeconds(25)) {
             break
         }
-        if (Test-Path $WebLog) {
-            $recentWeb = Get-Content -Path $WebLog -Tail 40 -ErrorAction SilentlyContinue
+        if (Test-Path $WebStdOutLog) {
+            $recentWeb = Get-Content -Path $WebStdOutLog -Tail 40 -ErrorAction SilentlyContinue
             if ($recentWeb -and ($recentWeb -match 'Application startup complete' -or $recentWeb -match 'Uvicorn running on http://127.0.0.1:27182')) {
                 $webReady = $true
                 break
@@ -429,8 +466,10 @@ print(json.dumps(payload))
 
     Write-Info 'Services running. Press Ctrl+C to stop.'
     Write-Info "  GPU: $gpuSummary"
-    Write-Info "  Orchestrator log: $OrchLog"
-    Write-Info "  Web log: $WebLog"
+    Write-Info "  Orchestrator stdout log: $OrchStdOutLog"
+    Write-Info "  Orchestrator stderr log: $OrchStdErrLog"
+    Write-Info "  Web stdout log: $WebStdOutLog"
+    Write-Info "  Web stderr log: $WebStdErrLog"
 
     while ($true) {
         if ($orchProcess.HasExited) {
