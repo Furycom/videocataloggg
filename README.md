@@ -49,6 +49,11 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - Heavy assistant workloads require an NVIDIA GPU with at least 8 GB of free VRAM. The bootstrap checks NVML and `nvidia-smi`; if
   neither are available it writes `logs\gpu.disabled.banner` and the assistant API responds with
   `AI disabled (GPU required: <reason>)`.
+- The bundled dependency manifest installs the CPU wheel of `llama-cpp-python==0.2.90` on Windows because the
+  `llama-cpp-python-cuBLAS` project does not publish Windows binaries. GPU acceleration remains available, but you must
+  install a compatible build manually after stabilization completes—for example by compiling the project with CMake and
+  CUDA or by installing a wheel published by the llama.cpp release artifacts. Once the GPU-enabled build is in place,
+  rerun `stabilize.ps1 -SkipInstall` to reuse the existing environment.
 - When the GPU probe fails, install the latest NVIDIA Studio/Game Ready driver and rerun `stabilize.ps1`. If CUDA support is
   missing, install the CUDA Toolkit (`winget install -e --id Nvidia.CUDA`) followed by `pip install --upgrade onnxruntime-gpu`.
 - `ffprobe` is required for the `quality_headers` smoke test. Install FFmpeg and ensure `ffprobe.exe` resolves on `PATH`. Until
