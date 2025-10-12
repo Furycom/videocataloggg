@@ -303,7 +303,9 @@ try {
 
     Write-Info 'Upgrading pip, setuptools, and wheel in the virtual environment.'
     $bootstrapArgs = @('install', '--upgrade', 'pip', 'setuptools', 'wheel')
-    $bootstrapExit = Invoke-PipInstall -Arguments $bootstrapArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
+    # Use ``python -m pip`` for the bootstrap upgrade to allow pip to replace its
+    # own executable on Windows where running ``pip.exe`` can block self-upgrades.
+    $bootstrapExit = Invoke-PipInstall -Arguments $bootstrapArgs -PythonExe $pythonExe -PipExe $null -LogFile $pipLog
     if ($bootstrapExit -ne 0) {
         $logHint = if ($pipLog) { " Review pip log at $pipLog." } else { '' }
         Write-Warn "Failed to upgrade pip/setuptools/wheel (exit code $bootstrapExit). Continuing with existing versions.$logHint"
