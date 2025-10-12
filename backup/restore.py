@@ -7,12 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-from api import __version__ as APP_VERSION
-
 from core.db import connect
+from core.versioning import get_app_version
 
 from .errors import BackupError, BackupRestoreError
 from .logs import BackupLogger
+
+APP_VERSION = get_app_version()
 
 
 def _load_manifest(path: Path) -> Dict[str, object]:

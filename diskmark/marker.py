@@ -9,13 +9,11 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from core.settings import update_settings
+from core.versioning import get_app_version
 
 from .checks import MARKER_SCHEMA, compute_signature, validate_marker
 
-try:  # pragma: no cover - best effort import
-    from api import __version__ as APP_VERSION
-except Exception:  # pragma: no cover - fallback when API package unavailable
-    APP_VERSION = "0.0.0"
+APP_VERSION = get_app_version()
 
 APP_NAME = "VideoCatalog"
 

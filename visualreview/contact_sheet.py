@@ -7,9 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-from PIL import Image, ImageOps
-
 from .frame_sampler import FrameSample
+from .pillow_support import (
+    LOGGER,
+    PillowImage,
+    PillowUnavailableError,
+    ensure_pillow,
+    load_pillow_image,
+    load_pillow_ops,
+)
 
 
 @dataclass(slots=True)
@@ -31,7 +37,7 @@ class ContactSheetConfig:
 class ContactSheetResult:
     """Return payload describing the generated contact sheet."""
 
-    image: Image.Image
+    image: PillowImage
     format: str
     width: int
     height: int
@@ -75,13 +81,22 @@ class ContactSheetBuilder:
 
     def build(
         self,
-        samples: Sequence[FrameSample] | Sequence[Image.Image],
+        samples: Sequence[FrameSample] | Sequence[PillowImage],
     ) -> Optional[ContactSheetResult]:
+        if not ensure_pillow(LOGGER):
+            return None
+
+        try:
+            pillow_image = load_pillow_image()
+            pillow_ops = load_pillow_ops()
+        except PillowUnavailableError:
+            return None
+
         frames = self._normalize_samples(samples)
         if not frames:
             return None
         grid = self._layout(len(frames))
-        sheet = Image.new(
+        sheet = pillow_image.new(
             "RGB",
             (
                 grid.columns * self._cell_width
@@ -95,10 +110,10 @@ class ContactSheetBuilder:
         )
         positions = self._iter_positions(grid.columns, grid.rows)
         for frame, (x, y) in zip(frames, positions):
-            resized = ImageOps.fit(
+            resized = pillow_ops.fit(
                 frame,
                 (self._cell_width, self._cell_height),
-                method=Image.Resampling.LANCZOS,
+                method=pillow_image.Resampling.LANCZOS,
                 centering=(0.5, 0.5),
             )
             offset_x = self._margin + x * (self._cell_width + self._padding)
@@ -123,7 +138,7 @@ class ContactSheetBuilder:
 
     def export(
         self,
-        samples: Sequence[FrameSample] | Sequence[Image.Image],
+        samples: Sequence[FrameSample] | Sequence[PillowImage],
         destination: Path,
         *,
         format: Optional[str] = None,
@@ -151,15 +166,19 @@ class ContactSheetBuilder:
     # Helpers
     # ------------------------------------------------------------------
     def _normalize_samples(
-        self, samples: Sequence[FrameSample] | Sequence[Image.Image]
-    ) -> List[Image.Image]:
-        frames: List[Image.Image] = []
+        self, samples: Sequence[FrameSample] | Sequence[PillowImage]
+    ) -> List[PillowImage]:
+        try:
+            pillow_image = load_pillow_image()
+        except PillowUnavailableError:
+            return []
+        frames: List[PillowImage] = []
         for sample in samples:
             if isinstance(sample, FrameSample):
                 frames.append(sample.image.copy())
-            elif isinstance(sample, Image.Image):
+            elif isinstance(sample, pillow_image.Image):
                 frames.append(sample.copy())
-        unique: List[Image.Image] = []
+        unique: List[PillowImage] = []
         hashes = set()
         for frame in frames:
             key = (frame.width, frame.height, frame.tobytes()[0:32])

@@ -8,8 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
-from PIL import Image
-
 from core.db import connect
 from core.paths import get_shard_db_path, get_shards_dir, resolve_working_dir
 from structure import tv_review
@@ -17,6 +15,11 @@ from structure import tv_review
 from .contact_sheet import ContactSheetBuilder, ContactSheetConfig
 from .frame_sampler import FrameSample, FrameSampler, FrameSamplerConfig
 from .store import VisualReviewStore, VisualReviewStoreConfig
+from .pillow_support import (
+    PillowUnavailableError,
+    ensure_pillow,
+    load_pillow_image,
+)
 
 LOGGER = logging.getLogger("videocatalog.visualreview.run")
 
@@ -561,10 +564,16 @@ class ReviewRunner:
         self, store: VisualReviewStore, item: ReviewItem, sample: FrameSample
     ) -> bool:
         image = sample.image.copy()
-        try:
-            image.thumbnail(self._thumbnail_size, Image.Resampling.LANCZOS)
-        except Exception:
-            pass
+        if ensure_pillow(LOGGER):
+            try:
+                pillow_image = load_pillow_image()
+            except PillowUnavailableError:
+                pillow_image = None
+            if pillow_image is not None:
+                try:
+                    image.thumbnail(self._thumbnail_size, pillow_image.Resampling.LANCZOS)
+                except Exception:
+                    pass
         return store.upsert_thumbnail(
             item_type=item.item_type,
             item_key=item.item_key,

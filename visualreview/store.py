@@ -9,9 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
-
 from core.db import connect
+from .pillow_support import (
+    PillowImage,
+    PillowUnavailableError,
+    ensure_pillow,
+    load_pillow_image,
+)
 
 LOGGER = logging.getLogger("videocatalog.visualreview.store")
 
@@ -85,10 +89,12 @@ class VisualReviewStore:
         *,
         item_type: str,
         item_key: str,
-        image: Image.Image,
+        image: PillowImage,
         format: str,
         quality: int,
     ) -> bool:
+        if not ensure_pillow(LOGGER):
+            return False
         payload = self._encode_image(image, format=format, quality=quality)
         if payload is None:
             return False
@@ -384,7 +390,13 @@ class VisualReviewStore:
                 )
                 remaining = max(0, remaining - reclaimed)
 
-    def _encode_image(self, image: Image.Image, *, format: str, quality: int) -> Optional[bytes]:
+    def _encode_image(self, image: PillowImage, *, format: str, quality: int) -> Optional[bytes]:
+        try:
+            pillow_image = load_pillow_image()
+        except PillowUnavailableError:
+            return None
+        if not isinstance(image, pillow_image.Image):
+            return None
         fmt = (format or "JPEG").upper()
         buffer = io.BytesIO()
         save_image = image

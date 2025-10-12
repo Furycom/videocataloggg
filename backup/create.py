@@ -13,15 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from api import __version__ as APP_VERSION
-
 from core.db import backup_sqlite, connect
 from core.paths import get_catalog_db_path, get_data_dir, get_logs_dir, get_shards_dir
+from core.versioning import get_app_version
 
 from .errors import BackupError
 from .logs import BackupLogger
 from .types import BackupArtifact, BackupManifest, BackupOptions, BackupResult
 
+APP_VERSION = get_app_version()
 _BACKUP_VERSION = 1
 _LOG_TAIL_BYTES = 5 * 1024 * 1024
 _MAX_THUMB_EXPORT_BYTES = 20 * 1024 * 1024

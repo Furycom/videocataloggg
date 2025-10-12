@@ -9,12 +9,12 @@ from typing import List, Optional, Sequence
 
 import uvicorn
 
-from api import __version__ as API_VERSION
 from api.db import DataAccess
 from api.server import APIServerConfig, create_app
 from catalog.exporter import export_catalog
 from core.paths import resolve_working_dir
 from core.settings import load_settings
+from core.versioning import get_app_version
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 27182
@@ -132,7 +132,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         data_access=data_access,
         api_key=api_key,
         cors_origins=cors,
-        app_version=API_VERSION,
+        app_version=get_app_version(),
         lan_only=lan_refuse,
     )
     app = create_app(config)
