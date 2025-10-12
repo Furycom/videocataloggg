@@ -162,6 +162,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "refresh_on_start": False,
         },
     },
+    "tests": {
+        "enable": True,
+        "gate_on_fail": True,
+        "timeouts_s": {"default": 15, "gpu": 30},
+        "fixtures": {"regen_on_mismatch": False},
+        "gpu_required_tests": ["vectors_refresh", "assistant_tools"],
+        "report_formats": ["markdown", "junit"],
+    },
     "structure": {
         "enable": True,
         "weights": {

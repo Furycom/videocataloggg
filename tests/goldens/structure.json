@@ -1,0 +1,30 @@
+{
+  "movies": [
+    {
+      "canonical": true,
+      "detected_year": 1999,
+      "folder": "The Matrix (1999)",
+      "issues": [
+        "extra_mkv_files:1",
+        "extra_nfo_files:1"
+      ],
+      "kind": "movie"
+    }
+  ],
+  "shows": [
+    {
+      "canonical": true,
+      "issues": [],
+      "seasons": [
+        {
+          "canonical": true,
+          "episode_count": 2,
+          "issues": [],
+          "season": 1
+        }
+      ],
+      "title": "Example Show",
+      "year": 2019
+    }
+  ]
+}

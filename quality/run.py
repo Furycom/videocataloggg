@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -33,8 +33,8 @@ class QualitySettings:
     timeout_s: float = 8.0
     gentle_sleep_ms: int = 3
     max_parallel: int = 1
-    thresholds: QualityThresholds = QualityThresholds()
-    labels: QualityLabels = QualityLabels()
+    thresholds: QualityThresholds = field(default_factory=QualityThresholds)
+    labels: QualityLabels = field(default_factory=QualityLabels)
 
     @classmethod
     def from_mapping(cls, mapping: Dict[str, object] | None) -> "QualitySettings":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -140,6 +141,18 @@ class VectorIndex:
         with self.meta_path.open("w", encoding="utf-8") as fh:
             json.dump({"entries": meta_entries}, fh, indent=2)
         self._meta = meta_entries
+        if isinstance(index, _SimpleVectorIndex):
+            # Remove stale on-disk indexes from previous backends to avoid confusion.
+            try:
+                if self.index_path.exists():
+                    self.index_path.unlink()
+            except Exception:
+                LOGGER.debug("Assistant RAG: failed to clean legacy index file at %s", self.index_path)
+            self._index = index
+            LOGGER.info(
+                "Assistant RAG: rebuilt in-memory simple index with %d entries", len(documents)
+            )
+            return
         if backend == "hnswlib":
             index.save_index(str(self.index_path))
         else:
@@ -244,11 +257,15 @@ class VectorIndex:
 
     def _ensure_embedder(self):
         if self._embedder is None:
-            from sentence_transformers import SentenceTransformer
-
             model_name = self.settings.rag.embed_model or "bge-small-en"
-            LOGGER.info("Assistant RAG: loading embeddings model %s", model_name)
-            self._embedder = SentenceTransformer(model_name)
+            if model_name.startswith("stub:"):
+                LOGGER.info("Assistant RAG: using stub embedding model %s", model_name)
+                self._embedder = _StubEmbeddingModel(model_name)
+            else:
+                from sentence_transformers import SentenceTransformer
+
+                LOGGER.info("Assistant RAG: loading embeddings model %s", model_name)
+                self._embedder = SentenceTransformer(model_name)
             self._dim = int(self._embedder.get_sentence_embedding_dimension())
         return self._embedder
 
@@ -256,8 +273,8 @@ class VectorIndex:
         try:
             import hnswlib
         except Exception as exc:
-            LOGGER.error("Assistant RAG: hnswlib unavailable (%s)", exc)
-            return None
+            LOGGER.warning("Assistant RAG: hnswlib unavailable (%s); using simple index", exc)
+            return _SimpleVectorIndex(vectors)
         num = len(vectors)
         index = hnswlib.Index(space="cosine", dim=vectors.shape[1])
         index.init_index(max_elements=num, ef_construction=200, M=48)
@@ -269,8 +286,8 @@ class VectorIndex:
         try:
             import faiss
         except Exception as exc:
-            LOGGER.error("Assistant RAG: faiss unavailable (%s)", exc)
-            return None
+            LOGGER.warning("Assistant RAG: faiss unavailable (%s); using simple index", exc)
+            return _SimpleVectorIndex(vectors)
         vectors = vectors.astype("float32")
         num, dim = vectors.shape
         index = faiss.IndexFlatIP(dim)
@@ -278,6 +295,9 @@ class VectorIndex:
         return index
 
     def _knn_query(self, vector: np.ndarray, k: int):
+        if isinstance(self._index, _SimpleVectorIndex):
+            scores, labels = self._index.search(vector, k=k)
+            return labels, 1 - scores
         if self.settings.rag.index == "hnswlib":
             labels, distances = self._index.knn_query(vector, k=k)
             return labels, distances
@@ -299,3 +319,56 @@ class VectorIndex:
             else:
                 normalized[key] = value
         return normalized
+class _StubEmbeddingModel:
+    """Deterministic embedding stub used for smoke tests."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._dim = 96
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self._dim
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        *,
+        convert_to_numpy: bool = True,
+        normalize_embeddings: bool = True,
+    ) -> np.ndarray:
+        vectors: List[np.ndarray] = []
+        salt = self._name.encode("utf-8")
+        for text in texts:
+            blob = hashlib.sha256(salt + text.encode("utf-8")).digest()
+            repeat = (self._dim + len(blob) - 1) // len(blob)
+            combined = (blob * repeat)[: self._dim]
+            vector = np.frombuffer(combined, dtype=np.uint8).astype("float32")
+            vectors.append(vector)
+        matrix = np.vstack(vectors)
+        if normalize_embeddings:
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            matrix = matrix / norms
+        return matrix if convert_to_numpy else matrix.tolist()
+
+
+class _SimpleVectorIndex:
+    """Lightweight cosine similarity index used when faiss/hnswlib are unavailable."""
+
+    def __init__(self, vectors: np.ndarray) -> None:
+        normalized = vectors.astype("float32")
+        norms = np.linalg.norm(normalized, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._vectors = normalized / norms
+
+    def search(self, queries: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+        if queries.ndim == 1:
+            queries = np.expand_dims(queries, axis=0)
+        queries = queries.astype("float32")
+        norms = np.linalg.norm(queries, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        normalized_queries = queries / norms
+        scores = normalized_queries @ self._vectors.T
+        top_idx = np.argsort(scores, axis=1)[:, ::-1][:, :k]
+        top_scores = np.take_along_axis(scores, top_idx, axis=1)
+        return top_scores, top_idx.astype(int)

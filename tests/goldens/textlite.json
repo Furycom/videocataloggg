@@ -1,0 +1,53 @@
+[
+  {
+    "bytes": 102,
+    "file": "metrics.csv",
+    "keywords": [
+      "category",
+      "episodes",
+      "movies",
+      "value"
+    ],
+    "lines": 11,
+    "summary": "category,value\nmovies,2\nepisodes,2\n\u2026\ncategory,value\nmovies,2\nepisodes,2\n\u2026\ncategory,value\nmovies,2\nepisodes,2"
+  },
+  {
+    "bytes": 195,
+    "file": "overview.md",
+    "keywords": [
+      "dataset",
+      "document",
+      "example",
+      "fixture",
+      "overview"
+    ],
+    "lines": 11,
+    "summary": "# Example Overview\n\nThis document summarises the fixture dataset. \u2026\n# Example Overview\n\nThis document summarises the fixture dataset."
+  },
+  {
+    "bytes": 363,
+    "file": "release_notes.txt",
+    "keywords": [
+      "smoke",
+      "automatically",
+      "content",
+      "created",
+      "delete"
+    ],
+    "lines": 11,
+    "summary": "VideoCatalog Smoke Fixtures v1.0\n- Deterministic sample content for smoke tests. - Created automatically; safe to delete. \u2026\nVideoCatalog Smoke Fixtures v1.0\n- Deterministic sample content for smoke tests."
+  },
+  {
+    "bytes": 475,
+    "file": "snippets.json",
+    "keywords": [
+      "episode",
+      "title",
+      "season",
+      "episodes",
+      "matrix"
+    ],
+    "lines": 41,
+    "summary": "{\n  \"movies\": [\n    \"The Matrix\"\n  ],\n  \"episodes\": [\n    {\n      \"title\": \"Pilot\",\n      \"season\": 1,\n      \"episode\": 1\n    },\n    {\n      \"title\": \"Orbit\",\n      \"season\": 1,\n      \"episode\": 2\n    }\n  ]\n}\n\u2026\n{\n  \"movies\": [\n    \"The Matrix\"\n  ],\n  \"episodes\": [\n      \"title\": \"Pilot\",\n      \"season\": 1,\n      \"episode\": 1\n    },\n\u2026\n{\n  \"movies\": [\n    \"The Matrix\"\n  ],\n  \"episodes\": [\n      \"title\": \"Pilot\",\n      \"season\": 1,\n      \"episode\": 1\n    },\n      \"title\": \"Orbit\",\n      \"episode\": 2\n    }\n  ]"
+  }
+]

@@ -79,6 +79,14 @@ def _noop_light_job(ctx: RunnerContext, payload: Dict[str, Any], checkpoint: Dic
     return None
 
 
+def _tests_gate_precondition(ctx: RunnerContext, payload: Dict[str, Any]) -> Optional[str]:
+    try:
+        from tests.api import orchestrator_gate_reason
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+    return orchestrator_gate_reason(ctx.settings, working_dir=ctx.working_dir)
+
+
 def build_default_registry() -> JobRegistry:
     registry = JobRegistry()
 
@@ -89,6 +97,7 @@ def build_default_registry() -> JobRegistry:
             runner=_ensure_vectors_index,
             estimate_vram=lambda payload: int(payload.get("vram_hint_mb", 4096)),
             estimate_runtime=lambda payload: int(payload.get("estimate_s", 300)),
+            preconditions=_tests_gate_precondition,
         )
     )
 
@@ -99,6 +108,7 @@ def build_default_registry() -> JobRegistry:
             runner=_assistant_warmup,
             estimate_vram=lambda payload: 2048,
             estimate_runtime=lambda payload: 60,
+            preconditions=_tests_gate_precondition,
         )
     )
 
@@ -109,6 +119,7 @@ def build_default_registry() -> JobRegistry:
             runner=_noop_light_job,
             estimate_vram=lambda payload: int(payload.get("vram_hint_mb", 6144)),
             estimate_runtime=lambda payload: int(payload.get("estimate_s", 600)),
+            preconditions=_tests_gate_precondition,
         )
     )
 
@@ -119,6 +130,7 @@ def build_default_registry() -> JobRegistry:
             runner=_noop_light_job,
             estimate_vram=lambda payload: int(payload.get("vram_hint_mb", 4096)),
             estimate_runtime=lambda payload: int(payload.get("estimate_s", 900)),
+            preconditions=_tests_gate_precondition,
         )
     )
 
