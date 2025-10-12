@@ -42,16 +42,61 @@ function Invoke-PipInstall {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$PythonExe,
-        [string]$PipExe
+        [string]$PipExe,
+        [string]$LogFile
     )
 
+    $commandPath = $null
+    $commandArgs = @()
     if ($PipExe) {
-        & $PipExe @Arguments
+        $commandPath = $PipExe
+        $commandArgs = $Arguments
     } else {
-        & $PythonExe -m pip @Arguments
+        $commandPath = $PythonExe
+        $commandArgs = @('-m', 'pip') + $Arguments
+    }
+
+    if ($LogFile) {
+        $logDirectory = Split-Path -Parent $LogFile
+        if ($logDirectory -and -not (Test-Path $logDirectory)) {
+            New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+        }
+
+        $timestamp = Get-Date -Format o
+        $commandLine = "\"$commandPath\" $($commandArgs -join ' ')"
+        Add-Content -Path $LogFile -Value "[$timestamp] COMMAND: $commandLine" -Encoding UTF8
+        try {
+            & $commandPath @commandArgs 2>&1 | Tee-Object -FilePath $LogFile -Append
+        } catch {
+            $errorMessage = $_.Exception.Message
+            Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] ERROR: $errorMessage" -Encoding UTF8
+            throw
+        } finally {
+            Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] EXIT CODE: $LASTEXITCODE" -Encoding UTF8
+            Add-Content -Path $LogFile -Value '' -Encoding UTF8
+        }
+    } else {
+        & $commandPath @commandArgs
     }
 
     return $LASTEXITCODE
+}
+
+function Write-PipLogTail {
+    param(
+        [Parameter(Mandatory = $true)][string]$LogFile,
+        [int]$Lines = 20
+    )
+
+    if (-not (Test-Path $LogFile)) {
+        Write-Warn "Pip log $LogFile not found."
+        return
+    }
+
+    Write-Warn "Last $Lines lines from pip log ($LogFile):"
+    Get-Content -Path $LogFile -Tail $Lines -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "        $_" -ForegroundColor Yellow
+    }
 }
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -85,6 +130,15 @@ try {
     Start-Transcript -Path $LauncherLog -Append | Out-Null
 } catch {
     Write-Warn "Failed to start transcript at ${LauncherLog}: $($_.Exception.Message)"
+}
+
+$pipLog = Join-Path $logs "pip_${launcherStamp}.log"
+try {
+    "VideoCatalog pip session log started $(Get-Date -Format o)" | Set-Content -Path $pipLog -Encoding UTF8
+    Write-Info "Pip output will be logged to $pipLog"
+} catch {
+    Write-Warn "Unable to initialize pip log at $pipLog: $($_.Exception.Message)"
+    $pipLog = $null
 }
 
 foreach ($bootstrap in 'start_videocatalog.bat', 'start_videocatalog.ps1') {
@@ -249,9 +303,10 @@ try {
 
     Write-Info 'Upgrading pip, setuptools, and wheel in the virtual environment.'
     $bootstrapArgs = @('install', '--upgrade', 'pip', 'setuptools', 'wheel')
-    $bootstrapExit = Invoke-PipInstall -Arguments $bootstrapArgs -PythonExe $pythonExe -PipExe $pipExe
+    $bootstrapExit = Invoke-PipInstall -Arguments $bootstrapArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
     if ($bootstrapExit -ne 0) {
-        Write-Warn 'Failed to upgrade pip/setuptools/wheel. Continuing with existing versions.'
+        $logHint = if ($pipLog) { " Review pip log at $pipLog." } else { '' }
+        Write-Warn "Failed to upgrade pip/setuptools/wheel (exit code $bootstrapExit). Continuing with existing versions.$logHint"
     } else {
         if (-not $pipExe -and (Test-Path $venvPip)) {
             $pipExe = $venvPip
@@ -268,9 +323,16 @@ try {
         Write-Warn 'uvicorn not found, installing required Python packages.'
         Write-Info "Installing dependencies from $requirementsPath"
         $baseInstallArgs = @('install', '--upgrade', '-r', $requirementsPath)
-        $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe
+        $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
         if ($exitCode -ne 0) {
-            throw 'Dependency installation failed.'
+            if ($pipLog) {
+                Write-PipLogTail -LogFile $pipLog -Lines 40
+            }
+            $message = 'Dependency installation failed.'
+            if ($pipLog) {
+                $message += " Review pip log at $pipLog for details."
+            }
+            throw $message
         }
 
         $pyVersionText = (& $pythonExe -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")').Trim()
@@ -314,17 +376,28 @@ try {
             }
             $args += $package.Requirement
             Write-Info "Installing optional dependency $($package.Name)"
-            $result = Invoke-PipInstall -Arguments $args -PythonExe $pythonExe -PipExe $pipExe
+            $result = Invoke-PipInstall -Arguments $args -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
             if ($result -eq 0) {
                 Write-Info "Optional dependency $($package.Name) installed."
                 continue
             }
 
-            Write-Warn "Unable to install optional dependency $($package.Name). $($package.FailureMessage)"
+            $optionalFailure = $package.FailureMessage
+            if ($pipLog) {
+                $optionalFailure = "$optionalFailure See pip log at $pipLog."
+            }
+            Write-Warn "Unable to install optional dependency $($package.Name). $optionalFailure"
         }
 
         if (-not (Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn')) {
-            throw 'uvicorn is still unavailable after installation.'
+            if ($pipLog) {
+                Write-PipLogTail -LogFile $pipLog -Lines 40
+            }
+            $uvicornMessage = 'uvicorn is still unavailable after installation.'
+            if ($pipLog) {
+                $uvicornMessage += " Review pip log at $pipLog for details."
+            }
+            throw $uvicornMessage
         }
     } else {
         Write-Info 'uvicorn module available.'
@@ -493,7 +566,11 @@ print(json.dumps(payload))
     }
 
 } catch {
-    Write-Err $_.Exception.Message
+    $errorText = if ($_.Exception) { $_.Exception.ToString() } else { $_.ToString() }
+    Write-Err $errorText
+    if ($pipLog) {
+        Write-Info "Pip log for this session: $pipLog"
+    }
     Write-Err "Launcher log captured at $LauncherLog"
     if ($exitCode -eq 0) { $exitCode = 1 }
 } finally {
