@@ -7,167 +7,220 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Info {
     param([string]$Message)
-    Write-Host $Message -ForegroundColor Cyan
+    Write-Host "[INFO ] $Message" -ForegroundColor Cyan
 }
 
 function Write-Warn {
     param([string]$Message)
-    Write-Host $Message -ForegroundColor Yellow
+    Write-Host "[WARN ] $Message" -ForegroundColor Yellow
 }
 
 function Write-Err {
     param([string]$Message)
-    Write-Host $Message -ForegroundColor Red
+    Write-Host "[ERROR] $Message" -ForegroundColor Red
 }
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$projectRoot = Resolve-Path (Join-Path $scriptRoot '..')
-Set-Location $projectRoot
-
-Write-Info "VideoCatalog A2.0 launcher"
+$root = Resolve-Path (Join-Path $scriptRoot '..')
+Set-Location $root
 
 if (-not $env:USERPROFILE) {
-    Write-Err "USERPROFILE environment variable is not set."
+    Write-Err 'USERPROFILE environment variable is not set.'
     exit 2
 }
 
-$workingDir = Join-Path $env:USERPROFILE 'VideoCatalog'
+$work = Join-Path $env:USERPROFILE 'VideoCatalog'
+$logs = Join-Path $work 'logs'
 $directories = @(
-    $workingDir,
-    (Join-Path $workingDir 'data'),
-    (Join-Path $workingDir 'logs'),
-    (Join-Path $workingDir 'exports'),
-    (Join-Path $workingDir 'backups'),
-    (Join-Path $workingDir 'vectors')
+    $work,
+    (Join-Path $work 'data'),
+    $logs,
+    (Join-Path $work 'exports'),
+    (Join-Path $work 'backups'),
+    (Join-Path $work 'vectors')
 )
 foreach ($dir in $directories) {
     if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir | Out-Null
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
 }
 
-$settingsSource = Join-Path $projectRoot 'settings.json'
-$userSettingsPath = Join-Path $workingDir 'settings.json'
-if (-not (Test-Path $userSettingsPath)) {
-    if (Test-Path $settingsSource) {
-        Copy-Item -Path $settingsSource -Destination $userSettingsPath -Force
-    } else {
-        '{}' | Set-Content -Path $userSettingsPath -Encoding UTF8
+$launcherStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$LauncherLog = Join-Path $logs "launcher_$launcherStamp.log"
+try {
+    Start-Transcript -Path $LauncherLog -Append | Out-Null
+} catch {
+    Write-Warn "Failed to start transcript at $LauncherLog: $($_.Exception.Message)"
+}
+
+foreach ($bootstrap in 'start_videocatalog.bat', 'start_videocatalog.ps1') {
+    $bootstrapPath = Join-Path $scriptRoot $bootstrap
+    if (Test-Path $bootstrapPath) {
+        try {
+            Unblock-File -Path $bootstrapPath -ErrorAction Stop
+        } catch {
+            Write-Warn "Unable to unblock $bootstrapPath: $($_.Exception.Message)"
+        }
     }
 }
 
-try {
-    $settingsRaw = Get-Content -Path $userSettingsPath -Raw -Encoding UTF8
-} catch {
-    $settingsRaw = '{}'
-}
+Write-Info 'VideoCatalog A2.0 launcher'
+
+$orchProcess = $null
+$webProcess = $null
+$exitCode = 0
 
 try {
-    $settings = $settingsRaw | ConvertFrom-Json
-} catch {
-    Write-Warn "settings.json is invalid JSON. Recreating defaults."
-    $settings = New-Object PSObject
-}
+    $workFull = [System.IO.Path]::GetFullPath($work)
+    $settingsSource = Join-Path $root 'settings.json'
+    $userSettingsPath = Join-Path $work 'settings.json'
+    if (-not (Test-Path $userSettingsPath)) {
+        if (Test-Path $settingsSource) {
+            Copy-Item -Path $settingsSource -Destination $userSettingsPath -Force
+            Write-Info "Copied default settings to $userSettingsPath"
+        } else {
+            '{}' | Set-Content -Path $userSettingsPath -Encoding UTF8
+            Write-Warn 'Default settings template missing. Created empty settings.json.'
+        }
+    }
 
-if (-not ($settings | Get-Member -Name 'server' -ErrorAction SilentlyContinue)) {
-    $settings | Add-Member -NotePropertyName 'server' -NotePropertyValue ([pscustomobject]@{})
-}
-$serverSettings = $settings.server
-if ($null -eq $serverSettings -or -not ($serverSettings -is [psobject])) {
-    $serverSettings = [pscustomobject]@{}
-    $settings.server = $serverSettings
-}
-$serverSettings.host = '127.0.0.1'
-$serverSettings.port = 27182
-$serverSettings.lan_refuse = $true
-
-if (-not ($settings | Get-Member -Name 'catalog_db' -ErrorAction SilentlyContinue)) {
-    $settings | Add-Member -NotePropertyName 'catalog_db' -NotePropertyValue ''
-}
-$catalogDbPath = Join-Path $workingDir 'catalog.db'
-$targetCatalog = [System.IO.Path]::GetFullPath($catalogDbPath)
-$needsCatalogUpdate = $true
-$existingCatalog = [string]$settings.catalog_db
-if (-not [string]::IsNullOrWhiteSpace($existingCatalog)) {
-    $expandedCatalog = [Environment]::ExpandEnvironmentVariables($existingCatalog)
     try {
-        $resolvedExisting = [System.IO.Path]::GetFullPath($expandedCatalog)
+        $settingsRaw = Get-Content -Path $userSettingsPath -Raw -Encoding UTF8
     } catch {
-        $resolvedExisting = $expandedCatalog
+        Write-Warn "Unable to read $userSettingsPath, using defaults."
+        $settingsRaw = '{}'
     }
-    if ($resolvedExisting.Trim().ToLowerInvariant() -eq $targetCatalog.Trim().ToLowerInvariant()) {
-        $needsCatalogUpdate = $false
+
+    try {
+        $settings = $settingsRaw | ConvertFrom-Json -Depth 100
+    } catch {
+        Write-Warn 'settings.json is invalid JSON. Recreating defaults.'
+        $settings = [pscustomobject]@{}
     }
-}
-if ($needsCatalogUpdate) {
-    $settings.catalog_db = $targetCatalog
-}
 
-if (-not ($settings | Get-Member -Name 'working_dir' -ErrorAction SilentlyContinue)) {
-    $settings | Add-Member -NotePropertyName 'working_dir' -NotePropertyValue $workingDir
-} else {
-    $settings.working_dir = $workingDir
-}
-
-$updatedJson = $settings | ConvertTo-Json -Depth 100
-[System.IO.File]::WriteAllText($userSettingsPath, $updatedJson + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
-
-foreach ($suffix in @('catalog.db-wal', 'catalog.db-shm')) {
-    $path = Join-Path $projectRoot $suffix
-    if (Test-Path $path) {
-        Remove-Item -Path $path -Force -ErrorAction SilentlyContinue
+    if (-not $settings) {
+        $settings = [pscustomobject]@{}
     }
-}
 
-$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pythonCmd) {
-    Write-Err 'Python executable not found on PATH.'
-    exit 3
-}
-$pythonExe = $pythonCmd.Source
-if (-not $pythonExe) { $pythonExe = $pythonCmd.Path }
-if (-not $pythonExe) { $pythonExe = $pythonCmd.Definition }
-
-$pipCmd = Get-Command pip -ErrorAction SilentlyContinue
-if ($pipCmd) {
-    $pipExe = $pipCmd.Source
-    if (-not $pipExe) { $pipExe = $pipCmd.Path }
-    if (-not $pipExe) { $pipExe = $pipCmd.Definition }
-} else {
-    Write-Warn 'pip executable not found on PATH. Falling back to python -m pip.'
-    $pipExe = $null
-}
-
-$env:VIDEOCATALOG_HOME = $workingDir
-
-$uvicornCheck = & $pythonExe -c "import uvicorn" 2>$null
-if ($LASTEXITCODE -ne 0) {
-    $requirementsPath = Join-Path $projectRoot 'requirements-windows.txt'
-    if (-not (Test-Path $requirementsPath)) {
-        $requirementsPath = Join-Path $projectRoot 'requirements.txt'
+    if (-not ($settings | Get-Member -Name 'server' -ErrorAction SilentlyContinue)) {
+        $settings | Add-Member -NotePropertyName 'server' -NotePropertyValue ([pscustomobject]@{})
     }
-    Write-Info "Installing Python dependencies from $requirementsPath"
-    if ($pipExe) {
-        & $pipExe install -r $requirementsPath
+    $settings.server = if ($settings.server -is [psobject]) { $settings.server } else { [pscustomobject]@{} }
+    if ($settings.server.host -ne '127.0.0.1') {
+        Write-Warn "server.host set to '$($settings.server.host)'; forcing to 127.0.0.1"
+    }
+    $settings.server.host = '127.0.0.1'
+    if (-not $settings.server.port) { $settings.server | Add-Member -NotePropertyName 'port' -NotePropertyValue 27182 -Force }
+    $settings.server.port = 27182
+    if ($settings.server.lan_refuse -ne $true) {
+        Write-Warn 'server.lan_refuse forced to true to prevent LAN exposure.'
+    }
+    $settings.server.lan_refuse = $true
+
+    if (-not ($settings | Get-Member -Name 'catalog_db' -ErrorAction SilentlyContinue)) {
+        $settings | Add-Member -NotePropertyName 'catalog_db' -NotePropertyValue ''
+    }
+    $catalogTarget = Join-Path $workFull 'catalog.db'
+    $existingCatalog = [string]$settings.catalog_db
+    $resolvedCatalog = $catalogTarget
+    if (-not [string]::IsNullOrWhiteSpace($existingCatalog)) {
+        $expandedCatalog = [Environment]::ExpandEnvironmentVariables($existingCatalog)
+        try {
+            $resolvedCatalog = [System.IO.Path]::GetFullPath($expandedCatalog)
+        } catch {
+            Write-Warn "Unable to resolve catalog_db '$existingCatalog', defaulting to $catalogTarget"
+            $resolvedCatalog = $catalogTarget
+        }
+    }
+    if (-not ($resolvedCatalog.StartsWith($workFull, [System.StringComparison]::OrdinalIgnoreCase))) {
+        Write-Warn "catalog_db path '$resolvedCatalog' is outside $workFull. Resetting."
+        $resolvedCatalog = $catalogTarget
+    }
+    $settings.catalog_db = $resolvedCatalog
+
+    if (-not ($settings | Get-Member -Name 'working_dir' -ErrorAction SilentlyContinue)) {
+        $settings | Add-Member -NotePropertyName 'working_dir' -NotePropertyValue $workFull
+    }
+    $settings.working_dir = $workFull
+
+    $updatedJson = $settings | ConvertTo-Json -Depth 100
+    [System.IO.File]::WriteAllText($userSettingsPath, $updatedJson + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
+    Write-Info "Settings written to $userSettingsPath"
+
+    foreach ($suffix in @('catalog.db-wal', 'catalog.db-shm')) {
+        $path = Join-Path $root $suffix
+        if (Test-Path $path) {
+            Remove-Item -Path $path -Force -ErrorAction SilentlyContinue
+            Write-Warn "Removed stray $suffix from repository root."
+        }
+    }
+
+    $cutoff = (Get-Date).AddDays(-14)
+    Get-ChildItem -Path $logs -Filter '*.log' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $cutoff } |
+        ForEach-Object {
+            Write-Info "Rotating old launcher log $($_.FullName)"
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) {
+        throw 'Python executable not found on PATH.'
+    }
+    $pythonExe = $pythonCmd.Source
+    if (-not $pythonExe) { $pythonExe = $pythonCmd.Path }
+    if (-not $pythonExe) { $pythonExe = $pythonCmd.Definition }
+    Write-Info "Python detected at $pythonExe"
+
+    $pipCmd = Get-Command pip -ErrorAction SilentlyContinue
+    if ($pipCmd) {
+        $pipExe = $pipCmd.Source
+        if (-not $pipExe) { $pipExe = $pipCmd.Path }
+        if (-not $pipExe) { $pipExe = $pipCmd.Definition }
+        Write-Info "pip detected at $pipExe"
+    } else {
+        Write-Warn 'pip executable not found on PATH. Falling back to python -m pip.'
+        $pipExe = $null
+    }
+
+    $env:VIDEOCATALOG_HOME = $workFull
+    $env:PYTHONUNBUFFERED = '1'
+
+    & $pythonExe -c "import uvicorn" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $requirementsPath = Join-Path $root 'requirements-windows.txt'
+        if (-not (Test-Path $requirementsPath)) {
+            $requirementsPath = Join-Path $root 'requirements.txt'
+        }
+        Write-Warn 'uvicorn not found, installing required Python packages.'
+        Write-Info "Installing dependencies from $requirementsPath"
+        if ($pipExe) {
+            & $pipExe install -r $requirementsPath
+        } else {
+            & $pythonExe -m pip install -r $requirementsPath
+        }
         if ($LASTEXITCODE -ne 0) {
-            Write-Err 'pip install failed.'
-            exit 4
+            throw 'Dependency installation failed.'
+        }
+        & $pythonExe -c "import uvicorn" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw 'uvicorn is still unavailable after installation.'
         }
     } else {
-        & $pythonExe -m pip install -r $requirementsPath
-        if ($LASTEXITCODE -ne 0) {
-            Write-Err 'python -m pip install failed.'
-            exit 4
-        }
+        Write-Info 'uvicorn module available.'
     }
-}
 
-if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
-    Write-Warn 'ffprobe not found on PATH. Quality headers will be disabled until installed.'
-}
+    if (Get-Command ffprobe -ErrorAction SilentlyContinue) {
+        Write-Info 'ffprobe detected on PATH.'
+    } else {
+        Write-Warn 'ffprobe not found on PATH. Media inspection will be degraded.'
+    }
 
-$tempProbe = [System.IO.Path]::GetTempFileName()
-$probeScript = @"
+    $gpuSummary = 'not probed'
+    $tempProbe = $null
+    try {
+        $tempProbe = [System.IO.Path]::GetTempFileName()
+        $probeScript = @"
 from pathlib import Path
 import json
 from orchestrator.gpu import GPUManager
@@ -175,7 +228,7 @@ from orchestrator.logs import OrchestratorLogger
 from core.settings import load_settings
 from core.paths import ensure_working_dir_structure
 
-working_dir = Path(r'$workingDir')
+working_dir = Path(r'$workFull')
 ensure_working_dir_structure(working_dir)
 settings = load_settings(working_dir)
 orch_cfg = dict(settings.get('orchestrator', {}))
@@ -198,165 +251,141 @@ payload = {
 }
 print(json.dumps(payload))
 "@
-[System.IO.File]::WriteAllText($tempProbe, $probeScript, [System.Text.Encoding]::UTF8)
-$gpuProbeOutput = & $pythonExe $tempProbe
-$gpuStatus = $null
-if ($LASTEXITCODE -eq 0 -and $gpuProbeOutput) {
-    try {
-        $gpuStatus = $gpuProbeOutput | ConvertFrom-Json
-    } catch {
-        $gpuStatus = $null
-    }
-}
-Remove-Item -Path $tempProbe -Force -ErrorAction SilentlyContinue
-
-if ($gpuStatus -and $gpuStatus.ok) {
-    $gpuSummary = "ready ($($gpuStatus.name) - free $($gpuStatus.free_mb) MB of $($gpuStatus.total_mb) MB)"
-} elseif ($gpuStatus -and $gpuStatus.present) {
-    $gpuSummary = "not-ready (GPU present but gated: $($gpuStatus.reason))"
-} elseif ($gpuStatus) {
-    $gpuSummary = "not-ready ($($gpuStatus.reason))"
-} else {
-    $gpuSummary = 'not-ready (probe failed)'
-}
-
-Write-Info "GPU status: $gpuSummary"
-
-function New-Process {
-    param(
-        [string]$FilePath,
-        [string[]]$Arguments,
-        [string]$Name,
-        [System.Collections.Generic.Dictionary[string, object]]$Handlers,
-        [System.Threading.ManualResetEvent]$ReadyEvent = $null,
-        [string[]]$ReadyPatterns = $null
-    )
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FilePath
-    $psi.Arguments = ($Arguments | ForEach-Object {
-        if ($_ -match '[\s\"]') {
-            '"' + ($_ -replace '"', '\"') + '"'
+        [System.IO.File]::WriteAllText($tempProbe, $probeScript, [System.Text.Encoding]::UTF8)
+        $gpuProbeOutput = & $pythonExe $tempProbe
+        if ($LASTEXITCODE -eq 0 -and $gpuProbeOutput) {
+            try {
+                $gpuStatus = $gpuProbeOutput | ConvertFrom-Json
+            } catch {
+                $gpuStatus = $null
+            }
+            if ($gpuStatus -and $gpuStatus.ok) {
+                $gpuSummary = "ready ($($gpuStatus.name) - free $($gpuStatus.free_mb) MB of $($gpuStatus.total_mb) MB)"
+            } elseif ($gpuStatus -and $gpuStatus.present) {
+                $gpuSummary = "not-ready (present but gated: $($gpuStatus.reason))"
+            } elseif ($gpuStatus) {
+                $gpuSummary = "not-ready ($($gpuStatus.reason))"
+            } else {
+                $gpuSummary = 'not-ready (probe parse failed)'
+            }
         } else {
-            $_
+            $gpuSummary = 'not-ready (probe failed)'
         }
-    }) -join ' '
-    $psi.WorkingDirectory = $projectRoot
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    $psi.EnvironmentVariables['VIDEOCATALOG_HOME'] = $workingDir
-    $psi.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $psi
-    $process.EnableRaisingEvents = $true
-    if (-not $process.Start()) {
-        throw "Failed to start $Name process."
+    } finally {
+        if ($tempProbe -and (Test-Path $tempProbe)) {
+            Remove-Item -Path $tempProbe -Force -ErrorAction SilentlyContinue
+        }
     }
+    Write-Info "GPU status: $gpuSummary"
 
-    $stdoutHandler = [System.Diagnostics.DataReceivedEventHandler]{
-        param($sender, $args)
-        if ([string]::IsNullOrWhiteSpace($args.Data)) { return }
-        Write-Host "[$Name] $($args.Data)"
-        if ($ReadyEvent -and $ReadyPatterns) {
-            foreach ($pattern in $ReadyPatterns) {
-                if ($args.Data -like $pattern) {
-                    $ReadyEvent.Set() | Out-Null
-                    break
-                }
+    $orchLogStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $OrchLog = Join-Path $logs "orchestrator_$orchLogStamp.log"
+    $WebLog = Join-Path $logs "web_$orchLogStamp.log"
+
+    $orchProcess = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'orchestrator.scheduler', '--working-dir', $workFull) -WorkingDirectory $root -RedirectStandardOutput $OrchLog -RedirectStandardError $OrchLog -NoNewWindow -PassThru
+    Write-Info "Orchestrator starting (PID $($orchProcess.Id)) logging to $OrchLog"
+
+    $orchReady = $false
+    $orchStart = Get-Date
+    while (-not $orchReady -and -not $orchProcess.HasExited) {
+        if ((Get-Date) - $orchStart -gt [TimeSpan]::FromSeconds(20)) {
+            break
+        }
+        if (Test-Path $OrchLog) {
+            $recent = Get-Content -Path $OrchLog -Tail 40 -ErrorAction SilentlyContinue
+            if ($recent -and ($recent -match 'ORCH_HEARTBEAT')) {
+                $orchReady = $true
+                break
             }
         }
-    }
-    $stderrHandler = [System.Diagnostics.DataReceivedEventHandler]{
-        param($sender, $args)
-        if ([string]::IsNullOrWhiteSpace($args.Data)) { return }
-        Write-Host "[$Name] $($args.Data)" -ForegroundColor DarkYellow
+        Start-Sleep -Milliseconds 500
     }
 
-    $process.add_OutputDataReceived($stdoutHandler)
-    $process.add_ErrorDataReceived($stderrHandler)
-    $process.BeginOutputReadLine()
-    $process.BeginErrorReadLine()
-
-    $Handlers[$Name] = @{ Output = $stdoutHandler; Error = $stderrHandler; Process = $process }
-    return $process
-}
-
-$handlers = New-Object 'System.Collections.Generic.Dictionary[string, object]'
-$orchReady = New-Object System.Threading.ManualResetEvent($false)
-$orchProcess = New-Process -FilePath $pythonExe -Arguments @('-m', 'orchestrator.scheduler', '--working-dir', $workingDir) -Name 'orchestrator' -Handlers $handlers -ReadyEvent $orchReady -ReadyPatterns @('ORCH_HEARTBEAT ready*')
-
-if (-not $orchReady.WaitOne(20000)) {
-    if ($orchProcess.HasExited) {
-        Write-Err "Orchestrator exited early with code $($orchProcess.ExitCode)."
-    } else {
-        Write-Err 'Orchestrator failed to report ready within 20 seconds.'
-        $orchProcess.Kill()
+    if (-not $orchReady) {
+        if ($orchProcess.HasExited) {
+            throw "Orchestrator exited early with code $($orchProcess.ExitCode)."
+        }
+        throw 'Orchestrator failed to emit heartbeat within 20 seconds.'
     }
-    exit 5
-}
 
-Write-Info "Orchestrator running (PID $($orchProcess.Id))"
+    Write-Info 'Orchestrator heartbeat detected.'
 
-$webReady = New-Object System.Threading.ManualResetEvent($false)
-$webProcess = New-Process -FilePath $pythonExe -Arguments @('-m', 'videocatalog_api', '--host', '127.0.0.1', '--port', '27182') -Name 'web' -Handlers $handlers -ReadyEvent $webReady -ReadyPatterns @('*Application startup complete*', '*Uvicorn running on http://127.0.0.1:27182*', '*API listening on http://127.0.0.1:27182*')
+    $webProcess = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'videocatalog_api', '--host', '127.0.0.1', '--port', '27182') -WorkingDirectory $root -RedirectStandardOutput $WebLog -RedirectStandardError $WebLog -NoNewWindow -PassThru
+    Write-Info "Web server starting (PID $($webProcess.Id)) logging to $WebLog"
 
-if (-not $webReady.WaitOne(25000)) {
-    if ($webProcess.HasExited) {
-        Write-Err "Web server exited early with code $($webProcess.ExitCode)."
-    } else {
-        Write-Err 'Web server failed to start within 25 seconds.'
-        $webProcess.Kill()
+    $webReady = $false
+    $webStart = Get-Date
+    while (-not $webReady -and -not $webProcess.HasExited) {
+        if ((Get-Date) - $webStart -gt [TimeSpan]::FromSeconds(25)) {
+            break
+        }
+        if (Test-Path $WebLog) {
+            $recentWeb = Get-Content -Path $WebLog -Tail 40 -ErrorAction SilentlyContinue
+            if ($recentWeb -and ($recentWeb -match 'Application startup complete' -or $recentWeb -match 'Uvicorn running on http://127.0.0.1:27182')) {
+                $webReady = $true
+                break
+            }
+        }
+        Start-Sleep -Milliseconds 500
     }
-    if (-not $orchProcess.HasExited) { $orchProcess.Kill() }
-    exit 6
-}
 
-Write-Info "Web UI available at http://127.0.0.1:27182"
-
-if (-not $NoBrowser) {
-    try {
-        Start-Process 'http://127.0.0.1:27182' | Out-Null
-    } catch {
-        Write-Warn 'Failed to launch browser automatically.'
+    if (-not $webReady) {
+        if ($webProcess.HasExited) {
+            throw "Web server exited early with code $($webProcess.ExitCode)."
+        }
+        throw 'Web server failed to report ready within 25 seconds.'
     }
-}
 
-Write-Host ''
-Write-Info 'Summary:'
-Write-Host "  GPU: $gpuSummary"
-Write-Host "  Orchestrator: running (PID $($orchProcess.Id))"
-Write-Host '  Web: http://127.0.0.1:27182 (WS/SSE enabled)'
-Write-Host ''
-Write-Host 'Press Ctrl+C to stop both services.'
+    Write-Info 'Web server reported ready. Performing readiness check...'
+    Start-Sleep -Seconds 2
 
-$exitCode = 0
-try {
+    $webUri = 'http://127.0.0.1:27182'
+    if (-not $NoBrowser) {
+        try {
+            Start-Process $webUri | Out-Null
+            Write-Info 'Opened default browser.'
+        } catch {
+            Write-Warn 'Failed to launch browser automatically.'
+        }
+    }
+
+    Write-Info 'Services running. Press Ctrl+C to stop.'
+    Write-Info "  GPU: $gpuSummary"
+    Write-Info "  Orchestrator log: $OrchLog"
+    Write-Info "  Web log: $WebLog"
+
     while ($true) {
         if ($orchProcess.HasExited) {
-            $exitCode = $orchProcess.ExitCode
-            Write-Err "Orchestrator exited with code $exitCode"
+            $exitCode = if ($orchProcess.ExitCode -ne 0) { $orchProcess.ExitCode } else { 0 }
+            Write-Err "Orchestrator exited with code $($orchProcess.ExitCode)"
             break
         }
         if ($webProcess.HasExited) {
-            $exitCode = $webProcess.ExitCode
-            Write-Err "Web server exited with code $exitCode"
+            $exitCode = if ($webProcess.ExitCode -ne 0) { $webProcess.ExitCode } else { 0 }
+            Write-Err "Web server exited with code $($webProcess.ExitCode)"
             break
         }
         Start-Sleep -Seconds 1
     }
+
+} catch {
+    Write-Err $_.Exception.Message
+    Write-Err "Launcher log captured at $LauncherLog"
+    if ($exitCode -eq 0) { $exitCode = 1 }
 } finally {
-    foreach ($entry in $handlers.Values) {
-        $proc = $entry['Process']
+    foreach ($proc in @($webProcess, $orchProcess)) {
         if ($proc -and -not $proc.HasExited) {
-            try { $proc.Kill() } catch {}
+            try {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Warn "Failed to stop process $($proc.Id): $($_.Exception.Message)"
+            }
         }
-        $outputHandler = $entry['Output']
-        if ($proc) { $proc.remove_OutputDataReceived($outputHandler) }
-        $errorHandler = $entry['Error']
-        if ($proc) { $proc.remove_ErrorDataReceived($errorHandler) }
+    }
+    try {
+        Stop-Transcript | Out-Null
+    } catch {
+        # ignore transcript stop failures
     }
 }
 
