@@ -60,6 +60,18 @@
     "lease_ttl_s": 120,
     "heartbeat_s": 5
   },
+  "backup": {
+    "enable": true,
+    "schedule_cron": "0 3 * * *",
+    "include_vectors": false,
+    "include_thumbs": false,
+    "retention": {
+      "keep_last": 10,
+      "keep_daily": 14,
+      "keep_weekly": 8,
+      "max_total_gb": 50
+    }
+  },
   "fingerprints": {
     "enable_video_tmk": false,
     "enable_audio_chroma": false,
@@ -87,8 +99,39 @@
     "default_limit": 100,
     "max_page_size": 500
   },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8756,
+    "lan_refuse": true
+  },
+  "apiguard": {
+    "mode": "on",
+    "ttl": {
+      "tmdb": 86400,
+      "opensubtitles": 43200,
+      "imdb": 604800
+    },
+    "max_retries": 3,
+    "retry_base_ms": 250,
+    "retry_jitter_ms": 150,
+    "concurrency": {
+      "tmdb": 2,
+      "opensubtitles": 1,
+      "imdb": 1
+    },
+    "budget_per_run": {
+      "tmdb": 200,
+      "opensubtitles": 120,
+      "imdb": 80
+    },
+    "respect_rate_headers": true,
+    "circuit": {
+      "error_threshold": 8,
+      "cooldown_s": 60
+    }
+  },
   "assistant": {
-    "enable": false,
+    "enable": true,
     "runtime": "auto",
     "model": "qwen2.5:7b-instruct",
     "ctx": 8192,
@@ -121,7 +164,15 @@
     "report_formats": [
       "markdown",
       "junit"
-    ]
+    ],
+    "webmon": {
+      "enable": true,
+      "smoke": true,
+      "latency_targets_ms": {
+        "p50": 800,
+        "p95": 1600
+      }
+    }
   },
   "assistant_dashboard": {
     "enable": true,

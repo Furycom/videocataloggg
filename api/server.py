@@ -105,6 +105,43 @@ class APIServerConfig:
     cors_origins: Sequence[str]
     app_version: str = "dev"
     vector_inline_dim: int = 2048
+    lan_only: bool = True
+
+
+_LOCAL_CLIENT_SENTINELS = {
+    "127.0.0.1",
+    "::1",
+    "localhost",
+    "testclient",
+}
+
+
+def _normalise_remote_host(host: Optional[str]) -> Optional[str]:
+    if host is None:
+        return None
+    value = host.strip().lower()
+    if not value:
+        return None
+    if value.startswith("::ffff:"):
+        value = value.rsplit(":", 1)[-1]
+        if value.startswith("::ffff:"):
+            value = value.split("::ffff:")[-1]
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    if "%" in value:  # strip IPv6 scope id
+        value = value.split("%", 1)[0]
+    return value
+
+
+def _is_loopback_host(host: Optional[str]) -> bool:
+    value = _normalise_remote_host(host)
+    if value is None:
+        return True
+    if value in _LOCAL_CLIENT_SENTINELS:
+        return True
+    if value.startswith("127."):
+        return True
+    return False
 
 
 def create_app(config: APIServerConfig) -> FastAPI:
@@ -135,6 +172,7 @@ def create_app(config: APIServerConfig) -> FastAPI:
     event_broker = CatalogEventBroker(data, monitor=web_monitor)
     vector_worker = VectorRefreshWorker(data, orchestrator=orchestrator_service)
     assistant_gateway = AssistantGateway(data)
+    lan_only = bool(config.lan_only)
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -154,14 +192,19 @@ def create_app(config: APIServerConfig) -> FastAPI:
     @app.middleware("http")
     async def log_requests(request: Request, call_next):  # type: ignore[override]
         start = time.perf_counter()
-        response = None
+        response: Optional[Response] = None
+        client_host = request.client.host if request.client else None
         try:
-            response = await call_next(request)
+            if lan_only and not _is_loopback_host(client_host):
+                LOGGER.warning("Rejected non-local HTTP request from %s", client_host or "<unknown>")
+                response = JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content={"error": "LAN access disabled"})
+            else:
+                response = await call_next(request)
             return response
         finally:
             duration_ms = (time.perf_counter() - start) * 1000
             status_code = response.status_code if response is not None else 500
-            client = request.client.host if request.client else "-"
+            client = client_host or "-"
             LOGGER.info(
                 "%s %s -> %s (%.1f ms) ip=%s",
                 request.method,
@@ -285,6 +328,10 @@ def create_app(config: APIServerConfig) -> FastAPI:
         provided = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
         if not expected_key or not provided or provided.strip() != expected_key:
             await websocket.close(code=4401)
+            return
+        if lan_only and not _is_loopback_host(websocket.client.host if websocket.client else None):
+            LOGGER.warning("Rejected non-local WebSocket connection from %s", (websocket.client.host if websocket.client else "<unknown>"))
+            await websocket.close(code=4403)
             return
         assigned_client = websocket.query_params.get("client_id") or secrets.token_hex(8)
         connection_key: Optional[str] = None
