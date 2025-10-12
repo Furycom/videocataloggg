@@ -20,6 +20,24 @@ function Write-Err {
     Write-Host "[ERROR] $Message" -ForegroundColor Red
 }
 
+function Test-PythonModule {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonExe,
+        [Parameter(Mandatory = $true)][string]$ModuleName
+    )
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $PythonExe -c "import $ModuleName" 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Resolve-Path (Join-Path $scriptRoot '..')
 Set-Location $root
@@ -190,8 +208,8 @@ try {
     $env:VIDEOCATALOG_HOME = $workFull
     $env:PYTHONUNBUFFERED = '1'
 
-    & $pythonExe -c "import uvicorn" 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $uvicornAvailable = Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn'
+    if (-not $uvicornAvailable) {
         $requirementsPath = Join-Path $root 'requirements-windows.txt'
         if (-not (Test-Path $requirementsPath)) {
             $requirementsPath = Join-Path $root 'requirements.txt'
@@ -206,8 +224,7 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw 'Dependency installation failed.'
         }
-        & $pythonExe -c "import uvicorn" 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        if (-not (Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn')) {
             throw 'uvicorn is still unavailable after installation.'
         }
     } else {
