@@ -230,14 +230,20 @@ def ensure_models(*, log_path: Optional[Path] = None, refresh: bool = False) -> 
     manifest = _load_manifest(manifest_path)
 
     summaries: List[ModelSummary] = []
+    errors: List[Dict[str, str]] = []
     for spec in _MODEL_SPECS:
-        summary = _ensure_single(
-            spec,
-            cache_dir=cache_dir,
-            working_dir=working_dir,
-            manifest=manifest,
-            refresh=refresh,
-        )
+        try:
+            summary = _ensure_single(
+                spec,
+                cache_dir=cache_dir,
+                working_dir=working_dir,
+                manifest=manifest,
+                refresh=refresh,
+            )
+        except Exception as exc:
+            LOGGER.exception("Model %s preparation failed: %s", spec.alias, exc)
+            errors.append({"alias": spec.alias, "error": str(exc)})
+            continue
         summaries.append(summary)
 
     _write_manifest(manifest_path, summaries)
@@ -247,6 +253,8 @@ def ensure_models(*, log_path: Optional[Path] = None, refresh: bool = False) -> 
         "cache_dir": str(cache_dir),
         "manifest": str(manifest_path),
         "models": [asdict(summary) for summary in summaries],
+        "errors": errors,
+        "status": "partial_failure" if errors else "ok",
     }
     return payload
 
@@ -266,6 +274,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     print(json.dumps(payload))
+    errors = payload.get("errors") or []
+    if errors:
+        LOGGER.error(
+            "Assistant model cache completed with %d failure(s)", len(errors)
+        )
+        return 1
     return 0
 
 
