@@ -21,6 +21,24 @@ DEFAULT_PORT = 8756
 DEFAULT_CORS = ["http://localhost", "http://127.0.0.1"]
 
 
+def _resolve_bind_host(candidate: Optional[str]) -> str:
+    host = (candidate or DEFAULT_HOST).strip()
+    if not host:
+        host = DEFAULT_HOST
+    norm = host.lower()
+    if norm == "localhost":
+        return "127.0.0.1"
+    if norm.startswith("::ffff:"):
+        norm = norm.split("::ffff:")[-1]
+    if norm == "::1":
+        return "127.0.0.1"
+    if norm.startswith("127."):
+        return host if host.startswith("127.") else "127.0.0.1"
+    raise ValueError(
+        f"Refusing to bind API server to non-loopback host '{candidate}'. VideoCatalog only serves on localhost."
+    )
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Start the local VideoCatalog API service.")
     parser.add_argument("--host", default=None, help="Bind host (default from settings.json)")
@@ -53,13 +71,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def resolve_api_settings(args: argparse.Namespace) -> tuple[str, int, Optional[str], List[str], DataAccess]:
+def resolve_api_settings(
+    args: argparse.Namespace,
+) -> tuple[str, int, Optional[str], List[str], DataAccess, bool]:
     working_dir = resolve_working_dir()
     settings = load_settings(working_dir)
     api_settings = settings.get("api") if isinstance(settings.get("api"), dict) else {}
+    server_settings = settings.get("server") if isinstance(settings.get("server"), dict) else {}
 
-    host = args.host or api_settings.get("host") or DEFAULT_HOST
-    port = args.port or api_settings.get("port") or DEFAULT_PORT
+    host_candidate = args.host or server_settings.get("host") or api_settings.get("host") or DEFAULT_HOST
+    host = _resolve_bind_host(host_candidate)
+    port = args.port or server_settings.get("port") or api_settings.get("port") or DEFAULT_PORT
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -73,13 +95,18 @@ def resolve_api_settings(args: argparse.Namespace) -> tuple[str, int, Optional[s
         cors = list(api_settings.get("cors_origins") or DEFAULT_CORS)
 
     data_access = DataAccess(working_dir=Path(working_dir), settings=settings)
-    return str(host), int(port), api_key, cors, data_access
+    lan_refuse = bool(server_settings.get("lan_refuse", True))
+    return str(host), int(port), api_key, cors, data_access, lan_refuse
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     args = parse_args(argv)
-    host, port, api_key, cors, data_access = resolve_api_settings(args)
+    try:
+        host, port, api_key, cors, data_access, lan_refuse = resolve_api_settings(args)
+    except ValueError as exc:
+        logging.error("%s", exc)
+        return 2
 
     if args.export_catalog:
         logging.info(
@@ -106,6 +133,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         api_key=api_key,
         cors_origins=cors,
         app_version=API_VERSION,
+        lan_only=lan_refuse,
     )
     app = create_app(config)
 
