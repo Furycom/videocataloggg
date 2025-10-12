@@ -14,7 +14,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - **Log locations.** The launcher writes timestamped logs under `%USERPROFILE%\VideoCatalog\logs\launcher-<timestamp>.log`. The orchestrator and web services emit matching files alongside it as `orchestrator-<timestamp>.log` and `web-<timestamp>.log`.
 - **Port already in use.** Edit `%USERPROFILE%\VideoCatalog\settings.json` and change `server.port` to an open TCP port, then rerun the launcher.
 - **Missing ffprobe.** Install FFmpeg and ensure `ffprobe.exe` is on `PATH`. Until then, quality header analysis stays disabled and the launcher prints a yellow warning.
-- **Legacy shortcuts.** Existing shortcuts that target `diskscannergui.py` still work; they now invoke the new launcher so you do not need to recreate them.
+- **Manual launcher.** Run `python launch_videocatalog.py` from the repository root to start the A2.0 services without using the batch or PowerShell wrappers. Update any shortcuts that previously referenced `diskscannergui.py`; the script was renamed to avoid collisions on case-insensitive file systems.
 
 ## Windows 11 bootstrap & stabilization
 
