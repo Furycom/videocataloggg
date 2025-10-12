@@ -61,6 +61,7 @@ from core.paths import (
 )
 from core.ann import ANNIndexManager
 from core.db import connect, transaction
+from backup import BackupError, BackupOptions, BackupService
 from core.settings import load_settings
 from learning import LearningEngine, load_learning_settings
 from learning.db import count_examples
@@ -1496,6 +1497,15 @@ def init_db(db_path: str):
         PRIMARY KEY(drive_label, path)
     );
     CREATE INDEX IF NOT EXISTS idx_contact_sheets_updated ON contact_sheets(updated_utc);
+    CREATE TABLE IF NOT EXISTS backups (
+        id TEXT PRIMARY KEY,
+        created_utc TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        include_vectors INTEGER NOT NULL,
+        include_thumbs INTEGER NOT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        notes TEXT
+    );
     """)
     conn.commit()
     # Migrations for legacy shards
@@ -3421,6 +3431,52 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Force VACUUM during maintenance, overriding free-space thresholds.",
     )
+    backup_group = parser.add_argument_group("Backups")
+    backup_group.add_argument(
+        "--backup-create",
+        action="store_true",
+        help="Create a catalog backup snapshot immediately.",
+    )
+    backup_group.add_argument(
+        "--backup-verify",
+        action="store_true",
+        help="Verify the integrity of a backup snapshot (requires --id).",
+    )
+    backup_group.add_argument(
+        "--backup-restore",
+        action="store_true",
+        help="Restore a backup snapshot (requires --id).",
+    )
+    backup_group.add_argument(
+        "--backup-prune",
+        action="store_true",
+        help="Apply the backup retention policy immediately.",
+    )
+    backup_group.add_argument(
+        "--include-vectors",
+        action="store_true",
+        help="Include ANN/vector indices when creating a backup snapshot.",
+    )
+    backup_group.add_argument(
+        "--include-thumbs",
+        action="store_true",
+        help="Export thumbnails and contact sheet blobs when creating a backup snapshot.",
+    )
+    backup_group.add_argument(
+        "--id",
+        dest="backup_id",
+        help="Backup identifier to verify or restore (format: YYYYMMDD-HHMMSS).",
+    )
+    backup_group.add_argument(
+        "--note",
+        dest="backup_note",
+        help="Optional note to attach to a newly created backup.",
+    )
+    backup_group.add_argument(
+        "--with-settings",
+        action="store_true",
+        help="Restore settings.json from the snapshot when using --backup-restore.",
+    )
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -4797,6 +4853,75 @@ def _wait_for_dashboard_action(dashboard, *, timeout: float = 180.0) -> Optional
     return {"status": "timeout"}
 
 
+def _run_backup_cli(args: argparse.Namespace, settings_data: Dict[str, Any]) -> Optional[int]:
+    actions = [
+        bool(getattr(args, "backup_create", False)),
+        bool(getattr(args, "backup_verify", False)),
+        bool(getattr(args, "backup_restore", False)),
+        bool(getattr(args, "backup_prune", False)),
+    ]
+    if not any(actions):
+        return None
+    if sum(1 for flag in actions if flag) > 1:
+        print("Select only one backup command at a time (create, verify, restore, or prune).", file=sys.stderr)
+        return 2
+    service = BackupService(working_dir=WORKING_DIR_PATH, settings=settings_data)
+    try:
+        if getattr(args, "backup_create", False):
+            options = BackupOptions(
+                include_vectors=bool(getattr(args, "include_vectors", False)),
+                include_thumbs=bool(getattr(args, "include_thumbs", False)),
+                note=getattr(args, "backup_note", None),
+            )
+            result = service.create_snapshot(options)
+            total_bytes = sum(int(entry.get("bytes") or 0) for entry in result.manifest.files)
+            print(
+                "Backup created: {bid} ({size})\n  manifest: {manifest}\n  bundle: {bundle}".format(
+                    bid=result.backup_id,
+                    size=_format_bytes(total_bytes),
+                    manifest=result.manifest_path,
+                    bundle=result.bundle_path,
+                )
+            )
+            return 0
+        if getattr(args, "backup_verify", False):
+            backup_id = getattr(args, "backup_id", None)
+            if not backup_id:
+                print("--backup-verify requires --id <timestamp>", file=sys.stderr)
+                return 2
+            summary = service.verify_snapshot(backup_id)
+            print(
+                f"Backup {backup_id} verified — files={summary.get('file_count')}"
+            )
+            return 0
+        if getattr(args, "backup_restore", False):
+            backup_id = getattr(args, "backup_id", None)
+            if not backup_id:
+                print("--backup-restore requires --id <timestamp>", file=sys.stderr)
+                return 2
+            service.restore_snapshot(backup_id, include_settings=bool(getattr(args, "with_settings", False)))
+            print(f"Backup {backup_id} restored successfully.")
+            return 0
+        if getattr(args, "backup_prune", False):
+            summary = service.apply_retention()
+            freed = _format_bytes(summary.freed_bytes) if summary.freed_bytes else "0 B"
+            print(
+                "Retention applied — kept {kept} removed {removed} freed {freed}".format(
+                    kept=len(summary.kept),
+                    removed=len(summary.removed),
+                    freed=freed,
+                )
+            )
+            return 0
+    except BackupError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # pragma: no cover - defensive guard
+        print(f"[ERROR] Backup operation failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _run_assistant_cli(args: argparse.Namespace, settings_data: Dict[str, Any]) -> Optional[int]:
     if not (
         getattr(args, "assistant_dashboard", False)
@@ -4873,6 +4998,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     settings_data = load_settings(WORKING_DIR_PATH)
+    backup_exit = _run_backup_cli(args, settings_data)
+    if backup_exit is not None:
+        return backup_exit
     assistant_exit = _run_assistant_cli(args, settings_data)
     if assistant_exit is not None:
         return assistant_exit

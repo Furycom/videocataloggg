@@ -123,6 +123,19 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "lease_ttl_s": 120,
         "heartbeat_s": 5,
     },
+    "backup": {
+        "enable": True,
+        "schedule_cron": "0 3 * * *",
+        "include_vectors": False,
+        "include_thumbs": False,
+        "quiesce_timeout_s": 120,
+        "retention": {
+            "keep_last": 10,
+            "keep_daily": 14,
+            "keep_weekly": 8,
+            "max_total_gb": 50,
+        },
+    },
     "api": {
         "enabled_default": False,
         "host": "127.0.0.1",

@@ -153,6 +153,7 @@ from tools import (
     setup_portable_tool,
     winget_available,
 )
+from backup import BackupError, BackupOptions, BackupService
 from search_util import (
     sanitize_query,
     ensure_inventory_name,
@@ -2152,6 +2153,20 @@ class App:
         self.root.option_add("*Font", "Segoe UI 10")
         self.root.geometry("1020x820")
         self.root.minsize(900, 720)
+        settings_payload = _SETTINGS if isinstance(_SETTINGS, dict) else {}
+        backup_cfg = settings_payload.get("backup") if isinstance(settings_payload.get("backup"), dict) else {}
+        self.backup_service = BackupService(working_dir=WORKING_DIR_PATH, settings=settings_payload)
+        self.backup_include_vectors_var = IntVar(value=1 if backup_cfg.get("include_vectors") else 0)
+        self.backup_include_thumbs_var = IntVar(value=1 if backup_cfg.get("include_thumbs") else 0)
+        self.backups_status_var = StringVar(value="Backups not loaded yet.")
+        self.backup_note_var = StringVar(value="")
+        self.backups_selected_id: Optional[str] = None
+        self.backup_job_active = False
+        self.backup_rows: Dict[str, object] = {}
+        self.backups_tree: Optional[ttk.Treeview] = None
+        self.backups_log_widget: Optional[ScrolledText] = None
+        self.backup_buttons: Dict[str, ttk.Button] = {}
+        self.backup_with_settings_var = IntVar(value=0)
         self.db_path = StringVar(value=DB_DEFAULT)
         self._maintenance_window: Optional[MaintenanceDialog] = None
         self._last_scan_label: Optional[str] = None
@@ -2359,7 +2374,6 @@ class App:
         except (TypeError, ValueError):
             self.assistant_default_min_score = 0.25
 
-        settings_payload = _SETTINGS if isinstance(_SETTINGS, dict) else {}
         try:
             self.assistant_dashboard: Optional[AssistantDashboard] = get_dashboard(
                 WORKING_DIR_PATH,
@@ -3188,6 +3202,10 @@ class App:
         self.audit_tab.columnconfigure(0, weight=1)
         self.audit_tab.rowconfigure(1, weight=1)
         self.main_notebook.add(self.audit_tab, text="Audit")
+        self.backups_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
+        self.backups_tab.columnconfigure(0, weight=1)
+        self.backups_tab.rowconfigure(1, weight=1)
+        self.main_notebook.add(self.backups_tab, text="Backups")
         self.textlite_tab = ttk.Frame(self.main_notebook, style="Content.TFrame")
         self.textlite_tab.columnconfigure(0, weight=1)
         self.textlite_tab.rowconfigure(1, weight=1)
@@ -3217,6 +3235,7 @@ class App:
         self._build_structure_tab(self.structure_tab)
         self._build_quality_tab(self.quality_tab)
         self._build_audit_tab(self.audit_tab)
+        self._build_backups_tab(self.backups_tab)
         self._build_textlite_tab(self.textlite_tab)
         self._build_docpreview_tab(self.docpreview_tab)
         self._build_music_tab(self.music_tab)
@@ -4294,6 +4313,337 @@ class App:
         ttk.Label(baseline, textvariable=self.audit_delta_var, style="Value.TLabel").grid(
             row=1, column=0, sticky="w", pady=(6, 0)
         )
+
+    def _build_backups_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=3)
+        parent.rowconfigure(3, weight=1)
+
+        controls = ttk.Frame(parent, padding=(12, 12), style="Card.TFrame")
+        controls.grid(row=0, column=0, sticky="ew")
+        for column in range(6):
+            controls.columnconfigure(column, weight=0)
+        controls.columnconfigure(6, weight=1)
+
+        self.backup_buttons["create"] = ttk.Button(controls, text="Create now", command=self._backup_create_now)
+        self.backup_buttons["create"].grid(row=0, column=0, padx=(0, 8))
+        self.backup_buttons["verify"] = ttk.Button(controls, text="Verify", command=self._backup_verify_selected)
+        self.backup_buttons["verify"].grid(row=0, column=1, padx=(0, 8))
+        self.backup_buttons["restore"] = ttk.Button(controls, text="Restore", command=self._backup_restore_selected)
+        self.backup_buttons["restore"].grid(row=0, column=2, padx=(0, 8))
+        self.backup_buttons["download"] = ttk.Button(
+            controls, text="Download bundle", command=self._backup_download_bundle
+        )
+        self.backup_buttons["download"].grid(row=0, column=3, padx=(0, 8))
+        self.backup_buttons["prune"] = ttk.Button(
+            controls, text="Apply retention", command=self._backup_apply_retention
+        )
+        self.backup_buttons["prune"].grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(controls, text="Refresh", command=self._refresh_backups_ui).grid(row=0, column=5)
+
+        options = ttk.Frame(parent, padding=(12, 0), style="Card.TFrame")
+        options.grid(row=1, column=0, sticky="ew")
+        options.columnconfigure(1, weight=1)
+        options.columnconfigure(2, weight=1)
+
+        ttk.Checkbutton(
+            options,
+            text="Include vectors",
+            variable=self.backup_include_vectors_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            options,
+            text="Include thumbnails",
+            variable=self.backup_include_thumbs_var,
+        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Checkbutton(
+            options,
+            text="Restore settings.json",
+            variable=self.backup_with_settings_var,
+        ).grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(options, text="Note:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        note_entry = ttk.Entry(options, textvariable=self.backup_note_var)
+        note_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        self.backup_buttons["note"] = ttk.Button(options, text="Add note", command=self._backup_update_note)
+        self.backup_buttons["note"].grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+
+        tree_frame = ttk.Frame(parent, padding=(12, 0), style="Card.TFrame")
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        columns = ("id", "created", "size", "vectors", "thumbs", "verified", "notes")
+        self.backups_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10)
+        self.backups_tree.heading("id", text="Backup ID")
+        self.backups_tree.heading("created", text="Created")
+        self.backups_tree.heading("size", text="Size")
+        self.backups_tree.heading("vectors", text="Vectors")
+        self.backups_tree.heading("thumbs", text="Thumbs")
+        self.backups_tree.heading("verified", text="Verified")
+        self.backups_tree.heading("notes", text="Notes")
+        self.backups_tree.column("id", width=140, anchor="w")
+        self.backups_tree.column("created", width=160, anchor="w")
+        self.backups_tree.column("size", width=110, anchor="e")
+        self.backups_tree.column("vectors", width=90, anchor="center")
+        self.backups_tree.column("thumbs", width=90, anchor="center")
+        self.backups_tree.column("verified", width=90, anchor="center")
+        self.backups_tree.column("notes", width=260, anchor="w")
+        self.backups_tree.grid(row=0, column=0, sticky="nsew")
+        self.backups_tree.bind("<<TreeviewSelect>>", self._on_backup_selected)
+
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.backups_tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.backups_tree.configure(yscrollcommand=tree_scroll.set)
+
+        log_frame = ttk.LabelFrame(parent, text="Backup log", padding=(12, 12), style="Card.TLabelframe")
+        log_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=(8, 12))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.backups_log_widget = ScrolledText(log_frame, height=6, wrap="word", state="disabled")
+        self.backups_log_widget.grid(row=0, column=0, sticky="nsew")
+        ttk.Button(log_frame, text="Reload log", command=self._load_backup_log).grid(row=1, column=0, sticky="e", pady=(8, 0))
+
+        status = ttk.Label(parent, textvariable=self.backups_status_var, style="StatusInfo.TLabel")
+        status.grid(row=4, column=0, sticky="ew", padx=12, pady=(4, 12))
+
+        self._refresh_backups_ui()
+        self._update_backup_buttons()
+
+    def _refresh_backups_ui(self) -> None:
+        self._refresh_backups_list()
+        self._load_backup_log()
+
+    def _refresh_backups_list(self) -> None:
+        if not self.backups_tree:
+            return
+        for item in self.backups_tree.get_children():
+            self.backups_tree.delete(item)
+        try:
+            entries = self.backup_service.list_backups()
+        except Exception as exc:  # pragma: no cover - UI guard
+            self._set_backup_status(f"Failed to load backups: {exc}", error=True)
+            entries = []
+        else:
+            if entries:
+                self._set_backup_status(f"{len(entries)} backup(s) available.")
+            else:
+                self._set_backup_status("No backups found.")
+        self.backup_rows = {}
+        for entry in entries:
+            self.backup_rows[entry.id] = entry
+            values = (
+                entry.id,
+                entry.created_utc or "—",
+                self._format_bytes(entry.size_bytes),
+                "yes" if entry.include_vectors else "no",
+                "yes" if entry.include_thumbs else "no",
+                "yes" if entry.verified else "no",
+                entry.notes or "",
+            )
+            self.backups_tree.insert("", "end", iid=entry.id, values=values)
+        if self.backups_selected_id and self.backups_selected_id in self.backup_rows:
+            self.backups_tree.selection_set(self.backups_selected_id)
+        else:
+            self.backups_selected_id = None
+        self._update_backup_buttons()
+
+    def _load_backup_log(self) -> None:
+        if not self.backups_log_widget:
+            return
+        log_path = LOGS_DIR_PATH / "backup.jsonl"
+        lines: List[str]
+        try:
+            raw = log_path.read_text(encoding="utf-8")
+            lines = raw.splitlines()[-200:]
+            if not lines:
+                lines = ["Log empty."]
+        except FileNotFoundError:
+            lines = ["Log file not found."]
+        except Exception as exc:  # pragma: no cover - UI guard
+            lines = [f"Failed to read log: {exc}"]
+        widget = self.backups_log_widget
+        widget.configure(state="normal")
+        widget.delete("1.0", END)
+        widget.insert("end", "\n".join(lines))
+        widget.configure(state="disabled")
+
+    def _on_backup_selected(self, event: Optional[object] = None) -> None:
+        if not self.backups_tree:
+            return
+        selection = self.backups_tree.selection()
+        if not selection:
+            self.backups_selected_id = None
+            self.backup_note_var.set("")
+        else:
+            backup_id = selection[0]
+            self.backups_selected_id = backup_id
+            entry = self.backup_rows.get(backup_id)
+            if entry:
+                self.backup_note_var.set(entry.notes or "")
+        self._update_backup_buttons()
+
+    def _selected_backup(self):
+        if not self.backups_selected_id:
+            return None
+        return self.backup_rows.get(self.backups_selected_id)
+
+    def _update_backup_buttons(self) -> None:
+        has_selection = self._selected_backup() is not None
+        for key in ("verify", "restore", "download", "note"):
+            button = self.backup_buttons.get(key)
+            if button:
+                state = "normal" if has_selection and not self.backup_job_active else "disabled"
+                button.configure(state=state)
+        for key in ("create", "prune"):
+            button = self.backup_buttons.get(key)
+            if button:
+                button.configure(state="disabled" if self.backup_job_active else "normal")
+
+    def _set_backup_status(self, message: str, *, error: bool = False) -> None:
+        self.backups_status_var.set(message)
+        if error:
+            self.show_banner(message, "ERROR")
+
+    def _run_backup_job(self, label: str, task: Callable[[], str]) -> None:
+        if self.backup_job_active:
+            messagebox.showinfo("Backups", "Another backup task is already running.")
+            return
+        self.backup_job_active = True
+        self._update_backup_buttons()
+        self._set_backup_status(f"{label}…")
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+
+        def worker() -> None:
+            try:
+                message = task()
+            except BackupError as exc:
+                self.root.after(0, lambda: self._complete_backup_job(label, error=str(exc)))
+            except Exception as exc:  # pragma: no cover - defensive
+                self.root.after(0, lambda: self._complete_backup_job(label, error=str(exc)))
+            else:
+                self.root.after(0, lambda: self._complete_backup_job(label, message=message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _complete_backup_job(self, label: str, message: Optional[str] = None, error: Optional[str] = None) -> None:
+        self.backup_job_active = False
+        self.root.config(cursor="")
+        if error:
+            self._set_backup_status(f"{label} failed: {error}", error=True)
+            messagebox.showerror("Backups", f"{label} failed:\n{error}")
+        else:
+            self._set_backup_status(message or f"{label} completed.")
+        self._refresh_backups_list()
+        self._load_backup_log()
+        self._update_backup_buttons()
+
+    def _backup_create_now(self) -> None:
+        note = (self.backup_note_var.get() or "").strip()
+
+        def task() -> str:
+            options = BackupOptions(
+                include_vectors=bool(self.backup_include_vectors_var.get()),
+                include_thumbs=bool(self.backup_include_thumbs_var.get()),
+                note=note or None,
+            )
+            result = self.backup_service.create_snapshot(options)
+            self.root.after(0, lambda: self.backup_note_var.set(""))
+            return f"Backup {result.backup_id} created."
+
+        self._run_backup_job("Create backup", task)
+
+    def _backup_verify_selected(self) -> None:
+        backup = self._selected_backup()
+        if not backup:
+            messagebox.showinfo("Backups", "Select a backup to verify.")
+            return
+
+        def task() -> str:
+            self.backup_service.verify_snapshot(backup.id)
+            return f"Backup {backup.id} verified."
+
+        self._run_backup_job("Verify backup", task)
+
+    def _backup_restore_selected(self) -> None:
+        backup = self._selected_backup()
+        if not backup:
+            messagebox.showinfo("Backups", "Select a backup to restore.")
+            return
+        include_settings = bool(self.backup_with_settings_var.get())
+        message = (
+            "Restore this backup?\n\n"
+            "The orchestrator will pause and the active catalog files will be replaced with the snapshot."
+        )
+        if include_settings:
+            message += "\nsettings.json will also be restored."
+        if not messagebox.askyesno("Restore backup", message):
+            return
+
+        def task() -> str:
+            self.backup_service.restore_snapshot(backup.id, include_settings=include_settings)
+            return f"Backup {backup.id} restored."
+
+        self._run_backup_job("Restore backup", task)
+
+    def _backup_download_bundle(self) -> None:
+        backup = self._selected_backup()
+        if not backup:
+            messagebox.showinfo("Backups", "Select a backup to download.")
+            return
+        bundle_path = Path(backup.path) / "bundle.zip"
+        if not bundle_path.exists():
+            messagebox.showerror("Backups", "Bundle file not found for the selected backup.")
+            return
+        target = filedialog.asksaveasfilename(
+            title="Save backup bundle",
+            defaultextension=".zip",
+            initialfile=f"{backup.id}.zip",
+        )
+        if not target:
+            return
+        try:
+            shutil.copy2(bundle_path, target)
+        except Exception as exc:
+            messagebox.showerror("Backups", f"Failed to copy bundle: {exc}")
+            self._set_backup_status(f"Download failed: {exc}", error=True)
+            return
+        self._set_backup_status(f"Bundle copied to {target}")
+
+    def _backup_apply_retention(self) -> None:
+
+        def task() -> str:
+            summary = self.backup_service.apply_retention()
+            freed = self._format_bytes(summary.freed_bytes) if summary.freed_bytes else "0 B"
+            return f"Retention removed {len(summary.removed)} backup(s), freed {freed}."
+
+        self._run_backup_job("Apply retention", task)
+
+    def _backup_update_note(self) -> None:
+        backup = self._selected_backup()
+        if not backup:
+            messagebox.showinfo("Backups", "Select a backup to annotate.")
+            return
+        note = (self.backup_note_var.get() or "").strip() or None
+        try:
+            self.backup_service.update_note(backup.id, note)
+        except Exception as exc:
+            messagebox.showerror("Backups", f"Failed to update note: {exc}")
+            self._set_backup_status(f"Failed to update note: {exc}", error=True)
+            return
+        self._set_backup_status("Note updated.")
+        self._refresh_backups_list()
+
+    def _format_bytes(self, value: int) -> str:
+        units = ["B", "KB", "MB", "GB", "TB"]
+        amount = float(value)
+        unit = 0
+        while amount >= 1024 and unit < len(units) - 1:
+            amount /= 1024.0
+            unit += 1
+        if unit == 0:
+            return f"{int(amount)} {units[unit]}"
+        return f"{amount:.2f} {units[unit]}"
 
     def request_audit_summary(self) -> None:
         self._start_audit_job(
