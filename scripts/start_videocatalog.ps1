@@ -92,7 +92,11 @@ try {
     }
 
     try {
-        $settings = $settingsRaw | ConvertFrom-Json -Depth 100
+        $convertFromJsonParameters = @{ InputObject = $settingsRaw }
+        if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('Depth')) {
+            $convertFromJsonParameters['Depth'] = 100
+        }
+        $settings = ConvertFrom-Json @convertFromJsonParameters
     } catch {
         Write-Warn 'settings.json is invalid JSON. Recreating defaults.'
         $settings = [pscustomobject]@{}
