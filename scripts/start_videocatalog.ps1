@@ -63,7 +63,7 @@ function Invoke-PipInstall {
         }
 
         $timestamp = Get-Date -Format o
-        $commandLine = "\"$commandPath\" $($commandArgs -join ' ')"
+        $commandLine = "`"$commandPath`" $($commandArgs -join ' ')"
         Add-Content -Path $LogFile -Value "[$timestamp] COMMAND: $commandLine" -Encoding UTF8
         try {
             & $commandPath @commandArgs 2>&1 | Tee-Object -FilePath $LogFile -Append
@@ -137,7 +137,7 @@ try {
     "VideoCatalog pip session log started $(Get-Date -Format o)" | Set-Content -Path $pipLog -Encoding UTF8
     Write-Info "Pip output will be logged to $pipLog"
 } catch {
-    Write-Warn "Unable to initialize pip log at $pipLog: $($_.Exception.Message)"
+    Write-Warn "Unable to initialize pip log at ${pipLog}: $($_.Exception.Message)"
     $pipLog = $null
 }
 
