@@ -1,117 +1,130 @@
 """Read-only diagnostics tools exposed to the assistant runtime."""
 from __future__ import annotations
 
-import statistics
-import time
+import json
+from dataclasses import dataclass
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from core import db as core_db
 from core.paths import get_catalog_db_path, resolve_working_dir
 from core.settings import load_settings
 
-from .logs import load_snapshot, query_logs
+from .logs import query_logs
 from .preflight import run_preflight
-from .report import build_report_snapshot
-from .smoke import DEFAULT_SUBSYSTEMS, run_smoke_tests
+from .report import build_report_snapshot, get_report, list_reports
+from .smoke import DEFAULT_TARGETS, run_smoke
+
+
+@dataclass(slots=True)
+class ToolGuard:
+    working_dir: Path
+
+    def ensure_within_workdir(self, path: Path) -> None:
+        resolved = path.resolve()
+        if not str(resolved).startswith(str(self.working_dir.resolve())):
+            raise PermissionError("Diagnostics tools may only read within working_dir")
 
 
 class DiagnosticsTools:
-    """Convenience wrapper to expose diagnostics operations to LLM tools."""
+    """Read-only tool facade for assistant integration."""
 
     def __init__(self, working_dir: Optional[Path] = None) -> None:
         self.working_dir = working_dir or resolve_working_dir()
         self.settings = load_settings(self.working_dir) or {}
-        self.db_path = get_catalog_db_path(self.working_dir)
+        self.guard = ToolGuard(self.working_dir)
 
     # ------------------------------------------------------------------
     def diag_run_preflight(self) -> Dict[str, Any]:
-        return run_preflight(working_dir=self.working_dir)
+        return run_preflight(working_dir=self.working_dir, settings=self.settings)
 
     def diag_run_smoke(
         self,
         subsystems: Optional[Iterable[str]] = None,
         budget: Optional[int] = None,
     ) -> Dict[str, Any]:
-        allowed = [name for name in (subsystems or DEFAULT_SUBSYSTEMS) if name in DEFAULT_SUBSYSTEMS]
-        return run_smoke_tests(allowed, budget=budget, working_dir=self.working_dir)
+        allowed = [name for name in (subsystems or DEFAULT_TARGETS) if name in DEFAULT_TARGETS]
+        return run_smoke(allowed, budget=budget, working_dir=self.working_dir, settings=self.settings)
 
-    def diag_get_logs(self, query: Optional[Dict[str, Any]] = None, limit: int = 200) -> Dict[str, Any]:
-        return query_logs(query=query, limit=limit, working_dir=self.working_dir)
+    def diag_get_logs(self, filters: Optional[Dict[str, Any]] = None, limit: int = 200) -> Dict[str, Any]:
+        filters = filters or {}
+        event_id = filters.get("event_id")
+        module = filters.get("module")
+        level = filters.get("level")
+        return query_logs(
+            working_dir=self.working_dir,
+            event_id=int(event_id) if event_id is not None else None,
+            module=module,
+            level=level,
+            limit=limit,
+        )
 
     def diag_get_metrics(self, window_min: int = 60) -> Dict[str, Any]:
-        payload = query_logs(limit=2000, working_dir=self.working_dir)
-        now = time.time()
-        threshold = now - max(1, int(window_min)) * 60
-        durations: List[float] = []
-        cache_hits = 0
-        cache_total = 0
-        budget_events = 0
-        logs = []
-        for row in payload.get("rows", []):
-            ts = float(row.get("ts", 0))
-            if ts < threshold:
-                continue
-            logs.append(row)
-            duration = row.get("duration_ms")
-            if isinstance(duration, (int, float)):
-                durations.append(float(duration))
-            if row.get("module") == "diagnostics.smoke" and "cache_size" in row:
-                cache_total += 1
-                if row.get("cache_size"):
-                    cache_hits += 1
-            if row.get("module") == "diagnostics.preflight" and row.get("op") == "gpu":
-                budget_events += 1
-        metrics = {}
-        if durations:
-            metrics["duration_ms"] = {
-                "p50": round(statistics.median(durations), 2),
-                "p90": round(statistics.quantiles(durations, n=10)[8], 2) if len(durations) >= 10 else round(max(durations), 2),
-                "p95": round(statistics.quantiles(durations, n=20)[18], 2) if len(durations) >= 20 else round(max(durations), 2),
+        db_path = get_catalog_db_path(self.working_dir)
+        conn = core_db.connect(db_path, read_only=True, timeout=2.0)
+        try:
+            rows = conn.execute(
+                "SELECT ts_utc, series, labels_json, value FROM diag_metrics ORDER BY ts_utc DESC LIMIT 500"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            conn.close()
+        metrics: Dict[str, List[float]] = {}
+        for _ts, series, labels_json, value in rows:
+            metrics.setdefault(series, []).append(float(value))
+        aggregates = {
+            series: {
+                "count": len(values),
+                "latest": values[0] if values else 0.0,
             }
-        if cache_total:
-            metrics["cache_hit_ratio"] = round(cache_hits / cache_total, 3)
-        metrics["gpu_checks"] = budget_events
-        return {"window_min": window_min, "metrics": metrics, "samples": len(logs)}
+            for series, values in metrics.items()
+        }
+        return {"window_min": window_min, "series": aggregates}
 
     def diag_sql(self, view: str, where: Optional[Dict[str, Any]] = None, limit: int = 50) -> Dict[str, Any]:
-        view = (view or "").lower()
-        limit = max(1, min(500, int(limit)))
-        rows: List[Dict[str, Any]]
-        if view == "preflight_checks":
-            snapshot = load_snapshot("preflight", working_dir=self.working_dir) or {}
-            rows = [
-                {
-                    "name": check.get("name"),
-                    "ok": check.get("ok"),
-                    "severity": check.get("severity"),
-                    "message": check.get("message"),
-                    "hint": check.get("hint"),
-                    **(check.get("data") or {}),
-                }
-                for check in snapshot.get("checks", [])
-            ]
-        elif view == "smoke_checks":
-            snapshot = load_snapshot("smoke", working_dir=self.working_dir) or {}
-            rows = [
-                {
-                    "name": check.get("name"),
-                    "ok": check.get("ok"),
-                    "severity": check.get("severity"),
-                    "message": check.get("message"),
-                    "hint": check.get("hint"),
-                    "duration_ms": check.get("duration_ms"),
-                    **(check.get("data") or {}),
-                }
-                for check in snapshot.get("checks", [])
-            ]
-        elif view == "log_events":
-            payload = query_logs(limit=limit, working_dir=self.working_dir)
-            rows = list(payload.get("rows", []))
-        else:
-            raise ValueError("Unsupported diagnostics view")
+        db_path = get_catalog_db_path(self.working_dir)
+        conn = core_db.connect(db_path, read_only=True, timeout=2.0)
+        result_rows: List[Dict[str, Any]] = []
+        try:
+            if view == "diag_reports":
+                rows = conn.execute(
+                    "SELECT id, created_utc, summary_json FROM diag_reports ORDER BY created_utc DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                result_rows = [
+                    {
+                        "id": row[0],
+                        "created_utc": row[1],
+                        "summary": json.loads(row[2]) if row[2] else {},
+                    }
+                    for row in rows
+                ]
+            elif view == "diag_metrics":
+                rows = conn.execute(
+                    "SELECT ts_utc, series, labels_json, value FROM diag_metrics ORDER BY ts_utc DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                result_rows = [
+                    {
+                        "ts_utc": row[0],
+                        "series": row[1],
+                        "labels": json.loads(row[2]) if row[2] else {},
+                        "value": row[3],
+                    }
+                    for row in rows
+                ]
+            else:
+                raise ValueError("Unsupported diagnostics view")
+        except sqlite3.Error:
+            result_rows = []
+        finally:
+            conn.close()
+
         if where:
-            filtered = []
-            for row in rows:
+            filtered: List[Dict[str, Any]] = []
+            for row in result_rows:
                 include = True
                 for key, value in where.items():
                     if str(row.get(key)) != str(value):
@@ -119,11 +132,19 @@ class DiagnosticsTools:
                         break
                 if include:
                     filtered.append(row)
-            rows = filtered
-        return {"rows": rows[:limit], "count": min(len(rows), limit)}
+            result_rows = filtered
+        return {"rows": result_rows[:limit], "count": min(len(result_rows), limit)}
 
-    def diag_get_report(self) -> Dict[str, Any]:
+    def diag_get_report(self, report_id: Optional[str] = None) -> Dict[str, Any]:
+        if report_id:
+            payload = get_report(report_id, working_dir=self.working_dir)
+            if payload is None:
+                raise ValueError("Report not found")
+            return payload
         return build_report_snapshot(working_dir=self.working_dir)
+
+    def diag_list_reports(self) -> List[Dict[str, Any]]:
+        return list_reports(working_dir=self.working_dir)
 
 
 __all__ = ["DiagnosticsTools"]

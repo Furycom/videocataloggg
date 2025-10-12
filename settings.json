@@ -1,5 +1,20 @@
 {
   "catalog_db": "C:/Users/Administrator/VideoCatalog/catalog.db",
+  "diagnostics": {
+    "enable": true,
+    "gpu_hard_requirement": true,
+    "timeouts_s": {
+      "default": 10,
+      "gpu": 20,
+      "ws_event": 5
+    },
+    "sample_sizes": {
+      "structure": 5,
+      "text": 3
+    },
+    "logs_keep_days": 14,
+    "export_bundle": true
+  },
   "light_analysis": {
     "enabled_default": false,
     "model_path": null,
