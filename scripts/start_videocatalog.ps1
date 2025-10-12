@@ -299,6 +299,13 @@ try {
             FailureMessage = 'Falling back to FAISS/simple similarity search. Install the Visual C++ Build Tools to enable the hnswlib backend.'
         }
 
+        $optionalPackages += [pscustomobject]@{
+            Name = 'faiss-cpu'
+            Requirement = 'faiss-cpu==1.7.4'
+            ForceBinary = $true
+            FailureMessage = 'Falling back to simple similarity search. Install FAISS manually to enable the FAISS backend.'
+        }
+
         foreach ($package in $optionalPackages) {
             if (-not $package.Requirement) { continue }
             $args = @('install')
