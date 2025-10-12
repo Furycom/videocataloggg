@@ -382,6 +382,116 @@ class CatalogOpenFolderResponse(BaseModel):
     path: str = Field(..., description="Path that should be opened.")
 
 
+class PlaylistCandidate(BaseModel):
+    id: str = Field(..., description="Identifier returned by catalog listings.")
+    kind: str = Field(..., description="Item kind (movie or episode).")
+    drive: Optional[str] = Field(None, description="Drive label owning the media path.")
+    path: str = Field(..., description="Absolute path to the media file for export.")
+    masked_path: str = Field(..., description="Masked path safe for UI display.")
+    title: Optional[str] = Field(None, description="Display title for the candidate.")
+    year: Optional[int] = Field(None, description="Release or air year when available.")
+    duration_min: Optional[int] = Field(None, description="Runtime in whole minutes when available.")
+    quality: Optional[int] = Field(None, description="Quality score when evaluated.")
+    confidence: float = Field(..., description="Confidence score from catalog pipelines.")
+    langs_audio: List[str] = Field(default_factory=list, description="Detected audio language codes.")
+    langs_subs: List[str] = Field(default_factory=list, description="Detected subtitle language codes.")
+    subs_present: bool = Field(False, description="True when local subtitles were detected.")
+    genres: List[str] = Field(default_factory=list, description="Best-effort genres extracted from metadata.")
+
+
+class PlaylistSuggestResponse(BaseModel):
+    limit: int = Field(..., description="Maximum number of candidates returned.")
+    candidates: List[PlaylistCandidate] = Field(
+        default_factory=list, description="Candidate rows ordered by descending quality/confidence."
+    )
+
+
+class PlaylistBuildRequest(BaseModel):
+    items: List[str] = Field(..., description="Item identifiers that should compose the playlist.")
+    mode: str = Field(
+        "weighted",
+        description="Ordering strategy: weighted, sort_quality, or sort_confidence.",
+    )
+    target_minutes: Optional[int] = Field(
+        None, description="Target total runtime in minutes; used as a soft limit when ordering."
+    )
+
+
+class PlaylistBuildItem(BaseModel):
+    id: str = Field(..., description="Identifier of the playlist item.")
+    kind: str = Field(..., description="Item kind (movie or episode).")
+    drive: Optional[str] = Field(None, description="Drive label owning the media path.")
+    title: Optional[str] = Field(None, description="Display title for the playlist row.")
+    year: Optional[int] = Field(None, description="Release or air year when available.")
+    duration_min: Optional[int] = Field(None, description="Runtime in minutes.")
+    cumulative_minutes: int = Field(..., description="Cumulative runtime including this item.")
+    path: str = Field(..., description="Absolute media path used for exports.")
+    masked_path: str = Field(..., description="Masked path for user display.")
+    quality: Optional[int] = Field(None, description="Quality score when available.")
+    confidence: float = Field(..., description="Confidence score from catalog pipelines.")
+    langs_audio: List[str] = Field(default_factory=list, description="Detected audio languages.")
+    langs_subs: List[str] = Field(default_factory=list, description="Detected subtitle languages.")
+    subs_present: bool = Field(False, description="True when local subtitles were detected.")
+    open_plan: Dict[str, Any] = Field(..., description="Plan payload for opening the containing folder.")
+
+
+class PlaylistBuildResponse(BaseModel):
+    mode: str = Field(..., description="Ordering strategy that was applied.")
+    target_minutes: Optional[int] = Field(
+        None, description="Target total runtime requested by the caller."
+    )
+    total_minutes: int = Field(..., description="Cumulative runtime for the returned playlist.")
+    items: List[PlaylistBuildItem] = Field(..., description="Ordered playlist items with cumulative runtime.")
+
+
+class PlaylistExportItem(BaseModel):
+    path: str = Field(..., description="Absolute media path to include in the export.")
+    title: Optional[str] = Field(None, description="Friendly title stored in CSV exports.")
+
+
+class PlaylistExportRequest(BaseModel):
+    name: str = Field(..., description="Human friendly name used for the exported filename.")
+    format: str = Field(..., regex="^(m3u|csv)$", description="Export format: m3u or csv.")
+    items: List[PlaylistExportItem] = Field(..., description="Ordered items to include in the export.")
+
+
+class PlaylistExportResponse(BaseModel):
+    ok: bool = Field(True, description="True when the export completed successfully.")
+    format: str = Field(..., description="Export format that was written.")
+    path: str = Field(..., description="Absolute path to the exported playlist file.")
+    count: int = Field(..., description="Number of entries written to the export file.")
+
+
+class PlaylistAiConstraints(BaseModel):
+    dur_min: Optional[int] = Field(None, description="Minimum runtime for generated suggestions.")
+    dur_max: Optional[int] = Field(None, description="Maximum runtime for generated suggestions.")
+    conf_min: Optional[float] = Field(None, description="Minimum confidence threshold.")
+    qual_min: Optional[int] = Field(None, description="Minimum quality threshold.")
+    langs_audio: List[str] = Field(default_factory=list, description="Preferred audio language codes.")
+    langs_subs: List[str] = Field(default_factory=list, description="Preferred subtitle language codes.")
+    genres: List[str] = Field(default_factory=list, description="Preferred genres to bias suggestions.")
+    target_minutes: Optional[int] = Field(None, description="Target runtime window for the evening playlist.")
+
+
+class PlaylistAiRequest(BaseModel):
+    question: str = Field(..., description="High level preference question posed to the assistant.")
+    constraints: PlaylistAiConstraints = Field(default_factory=PlaylistAiConstraints)
+
+
+class PlaylistAiPlanItem(BaseModel):
+    id: str = Field(..., description="Identifier proposed by the assistant.")
+    reason: Optional[str] = Field(None, description="Short justification for including the item.")
+    confidence: Optional[float] = Field(None, description="Catalog confidence score when referenced.")
+    quality: Optional[int] = Field(None, description="Quality score when referenced.")
+
+
+class PlaylistAiResponse(BaseModel):
+    mode: str = Field(..., description="Assistant strategy used for the plan.")
+    items: List[PlaylistAiPlanItem] = Field(default_factory=list, description="Ordered playlist items.")
+    reasoning: str = Field(..., description="Narrative explanation of the selection.")
+    sources: List[str] = Field(default_factory=list, description="Data sources consulted while planning.")
+
+
 class CatalogSearchHit(BaseModel):
     id: str = Field(..., description="Identifier returned by catalog listings.")
     kind: str = Field(..., description="Item kind associated with the hit.")

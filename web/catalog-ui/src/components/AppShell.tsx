@@ -12,6 +12,7 @@ const NAV_LINKS = [
   { to: '/movies', label: 'Movies' },
   { to: '/tv', label: 'TV' },
   { to: '/search', label: 'Search' },
+  { to: '/playlist', label: 'Evening Playlist' },
 ];
 
 interface AppShellProps {

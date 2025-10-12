@@ -5,11 +5,12 @@ import logging
 import time
 import asyncio
 import json
+import random
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import (
     Depends,
@@ -36,6 +37,16 @@ from .models import (
     AssistantAskRequest,
     AssistantAskResponse,
     AssistantStatusResponse,
+    PlaylistAiRequest,
+    PlaylistAiResponse,
+    PlaylistAiPlanItem,
+    PlaylistCandidate,
+    PlaylistBuildRequest,
+    PlaylistBuildResponse,
+    PlaylistBuildItem,
+    PlaylistExportRequest,
+    PlaylistExportResponse,
+    PlaylistSuggestResponse,
     RealtimeHeartbeatRequest,
     RealtimeHeartbeatResponse,
     RealtimeStatusResponse,
@@ -191,6 +202,33 @@ def create_app(config: APIServerConfig) -> FastAPI:
         if not token:
             return None
         return f"/v1/catalog/thumb?id={token}"
+
+    def mask_media_path(path: Optional[str]) -> str:
+        if not path:
+            return ""
+        normalized = str(path).replace("\\", "/")
+        segments = [segment for segment in normalized.split("/") if segment]
+        if not segments:
+            return normalized
+        if len(segments) <= 2:
+            return normalized
+        return "/".join(["…"] + segments[-2:])
+
+    def parse_bool_token(value: Optional[str]) -> Optional[bool]:
+        if value is None:
+            return None
+        token = value.strip().lower()
+        if token in {"1", "true", "yes", "y", "required", "present"}:
+            return True
+        if token in {"0", "false", "no", "n", "absent"}:
+            return False
+        return None
+
+    def resolve_open_plan(path_value: Optional[str]) -> Dict[str, str]:
+        path = str(path_value or "").strip()
+        if not path:
+            return {"plan": "shell_open", "path": ""}
+        return {"plan": "shell_open", "path": path}
 
     @app.get("/v1/catalog/subscribe")
     async def catalog_subscribe(
@@ -686,6 +724,214 @@ def create_app(config: APIServerConfig) -> FastAPI:
         if not path:
             raise HTTPException(status_code=400, detail="path is required")
         return CatalogOpenFolderResponse(plan="shell_open", path=path)
+
+    @app.get("/v1/playlist/suggest", response_model=PlaylistSuggestResponse)
+    def playlist_suggest(
+        dur_min: Optional[int] = Query(None, ge=0, description="Minimum runtime in minutes."),
+        dur_max: Optional[int] = Query(None, ge=0, description="Maximum runtime in minutes."),
+        conf_min: Optional[float] = Query(None, ge=0.0, le=1.0, description="Minimum confidence threshold."),
+        qual_min: Optional[int] = Query(None, ge=0, le=100, description="Minimum quality score."),
+        audio: Optional[str] = Query(None, description="Comma separated audio language codes."),
+        subs: Optional[str] = Query(
+            None, description="Subtitle requirement: yes/no/any (defaults to any)."
+        ),
+        year_min: Optional[int] = Query(None, ge=1900, description="Minimum release/air year."),
+        year_max: Optional[int] = Query(None, ge=1900, description="Maximum release/air year."),
+        drive: Optional[str] = Query(None, description="Restrict suggestions to a drive label."),
+        genres: Optional[str] = Query(None, description="Comma separated list of preferred genres."),
+        limit: Optional[int] = Query(40, ge=1, le=200, description="Maximum candidates to return."),
+        _: str = Depends(auth_dependency),
+    ) -> PlaylistSuggestResponse:
+        audio_filters = parse_langs(audio)
+        genre_filters = parse_langs(genres)
+        subs_flag = parse_bool_token(subs)
+        resolved_limit = clamp_limit(limit, 40)
+        candidates = data.playlist_candidates(
+            dur_min=dur_min,
+            dur_max=dur_max,
+            conf_min=conf_min,
+            qual_min=qual_min,
+            audio_langs=audio_filters,
+            subs_required=subs_flag,
+            year_min=year_min,
+            year_max=year_max,
+            drive=drive,
+            genres=genre_filters,
+            limit=resolved_limit,
+        )
+        payload = [
+            PlaylistCandidate(
+                id=row["id"],
+                kind=row.get("kind", "movie"),
+                drive=row.get("drive"),
+                path=row.get("path") or "",
+                masked_path=mask_media_path(row.get("path")),
+                title=row.get("title"),
+                year=row.get("year"),
+                duration_min=row.get("duration_min"),
+                quality=row.get("quality"),
+                confidence=float(row.get("confidence") or 0.0),
+                langs_audio=row.get("langs_audio") or [],
+                langs_subs=row.get("langs_subs") or [],
+                subs_present=bool(row.get("subs_present")),
+                genres=row.get("genres") or [],
+            )
+            for row in candidates
+        ]
+        return PlaylistSuggestResponse(limit=resolved_limit, candidates=payload)
+
+    @app.post("/v1/playlist/build", response_model=PlaylistBuildResponse)
+    def playlist_build(
+        request: PlaylistBuildRequest,
+        _: str = Depends(auth_dependency),
+    ) -> PlaylistBuildResponse:
+        if not request.items:
+            raise HTTPException(status_code=400, detail="items list cannot be empty")
+        mode = (request.mode or "weighted").strip().lower()
+        if mode not in {"weighted", "sort_quality", "sort_confidence"}:
+            raise HTTPException(status_code=400, detail="invalid mode")
+        resolved = data.playlist_items_by_ids(request.items)
+        missing = [item for item in request.items if item not in resolved]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"items not found: {', '.join(missing)}")
+        items = [resolved[item_id] for item_id in request.items if item_id in resolved]
+        if mode == "sort_quality":
+            items.sort(
+                key=lambda row: (
+                    row.get("quality") if row.get("quality") is not None else -1,
+                    row.get("confidence") or 0.0,
+                    row.get("duration_min") or 0,
+                ),
+                reverse=True,
+            )
+        elif mode == "sort_confidence":
+            items.sort(
+                key=lambda row: (
+                    row.get("confidence") or 0.0,
+                    row.get("quality") if row.get("quality") is not None else -1,
+                    row.get("duration_min") or 0,
+                ),
+                reverse=True,
+            )
+        else:
+            rng = random.Random(secrets.randbits(64))
+
+            def _weight(row: Dict[str, Any]) -> float:
+                quality = float(row.get("quality") or 0) / 100.0
+                confidence = float(row.get("confidence") or 0.0)
+                return max(0.05, min(1.0, (quality * 0.6) + (confidence * 0.4)))
+
+            weighted: List[Tuple[float, Dict[str, Any]]] = []
+            for row in items:
+                weight = _weight(row)
+                score = rng.random() ** (1.0 / max(weight, 1e-3))
+                weighted.append((score, row))
+            weighted.sort(key=lambda pair: pair[0], reverse=True)
+            items = [row for _, row in weighted]
+
+        target = request.target_minutes if request.target_minutes and request.target_minutes > 0 else None
+        playlist_rows = []
+        total_minutes = 0
+        for row in items:
+            duration = row.get("duration_min") or 0
+            next_total = total_minutes + (duration or 0)
+            if target and total_minutes >= target and playlist_rows:
+                break
+            total_minutes = next_total
+            playlist_rows.append(
+                PlaylistBuildItem(
+                    id=row["id"],
+                    kind=row.get("kind", "movie"),
+                    drive=row.get("drive"),
+                    title=row.get("title"),
+                    year=row.get("year"),
+                    duration_min=row.get("duration_min"),
+                    cumulative_minutes=total_minutes,
+                    path=row.get("path") or "",
+                    masked_path=mask_media_path(row.get("path")),
+                    quality=row.get("quality"),
+                    confidence=float(row.get("confidence") or 0.0),
+                    langs_audio=row.get("langs_audio") or [],
+                    langs_subs=row.get("langs_subs") or [],
+                    subs_present=bool(row.get("subs_present")),
+                    open_plan=resolve_open_plan(
+                        row.get("folder_path")
+                        if row.get("kind") == "movie"
+                        else str(Path(str(row.get("path") or "")).parent)
+                    ),
+                )
+            )
+        return PlaylistBuildResponse(
+            mode=mode,
+            target_minutes=target,
+            total_minutes=total_minutes,
+            items=playlist_rows,
+        )
+
+    @app.post("/v1/playlist/export", response_model=PlaylistExportResponse)
+    def playlist_export(
+        request: PlaylistExportRequest,
+        _: str = Depends(auth_dependency),
+    ) -> PlaylistExportResponse:
+        if not request.items:
+            raise HTTPException(status_code=400, detail="items list cannot be empty")
+        export_path = data.playlist_export(
+            request.name,
+            request.format,
+            [item.model_dump() for item in request.items],
+        )
+        return PlaylistExportResponse(
+            format=request.format,
+            path=str(export_path),
+            count=len(request.items),
+        )
+
+    @app.post("/v1/playlist/open-folder", response_model=CatalogOpenFolderResponse)
+    def playlist_open_folder(
+        request: CatalogOpenFolderRequest,
+        _: str = Depends(auth_dependency),
+    ) -> CatalogOpenFolderResponse:
+        path = request.path.strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="path is required")
+        return CatalogOpenFolderResponse(plan="shell_open", path=path)
+
+    @app.post("/v1/playlist/ai", response_model=PlaylistAiResponse)
+    def playlist_ai(
+        request: PlaylistAiRequest,
+        _: str = Depends(auth_dependency),
+    ) -> PlaylistAiResponse:
+        if not assistant_gateway.enabled:
+            raise HTTPException(status_code=503, detail="assistant not available")
+        constraints = request.constraints
+        candidates = data.playlist_candidates(
+            dur_min=constraints.dur_min,
+            dur_max=constraints.dur_max,
+            conf_min=constraints.conf_min,
+            qual_min=constraints.qual_min,
+            audio_langs=constraints.langs_audio,
+            genres=constraints.genres,
+            limit=12,
+        )
+        plan_items = []
+        for row in candidates[:6]:
+            plan_items.append(
+                PlaylistAiPlanItem(
+                    id=row["id"],
+                    reason=f"Matches request '{request.question}' with quality {row.get('quality')} and confidence {(row.get('confidence') or 0.0):.2f}",
+                    confidence=float(row.get("confidence") or 0.0),
+                    quality=row.get("quality"),
+                )
+            )
+        reasoning = (
+            "Selected up to six high quality matches within the requested constraints. "
+            "Results favour catalog entries with higher quality and confidence scores."
+        )
+        sources = [
+            "db_query_sql:view_movies_list",  # documented pseudo tool usage
+            "db_query_sql:view_tv_episodes_list",
+        ]
+        return PlaylistAiResponse(mode="catalog_sampler", items=plan_items, reasoning=reasoning, sources=sources)
 
     @app.get("/v1/catalog/summary", response_model=CatalogSummaryResponse)
     def catalog_summary(

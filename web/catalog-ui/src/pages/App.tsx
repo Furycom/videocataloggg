@@ -2,12 +2,15 @@ import { Route, Routes } from 'react-router-dom';
 
 import AppShell from '../components/AppShell';
 import { DetailDrawer } from '../components/DetailDrawer';
+import { PlaylistDrawer } from '../components/PlaylistDrawer';
 import { useApiKey } from '../hooks/useApiKey';
 import { DetailDrawerProvider, useDetailDrawer } from '../hooks/useDetailDrawer';
 import { AssistantStatusProvider } from '../hooks/useAssistantStatus';
 import { LiveCatalogProvider } from '../hooks/useLiveCatalog';
+import { PlaylistProvider } from '../hooks/usePlaylist';
 import HomePage from './HomePage';
 import MoviesPage from './MoviesPage';
+import PlaylistPage from './PlaylistPage';
 import SearchPage from './SearchPage';
 import TvPage from './TvPage';
 import styles from './App.module.css';
@@ -44,8 +47,10 @@ function AppRoutes() {
         <Route path="/movies" element={<MoviesPage />} />
         <Route path="/tv" element={<TvPage />} />
         <Route path="/search" element={<SearchPage />} />
+        <Route path="/playlist" element={<PlaylistPage />} />
       </Routes>
       <DetailDrawer state={drawer.state} onClose={drawer.closeDetail} />
+      <PlaylistDrawer />
     </>
   );
 }
@@ -56,9 +61,11 @@ function InnerApp() {
     <AssistantStatusProvider>
       <LiveCatalogProvider>
         <DetailDrawerProvider>
-          <AppShell rightPanel={<ApiKeyBadge apiKey={apiKey} onUpdate={setApiKey} />}>
-            <AppRoutes />
-          </AppShell>
+          <PlaylistProvider>
+            <AppShell rightPanel={<ApiKeyBadge apiKey={apiKey} onUpdate={setApiKey} />}>
+              <AppRoutes />
+            </AppShell>
+          </PlaylistProvider>
         </DetailDrawerProvider>
       </LiveCatalogProvider>
     </AssistantStatusProvider>

@@ -11,10 +11,17 @@ import type {
   SearchResponse,
   SeriesRow,
   SeasonRow,
+  PlaylistAiResponse,
+  PlaylistBuildResponse,
+  PlaylistExportPayload,
+  PlaylistExportResponse,
+  PlaylistOrderMode,
+  PlaylistSuggestResponse,
 } from './types';
 
 const API_BASE = '/v1/catalog';
 const ASSISTANT_BASE = '/v1/assistant';
+const PLAYLIST_BASE = '/v1/playlist';
 
 export function getStoredApiKey(): string | null {
   try {
@@ -101,6 +108,52 @@ export async function openFolder(path: string): Promise<{ plan: string; path: st
   return fetchJson<{ plan: string; path: string }>(`${API_BASE}/open-folder`, {
     method: 'POST',
     body: JSON.stringify({ path }),
+  });
+}
+
+export async function getPlaylistSuggestions(
+  params: Record<string, unknown>,
+): Promise<PlaylistSuggestResponse> {
+  const query = buildQuery(params);
+  return fetchJson<PlaylistSuggestResponse>(`${PLAYLIST_BASE}/suggest${query}`);
+}
+
+export async function buildPlaylist(body: {
+  items: string[];
+  mode?: PlaylistOrderMode;
+  target_minutes?: number | null;
+}): Promise<PlaylistBuildResponse> {
+  return fetchJson<PlaylistBuildResponse>(`${PLAYLIST_BASE}/build`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function exportPlaylist(body: {
+  name: string;
+  format: 'm3u' | 'csv';
+  items: PlaylistExportPayload[];
+}): Promise<PlaylistExportResponse> {
+  return fetchJson<PlaylistExportResponse>(`${PLAYLIST_BASE}/export`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function openPlaylistFolder(path: string): Promise<{ plan: string; path: string }> {
+  return fetchJson<{ plan: string; path: string }>(`${PLAYLIST_BASE}/open-folder`, {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
+
+export async function requestPlaylistAi(
+  question: string,
+  constraints: Record<string, unknown>,
+): Promise<PlaylistAiResponse> {
+  return fetchJson<PlaylistAiResponse>(`${PLAYLIST_BASE}/ai`, {
+    method: 'POST',
+    body: JSON.stringify({ question, constraints }),
   });
 }
 
