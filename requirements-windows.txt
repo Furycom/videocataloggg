@@ -28,7 +28,8 @@ langchain-core==0.2.34
 langchain-community==0.2.12
 sentence-transformers==3.0.1
 huggingface-hub==0.24.6
-faiss-cpu==1.7.4
+# FAISS is installed separately by the launcher so Windows users without build tools can
+# still start the application and receive a helpful warning instead of a hard failure.
 #
 # Optional dependencies (llama-cpp-python, hnswlib) are installed by the Windows launcher so
 # it can provide clearer error messages and continue when build tools are unavailable.
