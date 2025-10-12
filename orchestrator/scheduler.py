@@ -1,8 +1,12 @@
 """Central orchestrator scheduler."""
 from __future__ import annotations
 
+import argparse
 import json
+import logging
+import signal
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -10,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from multiprocessing import Process
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .checkpoint import ensure_schema as ensure_checkpoint_schema, load_checkpoint
 from .gpu import GPUManager
@@ -115,6 +119,7 @@ class Scheduler:
             conn.commit()
         finally:
             conn.close()
+
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -541,3 +546,82 @@ class Scheduler:
             conn.commit()
         finally:
             conn.close()
+
+
+def _resolve_working_dir(path_token: Optional[str]) -> Path:
+    if path_token:
+        candidate = Path(path_token).expanduser()
+        return candidate.resolve()
+    from core.paths import resolve_working_dir
+
+    return resolve_working_dir()
+
+
+def _load_runtime_settings(working_dir: Path) -> Dict[str, Any]:
+    from core.paths import ensure_working_dir_structure
+    from core.settings import load_settings
+
+    ensure_working_dir_structure(working_dir)
+    return load_settings(working_dir)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point for running the scheduler as a standalone service."""
+
+    parser = argparse.ArgumentParser(description="Start the VideoCatalog orchestrator scheduler.")
+    parser.add_argument("--working-dir", dest="working_dir", help="Override the VideoCatalog working directory")
+    parser.add_argument(
+        "--heartbeat",
+        dest="heartbeat",
+        type=int,
+        default=None,
+        help="Override heartbeat interval for CLI tick output (seconds)",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+    working_dir = _resolve_working_dir(args.working_dir)
+    settings = _load_runtime_settings(working_dir)
+    logger = OrchestratorLogger(working_dir)
+    scheduler = Scheduler(working_dir=working_dir, settings=settings, logger=logger)
+
+    stop_event = threading.Event()
+
+    def _shutdown_handler(signum, _frame):
+        logger.log_scheduler(1002, True, signal=int(signum), action="shutdown")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _shutdown_handler)
+        except ValueError:
+            pass
+
+    try:
+        scheduler.start()
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.log_scheduler(1001, False, err=str(exc))
+        print(f"Failed to start orchestrator scheduler: {exc}", file=sys.stderr)
+        return 1
+
+    logger.log_scheduler(1000, True, status="started")
+    print("ORCH_HEARTBEAT ready", flush=True)
+
+    heartbeat = args.heartbeat or int(settings.get("orchestrator", {}).get("heartbeat_s", 5) or 5)
+    heartbeat = max(1, min(int(heartbeat), 60))
+
+    try:
+        while not stop_event.wait(timeout=heartbeat):
+            print("ORCH_HEARTBEAT tick", flush=True)
+    except KeyboardInterrupt:
+        stop_event.set()
+    finally:
+        scheduler.stop()
+        logger.log_scheduler(1003, True, status="stopped")
+
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry
+    sys.exit(main())

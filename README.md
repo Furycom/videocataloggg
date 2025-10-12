@@ -2,6 +2,18 @@
 
 Utilities for scanning large removable media libraries and keeping a SQLite-based catalog.
 
+## Starting VideoCatalog A2.0
+
+1. Double-click the **VideoCatalog (A2.0)** desktop shortcut, or run `scripts\start_videocatalog.bat` from the repository.
+2. Your default browser opens to [http://127.0.0.1:27182](http://127.0.0.1:27182); the UI streams entirely over localhost.
+3. If the AI panel displays **GPU disabled**, open the **Diagnostics** tab and run **Preflight** to see the remediation checklist.
+
+### Troubleshooting the launcher
+
+- **Port already in use.** Edit `%USERPROFILE%\VideoCatalog\settings.json` and change `server.port` to an open TCP port, then rerun the launcher.
+- **Missing ffprobe.** Install FFmpeg and ensure `ffprobe.exe` is on `PATH`. Until then, quality header analysis stays disabled and the launcher prints a yellow warning.
+- **Legacy shortcuts.** Existing shortcuts that target `diskscannergui.py` still work; they now invoke the new launcher so you do not need to recreate them.
+
 ## Windows 11 bootstrap & stabilization
 
 1. Install the NVIDIA Windows driver and Python 3.11+ (64-bit). Ensure `python` is on your `PATH` when you open PowerShell.
@@ -15,7 +27,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
    The script prepares `%USERPROFILE%\VideoCatalog` as the writable home, downloads the assistant warmup models (Qwen2 0.5B
    instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies from
-   `requirements-windows.txt`, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:8756`), and
+   `requirements-windows.txt`, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
    executes the HTTP preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the
    console. Rerun with `-SkipInstall` to reuse an existing virtual environment.
 
@@ -56,7 +68,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
 ### Serving the catalog UI
 
-- After `stabilize.ps1` reports success the API continues running. Visit `http://127.0.0.1:8756/catalog` in a browser and supply
+- After `stabilize.ps1` reports success the API continues running. Visit `http://127.0.0.1:27182/catalog` in a browser and supply
   the API key (`localdev` by default) when prompted. The UI streams data exclusively over localhost—`settings.json` enforces
   `server.host = 127.0.0.1` and `lan_refuse = true`.
 - WebSocket and SSE subscribers are exposed via `/v1/catalog/subscribe`. Successful connections increment the `ws_clients` and
@@ -110,20 +122,20 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
 - Launch the service directly with `python videocatalog_api.py --api-key <KEY>` (optional `--host`, `--port`, and repeated `--cors` flags override `settings.json`). On start the CLI prints `API listening on http://<host>:<port>` so other tools can probe it locally.
 - The GUI exposes a **Start Local API** toggle under the Database card. It shows host/port plus whether an API key is configured and runs the server in a background process. Disable it from the same button or let it auto-start when `settings.json` sets `"api.enabled_default": true`.
-- All endpoints are GET-only, paginate with `limit`/`offset`, and require an `X-API-Key` header. Missing or empty keys return `401 Unauthorized`. Defaults bind to `127.0.0.1:8756`; expanding beyond localhost or exposing the API externally is at your own risk.
+- All endpoints are GET-only, paginate with `limit`/`offset`, and require an `X-API-Key` header. Missing or empty keys return `401 Unauthorized`. Defaults bind to `127.0.0.1:27182`; expanding beyond localhost or exposing the API externally is at your own risk.
 - `/v1/reports/*` mirrors the GUI summaries (`overview`, `top-extensions`, `largest-files`, `heaviest-folders`, `recent`) and clamps `limit` parameters to the configured API maximum.
 - `/v1/semantic/search` exposes the same ANN/FTS hybrid search used by the CLI. Supply `q`, optional `mode=ann|text|hybrid`, `limit`, `offset`, `drive_label`, and `hybrid=true` to tweak scoring. New maintenance routes—`GET /v1/semantic/index`, `POST /v1/semantic/index` (mode=`build|rebuild`), and `POST /v1/semantic/transcribe`—wrap the underlying pipeline with authentication and respect the `semantic.*_phase` toggles in `settings.json`.
 - `/v1/music` returns inferred music metadata for a shard with optional filters (`q`, `ext`, `min_confidence`). Responses include parsed artist/title/album/track fields plus JSON-decoded reasons and suggestions arrays. `GET /v1/music/review` exposes the manual review queue ordered by lowest confidence first.
 - Example requests:
 
   ```bash
-  curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" http://127.0.0.1:8756/v1/health
+  curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" http://127.0.0.1:27182/v1/health
   curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" \
-       "http://127.0.0.1:8756/v1/inventory?drive_label=MyDrive&limit=25&q=hdr"
+       "http://127.0.0.1:27182/v1/inventory?drive_label=MyDrive&limit=25&q=hdr"
   curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" \
-       "http://127.0.0.1:8756/v1/features/vector?drive_label=MyDrive&path=movies/clip.mp4&raw=true"
+       "http://127.0.0.1:27182/v1/features/vector?drive_label=MyDrive&path=movies/clip.mp4&raw=true"
   curl -H "X-API-Key: $VIDEOCATALOG_API_KEY" \
-       "http://127.0.0.1:8756/v1/music?drive_label=MyDrive&min_confidence=0.75&limit=25"
+       "http://127.0.0.1:27182/v1/music?drive_label=MyDrive&min_confidence=0.75&limit=25"
   ```
 
 - Configure behaviour under the `"api"` section of `settings.json` (host, port, API key, allowed CORS origins, default page size). Pagination caps at `max_page_size`, and `/v1/features/vector` enforces a dimensionality guard unless `?raw=true` is supplied to download large vectors explicitly.
@@ -189,18 +201,18 @@ If the ONNX model or runtime cannot be loaded the scanner posts a red banner, sk
 
 ## GPU acceleration
 
-VideoCatalog automatically probes NVIDIA hardware on Windows 11 via NVML (`pynvml`), sanity-checks the ONNX Runtime CUDA execution provider, and falls back to DirectML or the CPU-only backend whenever CUDA cannot be brought online safely. Detection also queries FFmpeg (`ffmpeg -hwaccels`) so NVDEC decoding is enabled whenever the binary advertises `cuda` support. Capabilities are cached for the current process and surfaced through both the CLI and GUI so you can confirm the active backend at a glance.
+VideoCatalog automatically probes NVIDIA hardware on Windows 11 via NVML (`pynvml`), sanity-checks the ONNX Runtime CUDA execution provider, and keeps heavy AI features disabled until a compatible GPU backend (CUDA or DirectML) is available. There is no CPU fallback for assistant or semantic workloads. Detection also queries FFmpeg (`ffmpeg -hwaccels`) so NVDEC decoding is enabled whenever the binary advertises `cuda` support. Capabilities are cached for the current process and surfaced through both the CLI and GUI so you can confirm the active backend at a glance.
 
 - `settings.json` ships with a `"gpu"` block controlling the default policy, whether FFmpeg hardware acceleration is allowed, the minimum free VRAM required before a GPU provider is selected, and the maximum number of concurrent GPU workers.
-- CLI overrides: `--gpu-policy AUTO|FORCE_GPU|CPU_ONLY` and `--gpu-hwaccel` / `--no-gpu-hwaccel`. `AUTO` always attempts CUDA first, then DirectML, then CPU. `FORCE_GPU` emits a warning when neither CUDA nor DirectML can be created but still downgrades gracefully to keep the scan running.
+- CLI overrides: `--gpu-policy AUTO|FORCE_GPU|CPU_ONLY` and `--gpu-hwaccel` / `--no-gpu-hwaccel`. `AUTO` always attempts CUDA first, then DirectML; when no GPU backend is healthy the assistant/semantic jobs remain disabled. `FORCE_GPU` keeps the gate closed until CUDA passes. `CPU_ONLY` is intended for diagnostics and runs non-AI scans only.
 - The GUI’s **GPU** card shows the detected adapter (name, VRAM, driver), the provider that will be used with the current policy, and whether FFmpeg hardware acceleration is active. In addition to Auto/Force/CPU radio buttons and the FFmpeg checkbox, a new **Troubleshoot…** button opens a provisioning assistant.
 - The provisioning assistant parses the CUDA error returned by ONNX Runtime, highlights missing dependencies (driver, CUDA Toolkit, cuDNN, MSVC), offers a one-click `winget install -e --id Nvidia.CUDA`, links to the official ONNX Runtime CUDA requirements, and exposes buttons to retry CUDA or fall back to DirectML immediately.
-- If CUDA starts but free VRAM dips below the configured threshold, the run logs a warning and automatically continues on the CPU to stay stable. When CUDA cannot be loaded, DirectML is selected transparently (when available); otherwise the CPU provider is used. TMK+PDQF and Chromaprint fingerprinting always remain CPU-bound so disk I/O pacing and hashing behaviour stay unchanged.
+- If CUDA starts but free VRAM dips below the configured threshold, the run logs a warning and pauses heavy AI jobs until resources recover. When CUDA cannot be loaded, DirectML is selected transparently when available. TMK+PDQF and Chromaprint fingerprinting always remain CPU-bound so disk I/O pacing and hashing behaviour stay unchanged.
 - FFmpeg automatically receives `-hwaccel cuda` when hardware decoding is allowed and NVDEC support is detected. Clearing the checkbox (or passing `--no-gpu-hwaccel`) forces software decode without affecting ONNX inference.
 
 **Troubleshooting tips**
 
-- Verify `nvidia-smi` works and that the NVIDIA driver is current. The GPU status line falls back to `provider: CPU` when GPU backends cannot be loaded.
+- Verify `nvidia-smi` works and that the NVIDIA driver is current. The GPU status line reports `AI disabled (GPU required …)` when backends cannot be loaded.
 - Run `winget install -e --id Nvidia.CUDA` (or use the GUI button) to install the CUDA Toolkit and Visual C++ dependencies that ONNX Runtime expects. Download cuDNN from NVIDIA if the checklist reports it missing.
 - Inspect `scanner.log` for messages such as `GPU: CUDA EP unavailable — falling back to DirectML` or `GPU: FORCE_GPU requested but no compatible provider found — using CPU` to confirm which backend is active.
 - If FFmpeg lacks NVDEC support, run `ffmpeg -hwaccels` manually. The GUI refresh button reruns detection once a new build is installed.

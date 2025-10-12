@@ -21,7 +21,7 @@ import requests
 from core.paths import get_catalog_db_path, resolve_working_dir
 from core.settings import load_settings
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8756"
+DEFAULT_BASE_URL = "http://127.0.0.1:27182"
 
 
 def _resolve_api_key(override: Optional[str], settings: Dict[str, object]) -> Optional[str]:
@@ -301,9 +301,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     api_settings = settings.get("api") if isinstance(settings.get("api"), dict) else {}
     if isinstance(api_settings, dict):
         host = api_settings.get("host") or "127.0.0.1"
-        port = api_settings.get("port") or 8756
+        port = api_settings.get("port") or 27182
     else:
-        host, port = "127.0.0.1", 8756
+        host, port = "127.0.0.1", 27182
     base_default = args.api_base or f"http://{host}:{port}"
     api_base = args.api_base or base_default or DEFAULT_BASE_URL
     api_key = _resolve_api_key(args.api_key, settings)

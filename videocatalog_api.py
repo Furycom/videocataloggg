@@ -17,7 +17,7 @@ from core.paths import resolve_working_dir
 from core.settings import load_settings
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8756
+DEFAULT_PORT = 27182
 DEFAULT_CORS = ["http://localhost", "http://127.0.0.1"]
 
 

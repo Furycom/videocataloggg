@@ -213,7 +213,7 @@ try {
     while ((Get-Date) -lt $deadline) {
         try {
             $headers = @{ 'X-API-Key' = $env:VIDEOCATALOG_API_KEY }
-            $response = Invoke-WebRequest -Uri 'http://127.0.0.1:8756/v1/health' -Headers $headers -TimeoutSec 5 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri 'http://127.0.0.1:27182/v1/health' -Headers $headers -TimeoutSec 5 -ErrorAction Stop
             if ($response.StatusCode -eq 200) {
                 $healthOk = $true
                 break
@@ -226,7 +226,7 @@ try {
         Add-Summary 'API server' 'FAIL' 'Server did not become ready'
         throw "API server failed to start"
     }
-    Add-Summary 'API server' 'PASS' 'API reachable on http://127.0.0.1:8756'
+    Add-Summary 'API server' 'PASS' 'API reachable on http://127.0.0.1:27182'
 
     # Optional orchestrator warmup when GPU present
     if ($gpuReady) {
@@ -387,7 +387,7 @@ finally:
     Write-Step "7) Assistant sanity check"
     try {
         $headers = @{ 'X-API-Key' = $env:VIDEOCATALOG_API_KEY }
-        $assistantStatus = Invoke-WebRequest -Uri 'http://127.0.0.1:8756/v1/assistant/status' -Headers $headers -TimeoutSec 10
+        $assistantStatus = Invoke-WebRequest -Uri 'http://127.0.0.1:27182/v1/assistant/status' -Headers $headers -TimeoutSec 10
         if ($assistantStatus.StatusCode -eq 200) {
             Add-Summary 'Assistant status' 'PASS' 'assistant/status reachable'
         } else {
