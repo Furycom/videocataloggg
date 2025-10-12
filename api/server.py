@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from assistant_webmon import WebMonitor
+from orchestrator.api import OrchestratorConfig, OrchestratorService
 
 from .auth import APIKeyAuth
 from .assistant_gateway import AssistantGateway
@@ -127,13 +128,17 @@ def create_app(config: APIServerConfig) -> FastAPI:
 
     auth_dependency = APIKeyAuth(config.api_key)
     data = config.data_access
+    orchestrator_service = OrchestratorService(
+        OrchestratorConfig(working_dir=str(data.working_dir), settings=data.settings_payload)
+    )
     web_monitor = WebMonitor(data.working_dir)
     event_broker = CatalogEventBroker(data, monitor=web_monitor)
-    vector_worker = VectorRefreshWorker(data)
+    vector_worker = VectorRefreshWorker(data, orchestrator=orchestrator_service)
     assistant_gateway = AssistantGateway(data)
 
     @app.on_event("startup")
     async def _startup() -> None:
+        orchestrator_service.start()
         await event_broker.start()
         await vector_worker.start()
         await web_monitor.start()
@@ -144,6 +149,7 @@ def create_app(config: APIServerConfig) -> FastAPI:
         await vector_worker.stop()
         await web_monitor.stop()
         assistant_gateway.shutdown()
+        orchestrator_service.stop()
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):  # type: ignore[override]
@@ -1241,6 +1247,8 @@ def create_app(config: APIServerConfig) -> FastAPI:
         except SemanticPhaseError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return SemanticOperationResponse(ok=True, action="transcribe", stats=stats)
+
+    app.include_router(orchestrator_service.router())
 
     dist_dir = (
         Path(__file__).resolve().parent.parent / "web" / "catalog-ui" / "dist"
