@@ -10,9 +10,13 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-from PIL import Image
-
 from gpu.runtime import get_hwaccel_args
+from .pillow_support import (
+    PillowImage,
+    PillowUnavailableError,
+    ensure_pillow,
+    load_pillow_image,
+)
 
 try:  # pragma: no cover - optional dependency guard
     import av  # type: ignore
@@ -60,7 +64,7 @@ class FrameSample:
     """In-memory representation of an extracted video frame."""
 
     timestamp: float
-    image: Image.Image
+    image: PillowImage
 
 
 class FrameSampler:
@@ -83,6 +87,9 @@ class FrameSampler:
 
     def sample(self, video_path: Path, *, max_frames: Optional[int] = None) -> List[FrameSample]:
         """Return a list of sampled frames ordered by timestamp."""
+
+        if not ensure_pillow(LOGGER):
+            return []
 
         frame_budget = max(1, int(max_frames or self._max_frames))
         timestamps = self._collect_timestamps(video_path, frame_budget)
@@ -293,7 +300,7 @@ class FrameSampler:
         video_path: Path,
         timestamp: float,
         hwaccel_args: Sequence[str],
-    ) -> Optional[Image.Image]:
+    ) -> Optional[PillowImage]:
         args: List[str] = [str(self._ffmpeg_path), "-hide_banner", "-loglevel", "error"]
         args.extend(hwaccel_args)
         if timestamp > 0:
@@ -315,7 +322,11 @@ class FrameSampler:
         if completed.returncode != 0 or not completed.stdout:
             return None
         try:
-            with Image.open(io.BytesIO(completed.stdout)) as image:
+            pillow_image = load_pillow_image()
+        except PillowUnavailableError:
+            return None
+        try:
+            with pillow_image.open(io.BytesIO(completed.stdout)) as image:
                 return image.convert("RGB")
         except Exception:
             return None
@@ -415,7 +426,7 @@ def _valid_crop_filter(text: str) -> bool:
     return all(value >= 0 for value in values) and values[0] > 0 and values[1] > 0
 
 
-def _apply_crop(image: Image.Image, crop_filter: str) -> Image.Image:
+def _apply_crop(image: PillowImage, crop_filter: str) -> PillowImage:
     parts = crop_filter.split(":")
     if len(parts) != 4:
         return image
