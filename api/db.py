@@ -5,8 +5,10 @@ import base64
 import binascii
 import json
 import os
+import random
 import sqlite3
 import logging
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +100,48 @@ def _extract_quality_reasons(value: Any) -> List[str]:
     if isinstance(payload, list):
         return [str(item) for item in payload if str(item).strip()]
     return []
+
+
+def _normalise_str_list(value: Iterable[Any]) -> List[str]:
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _extract_genres(*payloads: Any) -> List[str]:
+    """Best effort genre extraction from assorted metadata payloads."""
+
+    genres: List[str] = []
+    for payload in payloads:
+        if not payload:
+            continue
+        current: Any = payload
+        if isinstance(current, str):
+            try:
+                current = json.loads(current)
+            except Exception:
+                parts = [segment.strip() for segment in current.replace(";", ",").split(",") if segment.strip()]
+                genres.extend(parts)
+                continue
+        if isinstance(current, dict):
+            for key, value in current.items():
+                key_norm = str(key).lower()
+                if key_norm in {"genres", "genre", "tags"}:
+                    if isinstance(value, (list, tuple, set)):
+                        genres.extend(_normalise_str_list(value))
+                    elif isinstance(value, str):
+                        genres.extend(
+                            [segment.strip() for segment in value.replace(";", ",").split(",") if segment.strip()]
+                        )
+        elif isinstance(current, (list, tuple, set)):
+            genres.extend(_normalise_str_list(current))
+    seen: set[str] = set()
+    unique: List[str] = []
+    for genre in genres:
+        key = genre.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(genre)
+    return unique
 
 
 @dataclass(slots=True)
@@ -2393,6 +2437,394 @@ class DataAccess:
         if count > _COUNT_GUARD:
             return None
         return int(count)
+
+    # ------------------------------------------------------------------
+    # Playlist helpers
+    # ------------------------------------------------------------------
+
+    def playlist_candidates(
+        self,
+        *,
+        dur_min: Optional[int] = None,
+        dur_max: Optional[int] = None,
+        conf_min: Optional[float] = None,
+        qual_min: Optional[int] = None,
+        audio_langs: Optional[Sequence[str]] = None,
+        subs_required: Optional[bool] = None,
+        year_min: Optional[int] = None,
+        year_max: Optional[int] = None,
+        drive: Optional[str] = None,
+        genres: Optional[Sequence[str]] = None,
+        limit: int = 40,
+    ) -> List[Dict[str, Any]]:
+        """Return candidate playlist items across all shards honoring the filters."""
+
+        limit = max(1, min(int(limit or 40), 200))
+        audio_filters = [lang.lower() for lang in audio_langs or [] if lang]
+        genre_filters = [genre.lower() for genre in genres or [] if genre]
+        min_duration_s = int(dur_min * 60) if dur_min else None
+        max_duration_s = int(dur_max * 60) if dur_max else None
+
+        def _lang_match(lang_list: Sequence[str], required: Sequence[str]) -> bool:
+            if not required:
+                return True
+            haystack = [lang.lower() for lang in lang_list]
+            return all(any(req == lang for lang in haystack) for req in required)
+
+        candidates: List[Dict[str, Any]] = []
+        for label, shard_path in self._iter_shards_with_labels():
+            if drive and drive.strip() and label != drive.strip():
+                continue
+            try:
+                conn = self._connect(shard_path)
+            except Exception:
+                continue
+            try:
+                shard_items = self._playlist_candidates_from_shard(
+                    conn,
+                    label,
+                    min_duration_s=min_duration_s,
+                    max_duration_s=max_duration_s,
+                    conf_min=conf_min,
+                    qual_min=qual_min,
+                    subs_required=subs_required,
+                    year_min=year_min,
+                    year_max=year_max,
+                )
+            finally:
+                conn.close()
+            for item in shard_items:
+                if audio_filters and not _lang_match(item.get("langs_audio", []), audio_filters):
+                    continue
+                if genre_filters:
+                    genres_lower = [genre.lower() for genre in item.get("genres") or []]
+                    if not all(any(g == genre for genre in genres_lower) for g in genre_filters):
+                        continue
+                candidates.append(item)
+                if len(candidates) >= limit:
+                    break
+            if len(candidates) >= limit:
+                break
+
+        candidates.sort(
+            key=lambda row: (
+                float(row.get("quality") or 0.0),
+                float(row.get("confidence") or 0.0),
+                -(row.get("duration_min") or 0),
+            ),
+            reverse=True,
+        )
+        return candidates[:limit]
+
+    def _playlist_candidates_from_shard(
+        self,
+        conn: sqlite3.Connection,
+        drive_label: str,
+        *,
+        min_duration_s: Optional[int],
+        max_duration_s: Optional[int],
+        conf_min: Optional[float],
+        qual_min: Optional[int],
+        subs_required: Optional[bool],
+        year_min: Optional[int],
+        year_max: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        tables = self._table_names(conn)
+        results: List[Dict[str, Any]] = []
+        clauses: List[str] = []
+        params: List[Any] = []
+
+        if conf_min is not None:
+            clauses.append("fp.confidence >= ?")
+            params.append(float(conf_min))
+        if qual_min is not None and "video_quality" in tables:
+            clauses.append("COALESCE(q.score, 0) >= ?")
+            params.append(int(qual_min))
+        if year_min is not None:
+            clauses.append("COALESCE(fp.parsed_year, 0) >= ?")
+            params.append(int(year_min))
+        if year_max is not None:
+            clauses.append("COALESCE(fp.parsed_year, 9999) <= ?")
+            params.append(int(year_max))
+        if min_duration_s is not None and "video_quality" in tables:
+            clauses.append("COALESCE(q.duration_s, 0) >= ?")
+            params.append(int(min_duration_s))
+        if max_duration_s is not None and "video_quality" in tables:
+            clauses.append("COALESCE(q.duration_s, 0) <= ?")
+            params.append(int(max_duration_s))
+        if subs_required is True and "video_quality" in tables:
+            clauses.append("COALESCE(q.subs_present, 0) = 1")
+        elif subs_required is False and "video_quality" in tables:
+            clauses.append("COALESCE(q.subs_present, 0) = 0")
+
+        where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+        movie_sql = (
+            "SELECT fp.folder_path, fp.parsed_title, fp.parsed_year, fp.confidence, fp.assets_json, "
+            "fp.source_signals_json, fp.main_video_path, COALESCE(q.duration_s, 0) AS duration_s, "
+            "q.score AS quality_score, q.audio_langs, q.subs_langs, q.subs_present "
+            "FROM folder_profile AS fp "
+            "LEFT JOIN video_quality AS q ON q.path = fp.main_video_path "
+            "WHERE COALESCE(LOWER(fp.kind),'') IN ('', 'movie')"
+        )
+        if where_sql:
+            movie_sql += where_sql.replace("fp.", " fp.")
+        try:
+            movie_rows = conn.execute(movie_sql, tuple(params)).fetchall()
+        except sqlite3.DatabaseError:
+            movie_rows = []
+        for row in movie_rows:
+            duration_s = row["duration_s"] if row["duration_s"] is not None else 0
+            item = {
+                "id": f"movie:{drive_label}:{row['folder_path']}",
+                "kind": "movie",
+                "drive": drive_label,
+                "path": row["main_video_path"] or row["folder_path"],
+                "folder_path": row["folder_path"],
+                "title": row["parsed_title"] or Path(row["folder_path"]).name,
+                "year": row["parsed_year"],
+                "duration_min": int(max(0, round(duration_s / 60))) if duration_s else None,
+                "duration_s": duration_s,
+                "quality": row["quality_score"],
+                "confidence": float(row["confidence"] or 0.0),
+                "langs_audio": _split_langs(row["audio_langs"]) if "audio_langs" in row.keys() else [],
+                "langs_subs": _split_langs(row["subs_langs"]) if "subs_langs" in row.keys() else [],
+                "subs_present": bool(row["subs_present"]) if "subs_present" in row.keys() else False,
+                "genres": _extract_genres(row["source_signals_json"], row["assets_json"]),
+            }
+            results.append(item)
+
+        if "tv_episode_profile" not in tables:
+            return results
+
+        episode_clauses: List[str] = []
+        episode_params: List[Any] = []
+        if conf_min is not None:
+            episode_clauses.append("ep.confidence >= ?")
+            episode_params.append(float(conf_min))
+        if qual_min is not None and "video_quality" in tables:
+            episode_clauses.append("COALESCE(q.score, 0) >= ?")
+            episode_params.append(int(qual_min))
+        if year_min is not None:
+            episode_clauses.append("CAST(SUBSTR(COALESCE(ep.air_date,''),1,4) AS INTEGER) >= ?")
+            episode_params.append(int(year_min))
+        if year_max is not None:
+            episode_clauses.append("CAST(SUBSTR(COALESCE(ep.air_date,''),1,4) AS INTEGER) <= ?")
+            episode_params.append(int(year_max))
+        if min_duration_s is not None and "video_quality" in tables:
+            episode_clauses.append("COALESCE(q.duration_s, 0) >= ?")
+            episode_params.append(int(min_duration_s))
+        if max_duration_s is not None and "video_quality" in tables:
+            episode_clauses.append("COALESCE(q.duration_s, 0) <= ?")
+            episode_params.append(int(max_duration_s))
+        if subs_required is True and "video_quality" in tables:
+            episode_clauses.append("COALESCE(q.subs_present, 0) = 1")
+        elif subs_required is False and "video_quality" in tables:
+            episode_clauses.append("COALESCE(q.subs_present, 0) = 0")
+
+        episode_where = " WHERE " + " AND ".join(episode_clauses) if episode_clauses else ""
+        episode_sql = (
+            "SELECT ep.episode_path, ep.series_root, ep.season_number, ep.episode_numbers_json, ep.air_date, "
+            "ep.parsed_title, ep.confidence, ep.ids_json, ep.subtitles_json, ep.audio_langs_json, "
+            "COALESCE(q.duration_s, 0) AS duration_s, q.score AS quality_score, q.audio_langs, q.subs_langs, q.subs_present "
+            "FROM tv_episode_profile AS ep "
+            "LEFT JOIN video_quality AS q ON q.path = ep.episode_path"
+            f"{episode_where}"
+        )
+        try:
+            episode_rows = conn.execute(episode_sql, tuple(episode_params)).fetchall()
+        except sqlite3.DatabaseError:
+            episode_rows = []
+        for row in episode_rows:
+            duration_s = row["duration_s"] if row["duration_s"] is not None else 0
+            air_year: Optional[int] = None
+            if row["air_date"]:
+                try:
+                    air_year = int(str(row["air_date"])[:4])
+                except Exception:
+                    air_year = None
+            item = {
+                "id": f"episode:{drive_label}:{row['episode_path']}",
+                "kind": "episode",
+                "drive": drive_label,
+                "path": row["episode_path"],
+                "title": row["parsed_title"] or Path(row["episode_path"]).stem,
+                "year": air_year,
+                "duration_min": int(max(0, round(duration_s / 60))) if duration_s else None,
+                "duration_s": duration_s,
+                "quality": row["quality_score"],
+                "confidence": float(row["confidence"] or 0.0),
+                "langs_audio": _split_langs(row["audio_langs"]) if "audio_langs" in row.keys() else [],
+                "langs_subs": _split_langs(row["subs_langs"]) if "subs_langs" in row.keys() else [],
+                "subs_present": bool(row["subs_present"]) if "subs_present" in row.keys() else False,
+                "genres": _extract_genres(row["ids_json"], row["subtitles_json"]),
+            }
+            results.append(item)
+        return results
+
+    def playlist_items_by_ids(self, item_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch playlist item metadata for the provided identifiers."""
+
+        grouped: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = defaultdict(lambda: defaultdict(list))
+        for item_id in item_ids:
+            parsed = self._parse_item_id(item_id)
+            if not parsed:
+                continue
+            kind, drive, key = parsed
+            grouped[drive][kind].append((item_id, key, drive))
+
+        resolved: Dict[str, Dict[str, Any]] = {}
+        for drive, kinds in grouped.items():
+            try:
+                shard_path = self._shard_path_for(drive)
+                conn = self._connect(shard_path)
+            except Exception:
+                continue
+            try:
+                if kinds.get("movie"):
+                    movie_rows = self._playlist_fetch_movies(conn, drive, kinds["movie"])
+                    resolved.update(movie_rows)
+                if kinds.get("episode"):
+                    episode_rows = self._playlist_fetch_episodes(conn, drive, kinds["episode"])
+                    resolved.update(episode_rows)
+            finally:
+                conn.close()
+        return resolved
+
+    def _playlist_fetch_movies(
+        self,
+        conn: sqlite3.Connection,
+        drive_label: str,
+        rows: Sequence[Tuple[str, str, str]],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not rows:
+            return {}
+        keys = [key for _, key, _ in rows]
+        placeholders = ",".join(["?"] * len(keys))
+        sql = (
+            "SELECT fp.folder_path, fp.parsed_title, fp.parsed_year, fp.confidence, fp.main_video_path, "
+            "fp.assets_json, fp.source_signals_json, COALESCE(q.duration_s, 0) AS duration_s, q.score AS quality_score, "
+            "q.audio_langs, q.subs_langs, q.subs_present "
+            "FROM folder_profile AS fp "
+            "LEFT JOIN video_quality AS q ON q.path = fp.main_video_path "
+            f"WHERE fp.folder_path IN ({placeholders})"
+        )
+        try:
+            cursor = conn.execute(sql, tuple(keys))
+        except sqlite3.DatabaseError:
+            return {}
+        mapping = {key: item_id for item_id, key, _ in rows}
+        results: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            folder_path = row["folder_path"]
+            item_id = mapping.get(folder_path)
+            if not item_id:
+                continue
+            duration_s = row["duration_s"] if row["duration_s"] is not None else 0
+            results[item_id] = {
+                "id": item_id,
+                "kind": "movie",
+                "drive": drive_label,
+                "path": row["main_video_path"] or folder_path,
+                "folder_path": folder_path,
+                "title": row["parsed_title"] or Path(folder_path).name,
+                "year": row["parsed_year"],
+                "duration_min": int(max(0, round(duration_s / 60))) if duration_s else None,
+                "duration_s": duration_s,
+                "quality": row["quality_score"],
+                "confidence": float(row["confidence"] or 0.0),
+                "langs_audio": _split_langs(row["audio_langs"]) if "audio_langs" in row.keys() else [],
+                "langs_subs": _split_langs(row["subs_langs"]) if "subs_langs" in row.keys() else [],
+                "subs_present": bool(row["subs_present"]) if "subs_present" in row.keys() else False,
+                "genres": _extract_genres(row["assets_json"], row["source_signals_json"]),
+            }
+        return results
+
+    def _playlist_fetch_episodes(
+        self,
+        conn: sqlite3.Connection,
+        drive_label: str,
+        rows: Sequence[Tuple[str, str, str]],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not rows:
+            return {}
+        keys = [key for _, key, _ in rows]
+        placeholders = ",".join(["?"] * len(keys))
+        sql = (
+            "SELECT ep.episode_path, ep.parsed_title, ep.air_date, ep.confidence, ep.ids_json, ep.subtitles_json, ep.audio_langs_json, "
+            "COALESCE(q.duration_s, 0) AS duration_s, q.score AS quality_score, q.audio_langs, q.subs_langs, q.subs_present "
+            "FROM tv_episode_profile AS ep "
+            "LEFT JOIN video_quality AS q ON q.path = ep.episode_path "
+            f"WHERE ep.episode_path IN ({placeholders})"
+        )
+        try:
+            cursor = conn.execute(sql, tuple(keys))
+        except sqlite3.DatabaseError:
+            return {}
+        mapping = {key: item_id for item_id, key, _ in rows}
+        results: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            episode_path = row["episode_path"]
+            item_id = mapping.get(episode_path)
+            if not item_id:
+                continue
+            duration_s = row["duration_s"] if row["duration_s"] is not None else 0
+            air_year: Optional[int] = None
+            if row["air_date"]:
+                try:
+                    air_year = int(str(row["air_date"])[:4])
+                except Exception:
+                    air_year = None
+            results[item_id] = {
+                "id": item_id,
+                "kind": "episode",
+                "drive": drive_label,
+                "path": episode_path,
+                "title": row["parsed_title"] or Path(episode_path).stem,
+                "year": air_year,
+                "duration_min": int(max(0, round(duration_s / 60))) if duration_s else None,
+                "duration_s": duration_s,
+                "quality": row["quality_score"],
+                "confidence": float(row["confidence"] or 0.0),
+                "langs_audio": _split_langs(row["audio_langs"]) if "audio_langs" in row.keys() else [],
+                "langs_subs": _split_langs(row["subs_langs"]) if "subs_langs" in row.keys() else [],
+                "subs_present": bool(row["subs_present"]) if "subs_present" in row.keys() else False,
+                "genres": _extract_genres(row["ids_json"], row["subtitles_json"]),
+            }
+        return results
+
+    def playlist_export(
+        self,
+        name: str,
+        fmt: str,
+        items: Sequence[Dict[str, str]],
+    ) -> Path:
+        """Export playlist items to the working directory in the requested format."""
+
+        safe_name = "".join(ch for ch in name if ch.isalnum() or ch in {"_", "-"}).strip() or "evening"
+        exports_dir = self.working_dir / "exports" / "playlists"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        extension = "m3u" if fmt == "m3u" else "csv"
+        path = exports_dir / f"{timestamp}_{safe_name}.{extension}"
+        if fmt == "m3u":
+            lines = []
+            for item in items:
+                media_path = str(item.get("path") or "").strip()
+                if not media_path:
+                    continue
+                lines.append(media_path)
+            payload = "\n".join(lines) + ("\n" if lines else "")
+        else:
+            lines = ["title,path"]
+            for item in items:
+                title = (item.get("title") or "").replace("\"", """)
+                media_path = str(item.get("path") or "").replace("\"", """)
+                if not media_path:
+                    continue
+                lines.append(f'"{title}","{media_path}"')
+            payload = "\n".join(lines) + "\n"
+        path.write_text(payload, encoding="utf-8")
+        return path
 
     def semantic_search(
         self,

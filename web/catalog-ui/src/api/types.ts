@@ -157,6 +157,81 @@ export interface AssistantStatus {
   runtime?: Record<string, unknown>;
 }
 
+export type PlaylistOrderMode = 'weighted' | 'sort_quality' | 'sort_confidence';
+
+export interface PlaylistCandidateRow {
+  id: string;
+  kind: 'movie' | 'episode' | string;
+  drive?: string | null;
+  path: string;
+  masked_path: string;
+  title?: string;
+  year?: number;
+  duration_min?: number | null;
+  quality?: number | null;
+  confidence: number;
+  langs_audio: string[];
+  langs_subs: string[];
+  subs_present: boolean;
+  genres: string[];
+}
+
+export interface PlaylistSuggestResponse {
+  limit: number;
+  candidates: PlaylistCandidateRow[];
+}
+
+export interface PlaylistBuildItemRow {
+  id: string;
+  kind: 'movie' | 'episode' | string;
+  drive?: string | null;
+  title?: string;
+  year?: number;
+  duration_min?: number | null;
+  cumulative_minutes: number;
+  path: string;
+  masked_path: string;
+  quality?: number | null;
+  confidence: number;
+  langs_audio: string[];
+  langs_subs: string[];
+  subs_present: boolean;
+  open_plan: { plan: string; path: string };
+}
+
+export interface PlaylistBuildResponse {
+  mode: PlaylistOrderMode;
+  target_minutes?: number | null;
+  total_minutes: number;
+  items: PlaylistBuildItemRow[];
+}
+
+export interface PlaylistExportPayload {
+  path: string;
+  title?: string;
+}
+
+export interface PlaylistExportResponse {
+  ok: boolean;
+  format: 'm3u' | 'csv';
+  path: string;
+  count: number;
+}
+
+export interface PlaylistAiPlanItem {
+  id: string;
+  reason?: string;
+  confidence?: number;
+  quality?: number | null;
+}
+
+export interface PlaylistAiResponse {
+  mode: string;
+  items: PlaylistAiPlanItem[];
+  reasoning: string;
+  sources: string[];
+}
+
 export interface AssistantAskSource {
   type: string;
   ref: string;

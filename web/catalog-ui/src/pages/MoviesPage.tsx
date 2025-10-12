@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import clsx from 'clsx';
 
 import { getMovies, thumbUrl } from '../api/client';
 import type { MovieRow, PaginatedResponse } from '../api/types';
 import { useDetailDrawer } from '../hooks/useDetailDrawer';
 import { useIntersectionObserver } from '../hooks/useIntersectionObserver';
 import { useLiveCatalog } from '../hooks/useLiveCatalog';
+import { usePlaylist } from '../hooks/usePlaylist';
 import styles from './MoviesPage.module.css';
 
 interface MovieFilters {
@@ -45,6 +47,7 @@ export default function MoviesPage() {
   const sentinel = useRef<HTMLDivElement | null>(null);
   const live = useLiveCatalog();
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const playlist = usePlaylist();
 
   const effectiveFilters = useMemo(() => ({ ...filters }), [filters]);
 
@@ -211,9 +214,46 @@ export default function MoviesPage() {
         </button>
       </aside>
       <section className={styles.gridSection}>
+        <div className={styles.playlistBar}>
+          <span>
+            {playlist.selectedItems.length > 0
+              ? `${playlist.selectedItems.length} selected`
+              : 'Select titles to build your evening playlist'}
+          </span>
+          <button className={styles.playlistButton} type="button" onClick={playlist.openDrawer}>
+            Open playlist drawer
+          </button>
+        </div>
         <div className={styles.grid}>
           {items.map(movie => (
-            <article key={movie.id} className={styles.card}>
+            <article
+              key={movie.id}
+              className={clsx(styles.card, playlist.isSelected(movie.id) && styles.cardSelected)}
+            >
+              <label
+                className={styles.cardSelect}
+                onClick={event => {
+                  event.stopPropagation();
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={playlist.isSelected(movie.id)}
+                  onChange={() =>
+                    playlist.toggleSelected({
+                      id: movie.id,
+                      kind: 'movie',
+                      title: movie.title,
+                      year: movie.year,
+                      drive: movie.drive,
+                      confidence: movie.confidence,
+                      quality: movie.quality ?? null,
+                    })
+                  }
+                />
+                <span className={styles.cardSelectVisual} aria-hidden="true" />
+                <span className={styles.visuallyHidden}>Select {movie.title ?? movie.id}</span>
+              </label>
               <button className={styles.cardButton} onClick={() => drawer.openDetail(movie.id, 'movie')}>
                 <div className={styles.posterWrap}>
                   {movie.poster_thumb ? (

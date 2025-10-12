@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import clsx from 'clsx';
 
 import { getEpisodes, getSeasons, getSeries, thumbUrl } from '../api/client';
 import type { EpisodeRow, PaginatedResponse, SeriesRow, SeasonRow } from '../api/types';
 import { useDetailDrawer } from '../hooks/useDetailDrawer';
 import { useLiveCatalog } from '../hooks/useLiveCatalog';
+import { usePlaylist } from '../hooks/usePlaylist';
 import styles from './TvPage.module.css';
 
 interface SeriesFilters {
@@ -29,6 +31,7 @@ export default function TvPage() {
   const [error, setError] = useState<string | null>(null);
   const drawer = useDetailDrawer();
   const live = useLiveCatalog();
+  const playlist = usePlaylist();
 
   const effectiveFilters = useMemo(() => ({ ...filters }), [filters]);
 
@@ -146,6 +149,16 @@ export default function TvPage() {
         </ul>
       </aside>
       <section className={styles.main}>
+        <div className={styles.playlistBar}>
+          <span>
+            {playlist.selectedItems.length > 0
+              ? `${playlist.selectedItems.length} selected`
+              : 'Select episodes to add them to your evening playlist'}
+          </span>
+          <button className={styles.playlistButton} type="button" onClick={playlist.openDrawer}>
+            Open playlist drawer
+          </button>
+        </div>
         {error && <div className={styles.error}>{error}</div>}
         {loadingDetail && <div className={styles.placeholder}>Loading…</div>}
         {!loadingDetail && selectedSeries && (
@@ -171,7 +184,37 @@ export default function TvPage() {
             </div>
             <div className={styles.episodeGrid}>
               {filteredEpisodes.map(episode => (
-                <article key={episode.id} className={styles.episodeCard}>
+                <article
+                  key={episode.id}
+                  className={clsx(
+                    styles.episodeCard,
+                    playlist.isSelected(episode.id) && styles.episodeCardSelected,
+                  )}
+                >
+                  <label
+                    className={styles.episodeSelect}
+                    onClick={event => {
+                      event.stopPropagation();
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={playlist.isSelected(episode.id)}
+                      onChange={() =>
+                        playlist.toggleSelected({
+                          id: episode.id,
+                          kind: 'episode',
+                          title: episode.title,
+                          year: undefined,
+                          drive: episode.drive,
+                          confidence: episode.confidence,
+                          quality: episode.quality ?? null,
+                        })
+                      }
+                    />
+                    <span className={styles.episodeSelectVisual} aria-hidden="true" />
+                    <span className={styles.visuallyHidden}>Select {episode.title ?? episode.id}</span>
+                  </label>
                   <button onClick={() => drawer.openDetail(episode.id, 'episode')}>
                     <div className={styles.episodePoster}>
                       {episode.poster_thumb ? (
