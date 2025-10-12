@@ -4,12 +4,14 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
 ## Starting VideoCatalog A2.0
 
-1. Double-click the **VideoCatalog (A2.0)** desktop shortcut, or run `scripts\start_videocatalog.bat` from the repository.
-2. Your default browser opens to [http://127.0.0.1:27182](http://127.0.0.1:27182); the UI streams entirely over localhost.
-3. If the AI panel displays **GPU disabled**, open the **Diagnostics** tab and run **Preflight** to see the remediation checklist.
+1. Double-click `START_HERE.bat` in the repository root (the same target behind the **VideoCatalog (A2.0)** desktop shortcut), or run `scripts\start_videocatalog.bat` from the repository.
+2. On success your default browser opens to [http://127.0.0.1:27182](http://127.0.0.1:27182) and the launcher console window closes automatically once the services are healthy.
+3. If startup fails the console window stays open, prints the path to the latest launcher log, and waits for you to press a key before exiting. Review the log, resolve the issue, and rerun the launcher.
+4. If the AI panel displays **GPU disabled**, open the **Diagnostics** tab and run **Preflight** to see the remediation checklist.
 
 ### Troubleshooting the launcher
 
+- **Log locations.** The launcher writes timestamped logs under `%USERPROFILE%\VideoCatalog\logs\launcher-<timestamp>.log`. The orchestrator and web services emit matching files alongside it as `orchestrator-<timestamp>.log` and `web-<timestamp>.log`.
 - **Port already in use.** Edit `%USERPROFILE%\VideoCatalog\settings.json` and change `server.port` to an open TCP port, then rerun the launcher.
 - **Missing ffprobe.** Install FFmpeg and ensure `ffprobe.exe` is on `PATH`. Until then, quality header analysis stays disabled and the launcher prints a yellow warning.
 - **Legacy shortcuts.** Existing shortcuts that target `diskscannergui.py` still work; they now invoke the new launcher so you do not need to recreate them.
