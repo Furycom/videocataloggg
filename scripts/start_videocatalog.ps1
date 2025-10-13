@@ -300,6 +300,7 @@ try {
 
     $env:VIDEOCATALOG_HOME = $workFull
     $env:PYTHONUNBUFFERED = '1'
+    $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
 
     Write-Info 'Upgrading pip, setuptools, and wheel in the virtual environment.'
     $bootstrapArgs = @('install', '--upgrade', 'pip', 'setuptools', 'wheel')
@@ -324,7 +325,7 @@ try {
         }
         Write-Warn 'uvicorn not found, installing required Python packages.'
         Write-Info "Installing dependencies from $requirementsPath"
-        $baseInstallArgs = @('install', '--upgrade', '--only-binary=:all:', '--no-deps', '-r', $requirementsPath)
+        $baseInstallArgs = @('install', '--only-binary=:all:', '--require-hashes', '-r', $requirementsPath)
         $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
         if ($exitCode -ne 0) {
             if ($pipLog) {
