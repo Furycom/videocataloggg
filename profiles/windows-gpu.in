@@ -1,5 +1,6 @@
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 -r ../requirements.in
 numpy<2
+opencv-python-headless<4.10
 onnxruntime-gpu
 llama-cpp-python
