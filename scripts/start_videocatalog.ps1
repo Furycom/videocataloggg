@@ -318,13 +318,13 @@ try {
 
     $uvicornAvailable = Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn'
     if (-not $uvicornAvailable) {
-        $requirementsPath = Join-Path $root 'requirements-windows.txt'
+        $requirementsPath = Join-Path $root 'profiles\windows-cpu.txt'
         if (-not (Test-Path $requirementsPath)) {
             $requirementsPath = Join-Path $root 'requirements.txt'
         }
         Write-Warn 'uvicorn not found, installing required Python packages.'
         Write-Info "Installing dependencies from $requirementsPath"
-        $baseInstallArgs = @('install', '--upgrade', '-r', $requirementsPath)
+        $baseInstallArgs = @('install', '--upgrade', '--only-binary=:all:', '--no-deps', '-r', $requirementsPath)
         $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
         if ($exitCode -ne 0) {
             if ($pipLog) {

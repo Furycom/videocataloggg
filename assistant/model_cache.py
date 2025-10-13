@@ -16,7 +16,7 @@ try:  # pragma: no cover - optional dependency guard
     from huggingface_hub import HfApi, hf_hub_download  # type: ignore
 except Exception as exc:  # pragma: no cover - optional dependency guard
     raise RuntimeError(
-        "huggingface-hub is required to bootstrap assistant models. Install requirements-windows.txt first."
+        "huggingface-hub is required to bootstrap assistant models. Install profiles\windows-cpu.txt first."
     ) from exc
 
 
