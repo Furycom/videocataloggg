@@ -1,9 +1,12 @@
 param(
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [ValidateSet('windows-cpu','windows-gpu')]
+    [string]$Profile = 'windows-cpu'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
 
 function Write-Info {
     param([string]$Message)
@@ -46,40 +49,47 @@ function Invoke-PipInstall {
         [string]$LogFile
     )
 
-    $commandPath = $null
-    $commandArgs = @()
-    if ($PipExe) {
-        $commandPath = $PipExe
-        $commandArgs = $Arguments
-    } else {
-        $commandPath = $PythonExe
-        $commandArgs = @('-m', 'pip') + $Arguments
+    $commandPath = if ($PipExe) { $PipExe } else { $PythonExe }
+    $argumentList = if ($PipExe) { $Arguments } else { @('-m', 'pip') + $Arguments }
+    $argumentList = $argumentList | ForEach-Object { [string]$_ }
+
+    if (-not $LogFile) {
+        & $commandPath @argumentList
+        return $LASTEXITCODE
     }
 
-    if ($LogFile) {
-        $logDirectory = Split-Path -Parent $LogFile
-        if ($logDirectory -and -not (Test-Path $logDirectory)) {
-            New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-        }
-
-        $timestamp = Get-Date -Format o
-        $commandLine = "`"$commandPath`" $($commandArgs -join ' ')"
-        Add-Content -Path $LogFile -Value "[$timestamp] COMMAND: $commandLine" -Encoding UTF8
-        try {
-            & $commandPath @commandArgs 2>&1 | Tee-Object -FilePath $LogFile -Append
-        } catch {
-            $errorMessage = $_.Exception.Message
-            Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] ERROR: $errorMessage" -Encoding UTF8
-            throw
-        } finally {
-            Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] EXIT CODE: $LASTEXITCODE" -Encoding UTF8
-            Add-Content -Path $LogFile -Value '' -Encoding UTF8
-        }
-    } else {
-        & $commandPath @commandArgs
+    $logDirectory = Split-Path -Parent $LogFile
+    if ($logDirectory -and -not (Test-Path $logDirectory)) {
+        New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     }
 
-    return $LASTEXITCODE
+    $timestamp = Get-Date -Format o
+    $commandLine = "`"$commandPath`" $($argumentList -join ' ')"
+    Add-Content -Path $LogFile -Value "[$timestamp] COMMAND: $commandLine" -Encoding UTF8
+
+    $stdOutFile = [System.IO.Path]::GetTempFileName()
+    $stdErrFile = [System.IO.Path]::GetTempFileName()
+    $exitCode = 1
+    try {
+        $process = Start-Process -FilePath $commandPath -ArgumentList $argumentList -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdOutFile -RedirectStandardError $stdErrFile
+        $exitCode = $process.ExitCode
+        Get-Content -Path $stdOutFile -ErrorAction SilentlyContinue | ForEach-Object {
+            Add-Content -Path $LogFile -Value $_ -Encoding UTF8
+        }
+        Get-Content -Path $stdErrFile -ErrorAction SilentlyContinue | ForEach-Object {
+            Add-Content -Path $LogFile -Value $_ -Encoding UTF8
+        }
+        Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] EXIT CODE: $exitCode" -Encoding UTF8
+        Add-Content -Path $LogFile -Value '' -Encoding UTF8
+    } catch {
+        $errorMessage = $_.Exception.Message
+        Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] ERROR: $errorMessage" -Encoding UTF8
+        throw
+    } finally {
+        Remove-Item -Path $stdOutFile, $stdErrFile -ErrorAction SilentlyContinue
+    }
+
+    return $exitCode
 }
 
 function Write-PipLogTail {
@@ -153,6 +163,7 @@ foreach ($bootstrap in 'start_videocatalog.bat', 'start_videocatalog.ps1') {
 }
 
 Write-Info 'VideoCatalog A2.0 launcher'
+Write-Info "Dependency profile: $Profile"
 
 $orchProcess = $null
 $webProcess = $null
@@ -301,30 +312,16 @@ try {
     $env:VIDEOCATALOG_HOME = $workFull
     $env:PYTHONUNBUFFERED = '1'
 
-    Write-Info 'Upgrading pip, setuptools, and wheel in the virtual environment.'
-    $bootstrapArgs = @('install', '--upgrade', 'pip', 'setuptools', 'wheel')
-    # Use ``python -m pip`` for the bootstrap upgrade to allow pip to replace its
-    # own executable on Windows where running ``pip.exe`` can block self-upgrades.
-    $bootstrapExit = Invoke-PipInstall -Arguments $bootstrapArgs -PythonExe $pythonExe -PipExe $null -LogFile $pipLog
-    if ($bootstrapExit -ne 0) {
-        $logHint = if ($pipLog) { " Review pip log at $pipLog." } else { '' }
-        Write-Warn "Failed to upgrade pip/setuptools/wheel (exit code $bootstrapExit). Continuing with existing versions.$logHint"
-    } else {
-        if (-not $pipExe -and (Test-Path $venvPip)) {
-            $pipExe = $venvPip
-            Write-Info "Detected pip at $pipExe after upgrade."
-        }
-    }
-
     $uvicornAvailable = Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn'
     if (-not $uvicornAvailable) {
-        $requirementsPath = Join-Path $root 'requirements-windows.txt'
+        $profileFile = if ($Profile -eq 'windows-gpu') { 'profiles\windows-gpu.txt' } else { 'profiles\windows-cpu.txt' }
+        $requirementsPath = Join-Path $root $profileFile
         if (-not (Test-Path $requirementsPath)) {
-            $requirementsPath = Join-Path $root 'requirements.txt'
+            throw "Profile lock file $profileFile not found."
         }
         Write-Warn 'uvicorn not found, installing required Python packages.'
         Write-Info "Installing dependencies from $requirementsPath"
-        $baseInstallArgs = @('install', '--upgrade', '-r', $requirementsPath)
+        $baseInstallArgs = @('install', '--only-binary=:all:', '--requirement', $requirementsPath)
         $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
         if ($exitCode -ne 0) {
             if ($pipLog) {
@@ -335,60 +332,6 @@ try {
                 $message += " Review pip log at $pipLog for details."
             }
             throw $message
-        }
-
-        $pyVersionText = (& $pythonExe -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")').Trim()
-        $pyVersionParts = $pyVersionText.Split('.')
-        $pyTag = $null
-        if ($pyVersionParts.Length -ge 2) {
-            $pyTag = "cp{0}{1}" -f $pyVersionParts[0], $pyVersionParts[1]
-        }
-
-        $optionalPackages = @()
-
-        if ($pyTag) {
-            $llamaWheel = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.2.90/llama_cpp_python-0.2.90-$pyTag-$pyTag-win_amd64.whl"
-            $optionalPackages += [pscustomobject]@{
-                Name = 'llama-cpp-python'
-                Requirement = "llama-cpp-python @ $llamaWheel"
-                ForceBinary = $false
-                FailureMessage = "Local llama.cpp runtime will be unavailable. Install the Visual C++ Build Tools or install the prebuilt wheel manually from $llamaWheel."
-            }
-        }
-
-        $optionalPackages += [pscustomobject]@{
-            Name = 'hnswlib'
-            Requirement = 'hnswlib==0.8.0'
-            ForceBinary = $false
-            FailureMessage = 'Falling back to FAISS/simple similarity search. Install the Visual C++ Build Tools to enable the hnswlib backend.'
-        }
-
-        $optionalPackages += [pscustomobject]@{
-            Name = 'faiss-cpu'
-            Requirement = 'faiss-cpu==1.7.4'
-            ForceBinary = $true
-            FailureMessage = 'Falling back to simple similarity search. Install FAISS manually to enable the FAISS backend.'
-        }
-
-        foreach ($package in $optionalPackages) {
-            if (-not $package.Requirement) { continue }
-            $args = @('install')
-            if ($package.ForceBinary) {
-                $args += '--only-binary=:all:'
-            }
-            $args += $package.Requirement
-            Write-Info "Installing optional dependency $($package.Name)"
-            $result = Invoke-PipInstall -Arguments $args -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
-            if ($result -eq 0) {
-                Write-Info "Optional dependency $($package.Name) installed."
-                continue
-            }
-
-            $optionalFailure = $package.FailureMessage
-            if ($pipLog) {
-                $optionalFailure = "$optionalFailure See pip log at $pipLog."
-            }
-            Write-Warn "Unable to install optional dependency $($package.Name). $optionalFailure"
         }
 
         if (-not (Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn')) {
@@ -412,6 +355,7 @@ try {
     }
 
     $gpuSummary = 'not probed'
+    $gpuAvailable = $false
     $tempProbe = $null
     try {
         $tempProbe = [System.IO.Path]::GetTempFileName()
@@ -455,6 +399,7 @@ print(json.dumps(payload))
                 $gpuStatus = $null
             }
             if ($gpuStatus -and $gpuStatus.ok) {
+                $gpuAvailable = $true
                 $gpuSummary = "ready ($($gpuStatus.name) - free $($gpuStatus.free_mb) MB of $($gpuStatus.total_mb) MB)"
             } elseif ($gpuStatus -and $gpuStatus.present) {
                 $gpuSummary = "not-ready (present but gated: $($gpuStatus.reason))"
@@ -469,6 +414,28 @@ print(json.dumps(payload))
     } finally {
         if ($tempProbe -and (Test-Path $tempProbe)) {
             Remove-Item -Path $tempProbe -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($Profile -eq 'windows-gpu' -and -not $gpuAvailable) {
+        Write-Warn 'GPU profile selected but GPU prerequisites are unavailable; installing CPU onnxruntime for fallback.'
+        $cpuProfilePath = Join-Path $root 'profiles\windows-cpu.txt'
+        $cpuOnnxRequirement = 'onnxruntime==1.23.1'
+        if (Test-Path $cpuProfilePath) {
+            $cpuMatch = Select-String -Path $cpuProfilePath -Pattern '^onnxruntime==' -SimpleMatch
+            if ($cpuMatch) {
+                $cpuOnnxRequirement = $cpuMatch.Line.Trim()
+            }
+        }
+        $fallbackArgs = @('install', '--only-binary=:all:', $cpuOnnxRequirement)
+        $fallbackExit = Invoke-PipInstall -Arguments $fallbackArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
+        if ($fallbackExit -ne 0) {
+            if ($pipLog) {
+                Write-PipLogTail -LogFile $pipLog -Lines 40
+            }
+            Write-Warn "Failed to install CPU onnxruntime fallback (exit code $fallbackExit). GPU features remain disabled."
+        } else {
+            Write-Warn 'CPU onnxruntime installed for compatibility.'
+            $gpuSummary = "$gpuSummary; CPU fallback installed"
         }
     }
     Write-Info "GPU status: $gpuSummary"

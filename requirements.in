@@ -1,0 +1,29 @@
+# Runtime dependency roots for VideoCatalog.
+# Compiled on Windows using pip-compile to produce requirements.txt.
+blake3
+tqdm
+rich
+sqlite-utils
+numpy
+Pillow
+scikit-learn
+skl2onnx
+nvidia-ml-py
+opencv-python-headless
+fastapi
+uvicorn[standard]
+guessit
+rapidfuzz
+tmdbsimple
+IMDbPY
+requests
+PyMuPDF
+pdfminer.six
+EbookLib
+pytesseract
+yake
+langgraph
+langchain-core
+langchain-community
+chroma-hnswlib
+huggingface-hub

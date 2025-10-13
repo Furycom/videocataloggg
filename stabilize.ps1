@@ -8,6 +8,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repoRoot
+$env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
 
 $pythonCmd = (Get-Command python -ErrorAction Stop).Source
 
@@ -86,18 +87,12 @@ Add-Summary 'Settings & Paths' 'PASS' 'Directories prepared and settings validat
 # ---------------------------------------------------------------------------
 Write-Step "2) Dependencies & Probes"
 if (-not $SkipInstall) {
-    $requirementsPath = Join-Path $repoRoot 'requirements-windows.txt'
+    $requirementsPath = Join-Path $repoRoot 'profiles\windows-cpu.txt'
     if (-not (Test-Path -LiteralPath $requirementsPath)) {
-        throw "requirements-windows.txt not found"
+        throw "profiles\\windows-cpu.txt not found"
     }
-    Write-Log "Installing pinned dependencies"
-    $pipArgs = @('-m', 'pip', 'install', '--upgrade', 'pip')
-    & $pythonCmd @pipArgs 2>&1 | ForEach-Object { Write-Log $_ }
-    if ($LASTEXITCODE -ne 0) {
-        Add-Summary 'Dependencies' 'FAIL' 'pip upgrade failed'
-        throw "pip upgrade failed"
-    }
-    $installArgs = @('-m', 'pip', 'install', '--requirement', $requirementsPath)
+    Write-Log "Installing pinned dependencies from $requirementsPath"
+    $installArgs = @('-m', 'pip', 'install', '--only-binary=:all:', '--requirement', $requirementsPath)
     & $pythonCmd @installArgs 2>&1 | ForEach-Object { Write-Log $_ }
     if ($LASTEXITCODE -ne 0) {
         Add-Summary 'Dependencies' 'FAIL' 'Dependency installation failed'

@@ -16,9 +16,32 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - **Missing ffprobe.** Install FFmpeg and ensure `ffprobe.exe` is on `PATH`. Until then, quality header analysis stays disabled and the launcher prints a yellow warning.
 - **Manual launcher.** Run `python launch_videocatalog.py` from the repository root to start the A2.0 services without using the batch or PowerShell wrappers. Update any shortcuts that previously referenced `diskscannergui.py`; the script was renamed to avoid collisions on case-insensitive file systems.
 
+## Windows installation
+
+The launcher and stabilisation scripts expect a virtual environment rooted in `%USERPROFILE%\VideoCatalog\venv` with dependencies installed from the Windows lock files. Create it with a single PowerShell command from the repository root:
+
+```powershell
+python -m venv "$env:USERPROFILE\VideoCatalog\venv"; & "$env:USERPROFILE\VideoCatalog\venv\Scripts\python.exe" -m pip install --only-binary=:all: --requirement profiles\windows-cpu.txt
+```
+
+> The scripts automatically set `PIP_DISABLE_PIP_VERSION_CHECK=1` and reuse the same lock files. Use `--only-binary=:all:` whenever installing from these manifests to enforce wheel-only installs.
+
+**GPU optional (llama-cpp).** Systems with CUDA 12.1+ and the NVIDIA driver can install the GPU profile:
+
+```powershell
+& "$env:USERPROFILE\VideoCatalog\venv\Scripts\python.exe" -m pip install --only-binary=:all: --requirement profiles\windows-gpu.txt
+```
+
+The GPU profile pulls `llama-cpp-python` wheels from the [official CUDA index](https://abetlen.github.io/llama-cpp-python/whl/cu121). Ensure the CUDA runtime matches the index version before installing.
+
+| Profile       | Lock file                   | Description                                               |
+| ------------- | --------------------------- | --------------------------------------------------------- |
+| `windows-cpu` | `profiles/windows-cpu.txt`  | Default profile; CPU-only dependencies and safe fallbacks |
+| `windows-gpu` | `profiles/windows-gpu.txt`  | Adds `onnxruntime-gpu` and CUDA `llama-cpp-python` wheels |
+
 ## Windows 11 bootstrap & stabilization
 
-1. Install the NVIDIA Windows driver and Python 3.11+ (64-bit). Ensure `python` is on your `PATH` when you open PowerShell.
+1. Install the NVIDIA Windows driver and Python 3.12 (64-bit). Ensure `python` is on your `PATH` when you open PowerShell.
 2. Clone or unpack this repository somewhere under your profile (for example `C:\Users\you\Projects\VideoCatalog`).
 3. Launch an elevated PowerShell prompt, change to the repo root, and run:
 
@@ -29,7 +52,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
    The script prepares `%USERPROFILE%\VideoCatalog` as the writable home, downloads the assistant warmup models (Qwen2 0.5B
    instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies from
-   `requirements-windows.txt`, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
+   `profiles\windows-cpu.txt` with `--only-binary=:all:`, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
    executes the HTTP preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the
    console. Rerun with `-SkipInstall` to reuse an existing virtual environment.
 
@@ -49,13 +72,10 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - Heavy assistant workloads require an NVIDIA GPU with at least 8 GB of free VRAM. The bootstrap checks NVML and `nvidia-smi`; if
   neither are available it writes `logs\gpu.disabled.banner` and the assistant API responds with
   `AI disabled (GPU required: <reason>)`.
-- The bundled dependency manifest installs the CPU wheel of `llama-cpp-python==0.2.90` on Windows because the
-  `llama-cpp-python-cuBLAS` project does not publish Windows binaries. GPU acceleration remains available, but you must
-  install a compatible build manually after stabilization completes—for example by compiling the project with CMake and
-  CUDA or by installing a wheel published by the llama.cpp release artifacts. Once the GPU-enabled build is in place,
-  rerun `stabilize.ps1 -SkipInstall` to reuse the existing environment.
-- When the GPU probe fails, install the latest NVIDIA Studio/Game Ready driver and rerun `stabilize.ps1`. If CUDA support is
-  missing, install the CUDA Toolkit (`winget install -e --id Nvidia.CUDA`) followed by `pip install --upgrade onnxruntime-gpu`.
+- Use the `windows-gpu` profile when CUDA is available. The extra index ships prebuilt wheels; ensure the CUDA DLLs (12.1+) are on
+  `PATH` before running `start_videocatalog.ps1 -Profile windows-gpu`.
+- If the GPU probe fails the launcher automatically installs the CPU `onnxruntime` wheel so the application can continue without
+  GPU inference. Install/update the NVIDIA driver, reboot, and rerun the launcher to regain GPU support.
 - `ffprobe` is required for the `quality_headers` smoke test. Install FFmpeg and ensure `ffprobe.exe` resolves on `PATH`. Until
   then, the diagnostics mark quality header checks as `SKIP` and write `logs\quality_headers.disabled`.
 

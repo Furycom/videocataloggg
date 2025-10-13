@@ -1,0 +1,4 @@
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+-r ../requirements.in
+onnxruntime-gpu
+llama-cpp-python

@@ -1,0 +1,86 @@
+name: Windows dependency locks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lock:
+    name: Lock dependencies
+    runs-on: windows-latest
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pip-tools
+        run: |
+          python -m pip install pip==24.3.1 pip-tools==7.4.1
+
+      - name: Compile runtime lock
+        run: |
+          python -m piptools compile --output-file=requirements.txt requirements.in
+
+      - name: Compile development lock
+        run: |
+          python -m piptools compile --output-file=requirements-dev.txt requirements-dev.in
+
+      - name: Compile Windows CPU profile
+        run: |
+          python -m piptools compile --output-file=profiles/windows-cpu.txt profiles/windows-cpu.in
+
+      - name: Compile Windows GPU profile
+        run: |
+          python -m piptools compile --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" --output-file=profiles/windows-gpu.txt profiles/windows-gpu.in
+
+      - name: Verify lock files committed
+        run: |
+          git config --global core.autocrlf false
+          git status --short
+          git diff --exit-code
+
+  install:
+    name: Install from locks
+    runs-on: windows-latest
+    needs: lock
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create virtual environment
+        run: |
+          python -m venv venv
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          $python = Join-Path $PWD 'venv' 'Scripts' 'python.exe'
+          $log = Join-Path $env:RUNNER_TEMP 'pip-install.log'
+          & $python -m pip install --only-binary=:all: --requirement profiles/windows-cpu.txt 2>&1 | Tee-Object -FilePath $log
+          $patterns = 'Building wheel', 'Preparing metadata', 'Running setup.py'
+          foreach ($pattern in $patterns) {
+            if (Select-String -Path $log -Pattern $pattern -SimpleMatch -Quiet) {
+              Write-Error "pip attempted a build step: $pattern"
+              Exit 1
+            }
+          }
+
+      - name: Smoke test
+        run: |
+          venv\Scripts\python.exe -c "import fastapi, uvicorn; print('ok')"
