@@ -788,7 +788,7 @@ langgraph==0.6.10 \
     --hash=sha256:b16baacd38895f6f4aa51e03b8a5b5f8695cff96fd0e8b637b725186ea27237c
     # via -r requirements.in
 llama-cpp-python==0.2.90 \
-    --hash=sha256:407d15fbb46ff33d8d8259a9826d23b9b127d3c280aecd92121623eb4a84f67a
+    --hash=sha256:7065885658ba26d9cce6ad2cd0e50ae10698c91e5e6dd48df790ef47abd92bdf
     # via -r profiles/windows-gpu.in
 langgraph-checkpoint==2.1.2 \
     --hash=sha256:911ebffb069fd01775d4b5184c04aaafc2962fcdf50cf49d524cd4367c4d0c60

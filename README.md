@@ -28,8 +28,9 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
    ```
 
    The script prepares `%USERPROFILE%\VideoCatalog` as the writable home, downloads the assistant warmup models (Qwen2 0.5B
-   instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies from
-   `profiles\windows-cpu.txt` (or `profiles\windows-gpu.txt` when running with CUDA), runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
+   instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned wheel-only dependencies from the
+   Windows lockfiles (`profiles\windows-cpu.txt` by default or `profiles\windows-gpu.txt` when CUDA prerequisites are
+   satisfied) with `pip --require-hashes --only-binary=:all:`, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
    executes the HTTP preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the
    console. Rerun with `-SkipInstall` to reuse an existing virtual environment.
 
@@ -49,11 +50,10 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 - Heavy assistant workloads require an NVIDIA GPU with at least 8 GB of free VRAM. The bootstrap checks NVML and `nvidia-smi`; if
   neither are available it writes `logs\gpu.disabled.banner` and the assistant API responds with
   `AI disabled (GPU required: <reason>)`.
-- The bundled dependency manifest installs the CPU wheel of `llama-cpp-python==0.2.90` on Windows because the
-  `llama-cpp-python-cuBLAS` project does not publish Windows binaries. GPU acceleration remains available, but you must
-  install a compatible build manually after stabilization completes—for example by compiling the project with CMake and
-  CUDA or by installing a wheel published by the llama.cpp release artifacts. Once the GPU-enabled build is in place,
-  rerun `stabilize.ps1 -SkipInstall` to reuse the existing environment.
+- The GPU lockfile resolves `llama-cpp-python==0.2.90` from the CUDA wheels published at
+  `https://abetlen.github.io/llama-cpp-python/whl/cu121`. If those wheels are unavailable (or if the host lacks CUDA
+  requirements), the launcher automatically falls back to the CPU profile so you can continue using the application without
+  rebuilding from source.
 - When the GPU probe fails, install the latest NVIDIA Studio/Game Ready driver and rerun `stabilize.ps1`. If CUDA support is
   missing, install the CUDA Toolkit (`winget install -e --id Nvidia.CUDA`) followed by `pip install --upgrade onnxruntime-gpu`.
 - `ffprobe` is required for the `quality_headers` smoke test. Install FFmpeg and ensure `ffprobe.exe` resolves on `PATH`. Until

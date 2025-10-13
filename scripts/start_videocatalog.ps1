@@ -300,6 +300,8 @@ try {
 
     $env:VIDEOCATALOG_HOME = $workFull
     $env:PYTHONUNBUFFERED = '1'
+    $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
+    Write-Info 'Disabled pip version check for child processes.'
 
     Write-Info 'Upgrading pip, setuptools, and wheel in the virtual environment.'
     $bootstrapArgs = @('install', '--upgrade', 'pip', 'setuptools', 'wheel')
@@ -308,7 +310,11 @@ try {
     $bootstrapExit = Invoke-PipInstall -Arguments $bootstrapArgs -PythonExe $pythonExe -PipExe $null -LogFile $pipLog
     if ($bootstrapExit -ne 0) {
         $logHint = if ($pipLog) { " Review pip log at $pipLog." } else { '' }
-        Write-Warn "Failed to upgrade pip/setuptools/wheel (exit code $bootstrapExit). Continuing with existing versions.$logHint"
+        if ($bootstrapExit -eq -1) {
+            Write-Warn "pip upgrade completed with warnings (exit code -1). Continuing with detected versions.$logHint"
+        } else {
+            Write-Warn "Failed to upgrade pip/setuptools/wheel (exit code $bootstrapExit). Continuing with existing versions.$logHint"
+        }
     } else {
         if (-not $pipExe -and (Test-Path $venvPip)) {
             $pipExe = $venvPip
