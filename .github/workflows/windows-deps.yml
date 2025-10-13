@@ -36,25 +36,47 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Create virtual environment
         run: python -m venv .venv
       - name: Install pip-tools
         run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: pip-tools
       - name: Compile runtime lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all:"' -o requirements.txt requirements.in
+        if: matrix.profile == 'cpu'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o requirements.txt requirements.in
       - name: Compile dev lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all:"' -o requirements-dev.txt requirements-dev.in
+        if: matrix.profile == 'cpu'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o requirements-dev.txt requirements-dev.in
       - name: Compile Windows CPU lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all:"' -o profiles/windows-cpu.txt profiles/windows-cpu.in
+        if: matrix.profile == 'cpu'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o profiles/windows-cpu.txt profiles/windows-cpu.in
       - name: Compile Windows GPU lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"' -o profiles/windows-gpu.txt profiles/windows-gpu.in
-      - name: Verify lock files committed
+        if: matrix.profile == 'gpu'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -o profiles/windows-gpu.txt profiles/windows-gpu.in
+      - name: Verify lock files committed (CPU)
+        if: matrix.profile == 'cpu'
         run: |
-          $lockFiles = @('requirements.txt', 'requirements-dev.txt', 'profiles/windows-cpu.txt', 'profiles/windows-gpu.txt')
-          $diff = git diff --name-only -- $lockFiles
+          $targets = @('requirements.txt', 'requirements-dev.txt', 'profiles/windows-cpu.txt')
+          $diff = git diff --name-only -- $targets
           if ($diff) {
-            git --no-pager diff -- $lockFiles
+            git --no-pager diff --stat -- $targets
+            git --no-pager diff -- $targets
+            Write-Error 'Windows CPU lockfiles are out of date. Regenerate them on Windows with Python 3.12 and commit the result.'
+            exit 1
+          }
+      - name: Verify lock files committed (GPU)
+        if: matrix.profile == 'gpu'
+        run: |
+          $target = 'profiles/windows-gpu.txt'
+          if (-not (Test-Path $target)) {
+            Write-Error "Expected $target to exist after compilation."
+            exit 1
+          }
+          $diff = git diff --name-only -- $target
+          if ($diff) {
+            git --no-pager diff --stat -- $target
+            git --no-pager diff -- $target
+            Write-Error 'Windows GPU lockfile is out of date. Regenerate it on Windows with Python 3.12 and commit the result.'
             exit 1
           }
 
@@ -75,7 +97,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Create virtual environment
         run: python -m venv .venv
       - name: Install shared requirements

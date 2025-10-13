@@ -18,7 +18,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
 ## Windows 11 bootstrap & stabilization
 
-1. Install the NVIDIA Windows driver and Python 3.11+ (64-bit). Ensure `python` is on your `PATH` when you open PowerShell.
+1. Install the NVIDIA Windows driver and Python 3.12 (64-bit). Ensure the Windows launcher (`py`) or `python.exe` resolves on your `PATH` when you open PowerShell—the launcher refuses to run on older interpreters.
 2. Clone or unpack this repository somewhere under your profile (for example `C:\Users\you\Projects\VideoCatalog`).
 3. Launch an elevated PowerShell prompt, change to the repo root, and run:
 
@@ -29,7 +29,8 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
    The script prepares `%USERPROFILE%\VideoCatalog` as the writable home, downloads the assistant warmup models (Qwen2 0.5B
    instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies from
-   `profiles\windows-cpu.txt` (or `profiles\windows-gpu.txt` when running with CUDA), runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
+   `profiles\windows-cpu.txt` (or `profiles\windows-gpu.txt` when running with CUDA) strictly from prebuilt wheels with hash
+   validation, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
    executes the HTTP preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the
    console. Rerun with `-SkipInstall` to reuse an existing virtual environment.
 
