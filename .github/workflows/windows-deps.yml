@@ -49,15 +49,10 @@ jobs:
         run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args="--only-binary=:all:" -o profiles/windows-cpu.txt profiles/windows-cpu.in
       - name: Compile Windows GPU lock
         run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args="--only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -o profiles/windows-gpu.txt profiles/windows-gpu.in
-      - name: Verify lockfiles unchanged
+      - name: Verify lock files committed
         run: |
           git diff --stat -- requirements.txt requirements-dev.txt profiles/windows-cpu.txt profiles/windows-gpu.txt
           git diff --exit-code -- requirements.txt requirements-dev.txt profiles/windows-cpu.txt profiles/windows-gpu.txt
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Locks drifted. Run pip-compile on Windows and commit the results."
-            $host.SetShouldExit(1)
-            return
-          }
 
   install:
     name: Install from locks (${{ matrix.profile }})

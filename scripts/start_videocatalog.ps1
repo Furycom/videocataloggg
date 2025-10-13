@@ -4,6 +4,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
 
 function Write-Info {
     param([string]$Message)
