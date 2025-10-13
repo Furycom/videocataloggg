@@ -42,20 +42,19 @@ jobs:
       - name: Install pip-tools
         run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: pip-tools
       - name: Compile runtime lock
-        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: -o requirements.txt requirements.in
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all:"' -o requirements.txt requirements.in
       - name: Compile dev lock
-        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: -o requirements-dev.txt requirements-dev.in
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all:"' -o requirements-dev.txt requirements-dev.in
       - name: Compile Windows CPU lock
-        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: -o profiles/windows-cpu.txt profiles/windows-cpu.in
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all:"' -o profiles/windows-cpu.txt profiles/windows-cpu.in
       - name: Compile Windows GPU lock
-        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args '--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121' -o profiles/windows-gpu.txt profiles/windows-gpu.in
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes '--pip-args "--disable-pip-version-check --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"' -o profiles/windows-gpu.txt profiles/windows-gpu.in
       - name: Verify lock files committed
         run: |
           $lockFiles = @('requirements.txt', 'requirements-dev.txt', 'profiles/windows-cpu.txt', 'profiles/windows-gpu.txt')
           $diff = git diff --name-only -- $lockFiles
           if ($diff) {
             git --no-pager diff -- $lockFiles
-            Write-Error 'Lock files are out of date. Regenerate them with pip-compile and commit the changes.'
             exit 1
           }
 
