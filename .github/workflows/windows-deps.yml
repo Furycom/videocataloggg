@@ -40,19 +40,24 @@ jobs:
       - name: Create virtual environment
         run: python -m venv .venv
       - name: Install pip-tools
-        run: .\.venv\Scripts\python -m pip install pip-tools
+        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: pip-tools
       - name: Compile runtime lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args="--only-binary=:all:" -o requirements.txt requirements.in
+        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: -o requirements.txt requirements.in
       - name: Compile dev lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args="--only-binary=:all:" -o requirements-dev.txt requirements-dev.in
+        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: -o requirements-dev.txt requirements-dev.in
       - name: Compile Windows CPU lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args="--only-binary=:all:" -o profiles/windows-cpu.txt profiles/windows-cpu.in
+        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: -o profiles/windows-cpu.txt profiles/windows-cpu.in
       - name: Compile Windows GPU lock
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args="--only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -o profiles/windows-gpu.txt profiles/windows-gpu.in
+        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args '--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121' -o profiles/windows-gpu.txt profiles/windows-gpu.in
       - name: Verify lock files committed
         run: |
-          git diff --stat -- requirements.txt requirements-dev.txt profiles/windows-cpu.txt profiles/windows-gpu.txt
-          git diff --exit-code -- requirements.txt requirements-dev.txt profiles/windows-cpu.txt profiles/windows-gpu.txt
+          $lockFiles = @('requirements.txt', 'requirements-dev.txt', 'profiles/windows-cpu.txt', 'profiles/windows-gpu.txt')
+          $diff = git diff --name-only -- $lockFiles
+          if ($diff) {
+            git --no-pager diff -- $lockFiles
+            Write-Error 'Lock files are out of date. Regenerate them with pip-compile and commit the changes.'
+            exit 1
+          }
 
   install:
     name: Install from locks (${{ matrix.profile }})
@@ -75,20 +80,12 @@ jobs:
       - name: Create virtual environment
         run: python -m venv .venv
       - name: Install shared requirements
-        run: |
-          .\.venv\Scripts\Activate.ps1
-          python -m pip install --only-binary=:all: --require-hashes -r requirements.txt
+        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements.txt
       - name: Install Windows CPU lock
         if: matrix.profile == 'cpu'
-        run: |
-          .\.venv\Scripts\Activate.ps1
-          python -m pip install --only-binary=:all: --require-hashes -r profiles/windows-cpu.txt
+        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r profiles/windows-cpu.txt
       - name: Install Windows GPU lock
         if: matrix.profile == 'gpu'
-        run: |
-          .\.venv\Scripts\Activate.ps1
-          python -m pip install --only-binary=:all: --require-hashes --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 -r profiles/windows-gpu.txt
+        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 -r profiles/windows-gpu.txt
       - name: Smoke import
-        run: |
-          .\.venv\Scripts\Activate.ps1
-          python -c "import fastapi, uvicorn; print('ok')"
+        run: .\.venv\Scripts\python -c "import fastapi, uvicorn; print('ok')"

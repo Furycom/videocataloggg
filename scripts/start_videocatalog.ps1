@@ -47,15 +47,22 @@ function Invoke-PipInstall {
         [string]$LogFile
     )
 
+    $effectiveArgs = $Arguments
+    if (-not ($effectiveArgs -contains '--disable-pip-version-check')) {
+        $effectiveArgs = @('--disable-pip-version-check') + $effectiveArgs
+    }
+
     $commandPath = $null
     $commandArgs = @()
     if ($PipExe) {
         $commandPath = $PipExe
-        $commandArgs = $Arguments
+        $commandArgs = $effectiveArgs
     } else {
         $commandPath = $PythonExe
-        $commandArgs = @('-m', 'pip') + $Arguments
+        $commandArgs = @('-m', 'pip') + $effectiveArgs
     }
+
+    $exitCode = -1
 
     if ($LogFile) {
         $logDirectory = Split-Path -Parent $LogFile
@@ -66,21 +73,44 @@ function Invoke-PipInstall {
         $timestamp = Get-Date -Format o
         $commandLine = "`"$commandPath`" $($commandArgs -join ' ')"
         Add-Content -Path $LogFile -Value "[$timestamp] COMMAND: $commandLine" -Encoding UTF8
+
+        $stdoutTemp = Join-Path $logDirectory ("pip_$([guid]::NewGuid().ToString('N'))_stdout.log")
+        $stderrTemp = Join-Path $logDirectory ("pip_$([guid]::NewGuid().ToString('N'))_stderr.log")
+
         try {
-            & $commandPath @commandArgs 2>&1 | Tee-Object -FilePath $LogFile -Append
+            $process = Start-Process -FilePath $commandPath -ArgumentList $commandArgs -RedirectStandardOutput $stdoutTemp -RedirectStandardError $stderrTemp -NoNewWindow -Wait -PassThru
+            $exitCode = if ($process) { $process.ExitCode } else { $LASTEXITCODE }
         } catch {
             $errorMessage = $_.Exception.Message
             Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] ERROR: $errorMessage" -Encoding UTF8
             throw
         } finally {
-            Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] EXIT CODE: $LASTEXITCODE" -Encoding UTF8
+            if (Test-Path $stdoutTemp) {
+                Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] STDOUT:" -Encoding UTF8
+                Get-Content -Path $stdoutTemp -ErrorAction SilentlyContinue | ForEach-Object {
+                    Add-Content -Path $LogFile -Value $_ -Encoding UTF8
+                }
+                Remove-Item -Path $stdoutTemp -Force -ErrorAction SilentlyContinue
+                Add-Content -Path $LogFile -Value '' -Encoding UTF8
+            }
+            if (Test-Path $stderrTemp) {
+                Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] STDERR:" -Encoding UTF8
+                Get-Content -Path $stderrTemp -ErrorAction SilentlyContinue | ForEach-Object {
+                    Add-Content -Path $LogFile -Value $_ -Encoding UTF8
+                }
+                Remove-Item -Path $stderrTemp -Force -ErrorAction SilentlyContinue
+                Add-Content -Path $LogFile -Value '' -Encoding UTF8
+            }
+            Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] EXIT CODE: $exitCode" -Encoding UTF8
             Add-Content -Path $LogFile -Value '' -Encoding UTF8
         }
     } else {
         & $commandPath @commandArgs
+        $exitCode = $LASTEXITCODE
     }
 
-    return $LASTEXITCODE
+    $global:LASTEXITCODE = $exitCode
+    return $exitCode
 }
 
 function Write-PipLogTail {
