@@ -29,7 +29,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
 
    The script prepares `%USERPROFILE%\VideoCatalog` as the writable home, downloads the assistant warmup models (Qwen2 0.5B
    instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies from
-   `requirements-windows.txt`, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
+   `profiles\windows-cpu.txt` (or `profiles\windows-gpu.txt` when running with CUDA), runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
    executes the HTTP preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the
    console. Rerun with `-SkipInstall` to reuse an existing virtual environment.
 
