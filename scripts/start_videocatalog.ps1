@@ -47,6 +47,7 @@ function Invoke-PipInstall {
         [string]$LogFile
     )
 
+    $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
     $effectiveArgs = $Arguments
     if (-not ($effectiveArgs -contains '--disable-pip-version-check')) {
         $effectiveArgs = @('--disable-pip-version-check') + $effectiveArgs
