@@ -31,19 +31,19 @@ jobs:
 
       - name: Compile runtime lock
         run: |
-          python -m piptools compile --output-file=requirements.txt requirements.in
+          python -m piptools compile --pip-args "--only-binary=:all:" --output-file=requirements.txt requirements.in
 
       - name: Compile development lock
         run: |
-          python -m piptools compile --output-file=requirements-dev.txt requirements-dev.in
+          python -m piptools compile --pip-args "--only-binary=:all:" --output-file=requirements-dev.txt requirements-dev.in
 
       - name: Compile Windows CPU profile
         run: |
-          python -m piptools compile --output-file=profiles/windows-cpu.txt profiles/windows-cpu.in
+          python -m piptools compile --pip-args "--only-binary=:all:" --output-file=profiles/windows-cpu.txt profiles/windows-cpu.in
 
       - name: Compile Windows GPU profile
         run: |
-          python -m piptools compile --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" --output-file=profiles/windows-gpu.txt profiles/windows-gpu.in
+          python -m piptools compile --pip-args "--only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" --output-file=profiles/windows-gpu.txt profiles/windows-gpu.in
 
       - name: Verify lock files committed
         run: |
