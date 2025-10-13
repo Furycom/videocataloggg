@@ -17,36 +17,47 @@ on:
 
 jobs:
   lock:
-    name: Lock dependencies
+    name: Lock dependencies (${{ matrix.profile }})
     runs-on: windows-latest
+    strategy:
+      matrix:
+        profile: [cpu, gpu]
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
     steps:
+      - uses: actions/checkout@v4
       - name: Disable line ending conversion
         run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Upgrade pip tooling
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pip-tools
+      - name: Create virtual environment
+        run: python -m venv .venv
+      - name: Install pip-tools
+        run: .\.venv\Scripts\python -m pip install --upgrade pip pip-tools
       - name: Compile runtime lock
-        run: |
-          pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args "--only-binary=:all: --platform win_amd64 --python-version 3.11 --implementation cp --abi cp311" --output-file requirements.txt requirements.in
+        env:
+          PIP_ONLY_BINARY: ':all:'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --output-file requirements.txt requirements.in
       - name: Compile dev lock
-        run: |
-          pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args "--only-binary=:all: --platform win_amd64 --python-version 3.11 --implementation cp --abi cp311" --output-file requirements-dev.txt requirements-dev.in
+        env:
+          PIP_ONLY_BINARY: ':all:'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --output-file requirements-dev.txt requirements-dev.in
       - name: Compile Windows CPU lock
-        run: |
-          pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args "--only-binary=:all: --platform win_amd64 --python-version 3.11 --implementation cp --abi cp311" --output-file profiles/windows-cpu.txt profiles/windows-cpu.in
+        env:
+          PIP_ONLY_BINARY: ':all:'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --output-file profiles/windows-cpu.txt profiles/windows-cpu.in
       - name: Compile Windows GPU lock
+        env:
+          PIP_ONLY_BINARY: ':all:'
+        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" --output-file profiles/windows-gpu.txt profiles/windows-gpu.in
+      - name: Verify lockfiles unchanged
         run: |
-          pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --pip-args "--only-binary=:all: --platform win_amd64 --python-version 3.11 --implementation cp --abi cp311 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" --output-file profiles/windows-gpu.txt profiles/windows-gpu.in
-      - name: Check for lock drift
-        run: git diff --stat
-      - name: Ensure no changes
-        run: git diff --exit-code
+          git diff --stat -- requirements.txt requirements-dev.txt profiles/windows-cpu.txt profiles/windows-gpu.txt
+          git diff --exit-code -- requirements.txt requirements-dev.txt profiles/windows-cpu.txt profiles/windows-gpu.txt || (
+            echo "::error::Lockfiles drifted. Run pip-compile on Windows and commit the results." && exit 1
+          )
 
   install:
     name: Install from locks (${{ matrix.profile }})
@@ -55,6 +66,8 @@ jobs:
     strategy:
       matrix:
         profile: [cpu, gpu]
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -67,12 +80,12 @@ jobs:
         if: matrix.profile == 'cpu'
         run: |
           .\.venv\Scripts\Activate.ps1
-          python -m pip install --only-binary=:all: --require-hashes -r profiles/windows-cpu.txt
+          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r profiles/windows-cpu.txt
       - name: Install Windows GPU lock
         if: matrix.profile == 'gpu'
         run: |
           .\.venv\Scripts\Activate.ps1
-          python -m pip install --only-binary=:all: --require-hashes --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 -r profiles/windows-gpu.txt
+          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 -r profiles/windows-gpu.txt
       - name: Smoke import
         run: |
           .\.venv\Scripts\Activate.ps1
