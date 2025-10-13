@@ -46,6 +46,11 @@ click==8.3.0
     #   yake
 click-default-group==1.2.4
     # via sqlite-utils
+colorama==0.4.6
+    # via
+    #   click
+    #   tqdm
+    #   uvicorn
 coloredlogs==15.0.1
     # via onnxruntime
 cryptography==46.0.2
@@ -226,6 +231,8 @@ pygments==2.19.2
     # via rich
 pymupdf==1.26.5
     # via -r requirements.in
+pyreadline3==3.5.4
+    # via humanfriendly
 pytesseract==0.3.13
     # via -r requirements.in
 python-dateutil==2.9.0.post0
@@ -331,8 +338,6 @@ urllib3==2.5.0
     # via requests
 uvicorn[standard]==0.37.0
     # via -r requirements.in
-uvloop==0.21.0
-    # via uvicorn
 watchfiles==1.1.0
     # via uvicorn
 websockets==15.0.1
