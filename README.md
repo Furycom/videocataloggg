@@ -28,11 +28,14 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
    ```
 
    The script prepares `%USERPROFILE%\VideoCatalog` as the writable home, downloads the assistant warmup models (Qwen2 0.5B
-   instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies from
-   `profiles\windows-cpu.txt` (or `profiles\windows-gpu.txt` when running with CUDA) strictly from prebuilt wheels with hash
-   validation, runs SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and
-   executes the HTTP preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the
-   console. Rerun with `-SkipInstall` to reuse an existing virtual environment.
+   instruct GGUF and BGE-small embeddings) into `working_dir\models`, installs the pinned dependencies by running
+   `uv pip sync --frozen --require-hashes --only-binary=:all: -r requirements.txt` followed by the appropriate Windows profile
+   (`uv pip sync --frozen --require-hashes --only-binary=:all: -r profiles\windows-cpu.txt` on CPU or
+   `uv pip sync --frozen --require-hashes --only-binary=:all: --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -r profiles\windows-gpu.txt`
+   when CUDA is enabled). Installs stay hash-validated and wheel-only—no local builds or resolver drift—before the script runs
+   SQLite migrations via `upgrade_db.py`, starts the local API (bound to `127.0.0.1:27182`), and executes the HTTP
+   preflight/smoke diagnostics. Logs stream to `working_dir\logs\stabilize.log` and are also mirrored in the console. Rerun
+   with `-SkipInstall` to reuse an existing virtual environment.
 
 4. On success the summary prints `PASS` for **Settings & Paths**, **Dependencies**, **Model cache**, **Database migrations**,
    **API server**, **Orchestrator warmup**, **Preflight**, **Smoke**, and **Assistant status**. Any `FAIL` entry leaves the
@@ -56,7 +59,7 @@ Utilities for scanning large removable media libraries and keeping a SQLite-base
   CUDA or by installing a wheel published by the llama.cpp release artifacts. Once the GPU-enabled build is in place,
   rerun `stabilize.ps1 -SkipInstall` to reuse the existing environment.
 - When the GPU probe fails, install the latest NVIDIA Studio/Game Ready driver and rerun `stabilize.ps1`. If CUDA support is
-  missing, install the CUDA Toolkit (`winget install -e --id Nvidia.CUDA`) followed by `pip install --upgrade onnxruntime-gpu`.
+  missing, install the CUDA Toolkit (`winget install -e --id Nvidia.CUDA`) followed by `uv pip install --upgrade onnxruntime-gpu`.
 - `ffprobe` is required for the `quality_headers` smoke test. Install FFmpeg and ensure `ffprobe.exe` resolves on `PATH`. Until
   then, the diagnostics mark quality header checks as `SKIP` and write `logs\quality_headers.disabled`.
 

@@ -26,6 +26,7 @@ jobs:
       matrix:
         profile: [cpu, gpu]
     env:
+      MATRIX_PROFILE: ${{ matrix.profile }}
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
     steps:
       - uses: actions/checkout@v4
@@ -33,51 +34,45 @@ jobs:
         run: |
           git config --global core.autocrlf false
           git config --global core.eol lf
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Create virtual environment
-        run: python -m venv .venv
-      - name: Install pip-tools
-        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: pip-tools
-      - name: Compile runtime lock
-        if: matrix.profile == 'cpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o requirements.txt requirements.in
-      - name: Compile dev lock
-        if: matrix.profile == 'cpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o requirements-dev.txt requirements-dev.in
-      - name: Compile Windows CPU lock
-        if: matrix.profile == 'cpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o profiles/windows-cpu.txt profiles/windows-cpu.in
-      - name: Compile Windows GPU lock
-        if: matrix.profile == 'gpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -o profiles/windows-gpu.txt profiles/windows-gpu.in
-      - name: Verify lock files committed (CPU)
-        if: matrix.profile == 'cpu'
+      - uses: astral-sh/setup-uv@v2
+      - name: Compile lockfiles
         run: |
-          $targets = @('requirements.txt', 'requirements-dev.txt', 'profiles/windows-cpu.txt')
-          $diff = git diff --name-only -- $targets
-          if ($diff) {
-            git --no-pager diff --stat -- $targets
-            git --no-pager diff -- $targets
-            Write-Error 'Windows CPU lockfiles are out of date. Regenerate them on Windows with Python 3.12 and commit the result.'
-            exit 1
+          function Assert-LockClean {
+            param([string]$Target, [string]$ErrorMessage)
+
+            if (-not (Test-Path $Target)) {
+              Write-Error "Expected $Target to exist after compilation."
+              exit 1
+            }
+
+            $diff = git diff --unified=5 -- $Target
+            if ($diff) {
+              git --no-pager diff --stat -- $Target
+              git --no-pager diff --unified=5 -- $Target
+              Write-Error $ErrorMessage
+              exit 1
+            }
           }
-      - name: Verify lock files committed (GPU)
-        if: matrix.profile == 'gpu'
-        run: |
-          $target = 'profiles/windows-gpu.txt'
-          if (-not (Test-Path $target)) {
-            Write-Error "Expected $target to exist after compilation."
-            exit 1
-          }
-          $diff = git diff --name-only -- $target
-          if ($diff) {
-            git --no-pager diff --stat -- $target
-            git --no-pager diff -- $target
-            Write-Error 'Windows GPU lockfile is out of date. Regenerate it on Windows with Python 3.12 and commit the result.'
-            exit 1
+
+          uv venv .venv
+          $Env:VIRTUAL_ENV = "${{ github.workspace }}\.venv"
+          $Env:Path = "${{ github.workspace }}\.venv\Scripts;$Env:Path"
+
+          if ($Env:MATRIX_PROFILE -eq 'cpu') {
+            uv pip compile --resolver=backtracking --generate-hashes --only-binary=:all: -o requirements.txt requirements.in
+            Assert-LockClean -Target 'requirements.txt' -ErrorMessage 'requirements.txt is out of date. Regenerate it on Windows with Python 3.12 and commit the result.'
+
+            uv pip compile --resolver=backtracking --generate-hashes --only-binary=:all: -o requirements-dev.txt requirements-dev.in
+            Assert-LockClean -Target 'requirements-dev.txt' -ErrorMessage 'requirements-dev.txt is out of date. Regenerate it on Windows with Python 3.12 and commit the result.'
+
+            uv pip compile --resolver=backtracking --generate-hashes --only-binary=:all: -o profiles/windows-cpu.txt profiles/windows-cpu.in
+            Assert-LockClean -Target 'profiles/windows-cpu.txt' -ErrorMessage 'Windows CPU lockfile is out of date. Regenerate it on Windows with Python 3.12 and commit the result.'
+          } else {
+            uv pip compile --resolver=backtracking --generate-hashes --only-binary=:all: --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -o profiles/windows-gpu.txt profiles/windows-gpu.in
+            Assert-LockClean -Target 'profiles/windows-gpu.txt' -ErrorMessage 'Windows GPU lockfile is out of date. Regenerate it on Windows with Python 3.12 and commit the result.'
           }
 
   install:
@@ -91,22 +86,26 @@ jobs:
       matrix:
         profile: [cpu, gpu]
     env:
+      MATRIX_PROFILE: ${{ matrix.profile }}
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Create virtual environment
-        run: python -m venv .venv
-      - name: Install shared requirements
-        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements.txt
-      - name: Install Windows CPU lock
-        if: matrix.profile == 'cpu'
-        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r profiles/windows-cpu.txt
-      - name: Install Windows GPU lock
-        if: matrix.profile == 'gpu'
-        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 -r profiles/windows-gpu.txt
-      - name: Smoke import
-        run: .\.venv\Scripts\python -c "import fastapi, uvicorn; print('ok')"
+      - uses: astral-sh/setup-uv@v2
+      - name: Sync dependencies
+        run: |
+          uv venv .venv
+          $Env:VIRTUAL_ENV = "${{ github.workspace }}\.venv"
+          $Env:Path = "${{ github.workspace }}\.venv\Scripts;$Env:Path"
+
+          uv pip sync --frozen --only-binary=:all: --require-hashes -r requirements.txt
+
+          if ($Env:MATRIX_PROFILE -eq 'gpu') {
+            uv pip sync --frozen --only-binary=:all: --require-hashes --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -r profiles/windows-gpu.txt
+          } else {
+            uv pip sync --frozen --only-binary=:all: --require-hashes -r profiles/windows-cpu.txt
+          }
+
+          python -c "import fastapi, uvicorn; print('ok')"

@@ -49,7 +49,18 @@ function Invoke-PipInstall {
 
     $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
     $effectiveArgs = $Arguments
-    if (-not ($effectiveArgs -contains '--disable-pip-version-check')) {
+    $skipDisableFlag = $false
+    if ($PipExe) {
+        try {
+            $pipLeaf = [System.IO.Path]::GetFileName($PipExe)
+        } catch {
+            $pipLeaf = $null
+        }
+        if ($pipLeaf -and $pipLeaf.Equals('uv.exe', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $skipDisableFlag = $true
+        }
+    }
+    if (-not $skipDisableFlag -and -not ($effectiveArgs -contains '--disable-pip-version-check')) {
         $effectiveArgs = @('--disable-pip-version-check') + $effectiveArgs
     }
 
@@ -173,6 +184,11 @@ try {
     $pipLog = $null
 }
 
+$runtimeLockPath = Join-Path $root 'requirements.txt'
+$cpuLockPath = Join-Path $root 'profiles\windows-cpu.txt'
+$gpuLockPath = Join-Path $root 'profiles\windows-gpu.txt'
+$gpuIndexUrl = 'https://abetlen.github.io/llama-cpp-python/whl/cu121'
+
 foreach ($bootstrap in 'start_videocatalog.bat', 'start_videocatalog.ps1') {
     $bootstrapPath = Join-Path $scriptRoot $bootstrap
     if (Test-Path $bootstrapPath) {
@@ -189,6 +205,7 @@ Write-Info 'VideoCatalog A2.0 launcher'
 $orchProcess = $null
 $webProcess = $null
 $exitCode = 0
+$UseGpu = $false
 
 try {
     $workFull = [System.IO.Path]::GetFullPath($work)
@@ -266,6 +283,30 @@ try {
         $settings | Add-Member -NotePropertyName 'working_dir' -NotePropertyValue $workFull
     }
     $settings.working_dir = $workFull
+
+    $gpuPolicyText = $null
+    if ($settings | Get-Member -Name 'gpu' -ErrorAction SilentlyContinue) {
+        $gpuSection = $settings.gpu
+        if ($gpuSection -is [psobject]) {
+            $gpuPolicyText = [string]$gpuSection.policy
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($gpuPolicyText)) {
+        $gpuPolicyText = 'AUTO'
+    }
+    if ($gpuPolicyText.ToUpperInvariant() -ne 'CPU_ONLY') {
+        $UseGpu = $true
+    } else {
+        $UseGpu = $false
+    }
+
+    $gpuBannerPath = Join-Path $logs 'gpu.disabled.banner'
+    if (Test-Path $gpuBannerPath) {
+        $UseGpu = $false
+    }
+    if (-not (Test-Path $gpuLockPath)) {
+        $UseGpu = $false
+    }
 
     $updatedJson = $settings | ConvertTo-Json -Depth 100
     [System.IO.File]::WriteAllText($userSettingsPath, $updatedJson + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
@@ -352,6 +393,8 @@ try {
     $venvScripts = Join-Path $venvPath 'Scripts'
     $venvPython = Join-Path $venvScripts 'python.exe'
     $venvPip = Join-Path $venvScripts 'pip.exe'
+    $venvBin = $venvScripts
+    $venvUv = Join-Path $venvBin 'uv.exe'
 
     if (-not (Test-Path $venvPython)) {
         Write-Info "Creating Python virtual environment at $venvPath"
@@ -370,6 +413,12 @@ try {
         $pipExe = $null
     }
     Write-Info "Using virtual environment python at $pythonExe"
+
+    if (Test-Path $venvUv) {
+        Write-Info "uv executable detected at $venvUv"
+    } else {
+        Write-Info 'uv executable not found in the virtual environment; pip will be used as a fallback.'
+    }
 
     $env:VIDEOCATALOG_HOME = $workFull
     $env:PYTHONUNBUFFERED = '1'
@@ -392,15 +441,24 @@ try {
 
     $uvicornAvailable = Test-PythonModule -PythonExe $pythonExe -ModuleName 'uvicorn'
     if (-not $uvicornAvailable) {
-        $requirementsPath = Join-Path $root 'profiles\windows-cpu.txt'
-        if (-not (Test-Path $requirementsPath)) {
-            $requirementsPath = Join-Path $root 'requirements.txt'
-        }
         Write-Warn 'uvicorn not found, installing required Python packages.'
-        Write-Info "Installing dependencies from $requirementsPath"
-        $baseInstallArgs = @('install', '--only-binary=:all:', '--require-hashes', '-r', $requirementsPath)
-        $exitCode = Invoke-PipInstall -Arguments $baseInstallArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
-        if ($exitCode -ne 0) {
+
+        if (-not (Test-Path $runtimeLockPath)) {
+            throw "Runtime lock $runtimeLockPath not found. Run the Windows dependency lock workflow."
+        }
+        if (-not (Test-Path $cpuLockPath)) {
+            throw "CPU lock $cpuLockPath not found. Run the Windows dependency lock workflow."
+        }
+
+        Write-Info "Syncing shared dependencies from $runtimeLockPath"
+        if (Test-Path $venvUv) {
+            $runtimeArgs = @('pip', 'sync', '--frozen', '--only-binary=:all:', '--require-hashes', '-r', $runtimeLockPath)
+            $runtimeExit = Invoke-PipInstall -Arguments $runtimeArgs -PythonExe $pythonExe -PipExe $venvUv -LogFile $pipLog
+        } else {
+            $runtimeArgs = @('install', '--only-binary=:all:', '--require-hashes', '-r', $runtimeLockPath)
+            $runtimeExit = Invoke-PipInstall -Arguments $runtimeArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
+        }
+        if ($runtimeExit -ne 0) {
             if ($pipLog) {
                 Write-PipLogTail -LogFile $pipLog -Lines 40
             }
@@ -409,6 +467,65 @@ try {
                 $message += " Review pip log at $pipLog for details."
             }
             throw $message
+        }
+
+        $profileLockPath = if ($UseGpu) { $gpuLockPath } else { $cpuLockPath }
+        if (-not (Test-Path $profileLockPath)) {
+            Write-Warn ("Profile lock {0} not found; falling back to CPU profile." -f $profileLockPath)
+            $UseGpu = $false
+            $profileLockPath = $cpuLockPath
+        }
+
+        $profileLabel = if ($UseGpu) { 'GPU' } else { 'CPU' }
+        Write-Info "Syncing $profileLabel profile from $profileLockPath"
+
+        if (Test-Path $venvUv) {
+            $profileArgs = @('pip', 'sync', '--frozen', '--only-binary=:all:', '--require-hashes')
+            if ($UseGpu) {
+                $profileArgs += @('--pip-args', "--extra-index-url $gpuIndexUrl")
+            }
+            $profileArgs += @('-r', $profileLockPath)
+            $profileExit = Invoke-PipInstall -Arguments $profileArgs -PythonExe $pythonExe -PipExe $venvUv -LogFile $pipLog
+            if ($profileExit -ne 0 -and $UseGpu) {
+                Write-Warn "GPU dependency sync failed (exit code $profileExit). Falling back to CPU lock (onnxruntime)."
+                $UseGpu = $false
+                $profileLabel = 'CPU'
+                $profileLockPath = $cpuLockPath
+                $profileArgs = @('pip', 'sync', '--frozen', '--only-binary=:all:', '--require-hashes', '-r', $profileLockPath)
+                $profileExit = Invoke-PipInstall -Arguments $profileArgs -PythonExe $pythonExe -PipExe $venvUv -LogFile $pipLog
+            }
+        } else {
+            $profileArgs = @('install', '--only-binary=:all:', '--require-hashes')
+            if ($UseGpu) {
+                $profileArgs += @('--extra-index-url', $gpuIndexUrl)
+            }
+            $profileArgs += @('-r', $profileLockPath)
+            $profileExit = Invoke-PipInstall -Arguments $profileArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
+            if ($profileExit -ne 0 -and $UseGpu) {
+                Write-Warn "GPU dependency installation failed (exit code $profileExit). Falling back to CPU lock (onnxruntime)."
+                $UseGpu = $false
+                $profileLabel = 'CPU'
+                $profileLockPath = $cpuLockPath
+                $profileArgs = @('install', '--only-binary=:all:', '--require-hashes', '-r', $profileLockPath)
+                $profileExit = Invoke-PipInstall -Arguments $profileArgs -PythonExe $pythonExe -PipExe $pipExe -LogFile $pipLog
+            }
+        }
+
+        if ($profileExit -ne 0) {
+            if ($pipLog) {
+                Write-PipLogTail -LogFile $pipLog -Lines 40
+            }
+            $message = 'Dependency installation failed.'
+            if ($pipLog) {
+                $message += " Review pip log at $pipLog for details."
+            }
+            throw $message
+        }
+
+        if ($UseGpu) {
+            Write-Info 'GPU profile dependencies synchronized.'
+        } else {
+            Write-Info 'CPU profile dependencies synchronized.'
         }
 
         $pyVersionText = (& $pythonExe -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")').Trim()
