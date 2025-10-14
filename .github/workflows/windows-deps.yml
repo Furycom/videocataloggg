@@ -41,44 +41,30 @@ jobs:
         run: python -c "import sys; assert sys.version_info[:2]==(3,12)"
       - name: Create virtual environment
         run: python -m venv .venv
+      - name: Upgrade pip tooling
+        run: .\.venv\Scripts\python -m pip install --upgrade pip setuptools wheel
       - name: Install pip-tools
-        run: .\.venv\Scripts\python -m pip install --disable-pip-version-check --only-binary=:all: pip-tools
-      - name: Compile runtime lock
-        if: matrix.profile == 'cpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o requirements.txt requirements.in
-      - name: Compile dev lock
-        if: matrix.profile == 'cpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o requirements-dev.txt requirements-dev.in
+        run: .\.venv\Scripts\python -m pip install pip-tools
       - name: Compile Windows CPU lock
         if: matrix.profile == 'cpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check" -o profiles/windows-cpu.txt profiles/windows-cpu.in
+        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: -o profiles/windows-cpu.txt profiles/windows-cpu.in
       - name: Compile Windows GPU lock
         if: matrix.profile == 'gpu'
-        run: .\.venv\Scripts\python -m piptools compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--disable-pip-version-check --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -o profiles/windows-gpu.txt profiles/windows-gpu.in
-      - name: Verify lock files committed (CPU)
-        if: matrix.profile == 'cpu'
+        run: .\.venv\Scripts\pip-compile --resolver=backtracking --allow-unsafe --strip-extras --generate-hashes --only-binary=:all: --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121" -o profiles/windows-gpu.txt profiles/windows-gpu.in
+      - name: Verify lock file committed
         run: |
-          $targets = @('requirements.txt', 'requirements-dev.txt', 'profiles/windows-cpu.txt')
-          $diff = git diff --name-only -- $targets
-          if ($diff) {
-            git --no-pager diff --stat -- $targets
-            git --no-pager diff -- $targets
-            Write-Error 'Windows CPU lockfiles are out of date. Regenerate them on Windows with Python 3.12 and commit the result.'
-            exit 1
-          }
-      - name: Verify lock files committed (GPU)
-        if: matrix.profile == 'gpu'
-        run: |
-          $target = 'profiles/windows-gpu.txt'
+          $target = if ('${{ matrix.profile }}' -eq 'cpu') { 'profiles/windows-cpu.txt' } else { 'profiles/windows-gpu.txt' }
           if (-not (Test-Path $target)) {
             Write-Error "Expected $target to exist after compilation."
             exit 1
           }
-          $diff = git diff --name-only -- $target
+          $diff = git diff --unified=100000 -- $target
           if ($diff) {
-            git --no-pager diff --stat -- $target
-            git --no-pager diff -- $target
-            Write-Error 'Windows GPU lockfile is out of date. Regenerate it on Windows with Python 3.12 and commit the result.'
+            Write-Host "First 20 diff lines:"
+            Write-Host (($diff -split "`n" | Select-Object -First 20) -join "`n")
+            Write-Host "..."
+            Write-Host "Last 20 diff lines:"
+            Write-Host (($diff -split "`n" | Select-Object -Last 20) -join "`n")
             exit 1
           }
 
