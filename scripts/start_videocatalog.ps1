@@ -80,7 +80,11 @@ function Invoke-PipInstall {
 
         try {
             $process = Start-Process -FilePath $commandPath -ArgumentList $commandArgs -RedirectStandardOutput $stdoutTemp -RedirectStandardError $stderrTemp -NoNewWindow -Wait -PassThru
-            $exitCode = if ($process) { $process.ExitCode } else { $LASTEXITCODE }
+            if ($process) {
+                $exitCode = $process.ExitCode
+            } else {
+                $exitCode = $LASTEXITCODE
+            }
         } catch {
             $errorMessage = $_.Exception.Message
             Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] ERROR: $errorMessage" -Encoding UTF8
@@ -88,22 +92,38 @@ function Invoke-PipInstall {
         } finally {
             if (Test-Path $stdoutTemp) {
                 Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] STDOUT:" -Encoding UTF8
-                Get-Content -Path $stdoutTemp -ErrorAction SilentlyContinue | ForEach-Object {
-                    Add-Content -Path $LogFile -Value $_ -Encoding UTF8
+                $stdoutLines = @()
+                try {
+                    $stdoutLines = Get-Content -Path $stdoutTemp -ErrorAction Stop
+                } catch {
+                    $stdoutLines = @()
+                }
+                foreach ($line in $stdoutLines) {
+                    Add-Content -Path $LogFile -Value $line -Encoding UTF8
                 }
                 Remove-Item -Path $stdoutTemp -Force -ErrorAction SilentlyContinue
                 Add-Content -Path $LogFile -Value '' -Encoding UTF8
             }
+            $stderrLines = @()
             if (Test-Path $stderrTemp) {
                 Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] STDERR:" -Encoding UTF8
-                Get-Content -Path $stderrTemp -ErrorAction SilentlyContinue | ForEach-Object {
-                    Add-Content -Path $LogFile -Value $_ -Encoding UTF8
+                try {
+                    $stderrLines = Get-Content -Path $stderrTemp -ErrorAction Stop
+                } catch {
+                    $stderrLines = @()
+                }
+                foreach ($line in $stderrLines) {
+                    Add-Content -Path $LogFile -Value $line -Encoding UTF8
                 }
                 Remove-Item -Path $stderrTemp -Force -ErrorAction SilentlyContinue
                 Add-Content -Path $LogFile -Value '' -Encoding UTF8
             }
             Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] EXIT CODE: $exitCode" -Encoding UTF8
             Add-Content -Path $LogFile -Value '' -Encoding UTF8
+            if ($exitCode -eq 0 -and $stderrLines.Count -gt 0) {
+                Add-Content -Path $LogFile -Value "[$(Get-Date -Format o)] NOTE: pip reported warnings on stderr while exiting successfully." -Encoding UTF8
+                Add-Content -Path $LogFile -Value '' -Encoding UTF8
+            }
         }
     } else {
         & $commandPath @commandArgs
