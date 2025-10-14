@@ -290,49 +290,50 @@ try {
     $systemPython = $null
     $pythonVersionText = $null
 
-    $pyLauncherCmd = Get-Command py -ErrorAction SilentlyContinue
-    if ($pyLauncherCmd) {
-        $pyLauncherPath = $pyLauncherCmd.Source
-        if (-not $pyLauncherPath) { $pyLauncherPath = $pyLauncherCmd.Path }
-        if (-not $pyLauncherPath) { $pyLauncherPath = $pyLauncherCmd.Definition }
-        if ($pyLauncherPath) {
-            Write-Info "Windows Python launcher detected at $pyLauncherPath"
+    if ($env:LOCALAPPDATA) {
+        $preferredPython = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
+        if (Test-Path $preferredPython) {
             try {
-                & $pyLauncherPath '-3.12' '-V' *> $null
-                if ($LASTEXITCODE -eq 0) {
-                    $systemPython = (& $pyLauncherPath '-3.12' '-c' 'import sys; print(sys.executable)').Trim()
-                    $pythonVersionText = (& $pyLauncherPath '-3.12' '-c' "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")").Trim()
-                } else {
-                    Write-Warn 'Python 3.12 not available via the Windows launcher. Falling back to python.exe on PATH.'
-                }
+                $systemPython = (Resolve-Path -LiteralPath $preferredPython).Path
+                Write-Info "Found Python 3.12 at $systemPython"
             } catch {
-                Write-Warn "Unable to query the Windows launcher: $($_.Exception.Message)"
+                Write-Warn "Unable to resolve preferred Python path $preferredPython: $($_.Exception.Message)"
+                $systemPython = $null
             }
         }
     }
 
     if (-not $systemPython) {
-        $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-        if (-not $pythonCmd) {
-            Write-Err 'Python 3.12 or newer is required. Install Python 3.12 from https://www.python.org/downloads/windows/ and ensure either the Python launcher (`py`) or `python.exe` is available on PATH.'
-            exit 1
-        }
-
-        $systemPython = $pythonCmd.Source
-        if (-not $systemPython) { $systemPython = $pythonCmd.Path }
-        if (-not $systemPython) { $systemPython = $pythonCmd.Definition }
-
-        $pythonVersionText = (& $systemPython -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")").Trim()
-        & $systemPython -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" *> $null
-        if ($LASTEXITCODE -ne 0) {
-            if (-not $pythonVersionText) { $pythonVersionText = 'unknown' }
-            Write-Err "Python $pythonVersionText detected, but Python 3.12 or newer is required. Install Python 3.12 from https://www.python.org/downloads/windows/."
-            exit 1
+        $pyLauncherCmd = Get-Command py -ErrorAction SilentlyContinue
+        if ($pyLauncherCmd) {
+            $pyLauncherPath = $pyLauncherCmd.Source
+            if (-not $pyLauncherPath) { $pyLauncherPath = $pyLauncherCmd.Path }
+            if (-not $pyLauncherPath) { $pyLauncherPath = $pyLauncherCmd.Definition }
+            if ($pyLauncherPath) {
+                Write-Info "Windows Python launcher detected at $pyLauncherPath"
+                try {
+                    $launcherQuery = (& $pyLauncherPath '-3.12' '-c' 'import sys; print(sys.executable)').Trim()
+                    if ($LASTEXITCODE -eq 0 -and $launcherQuery) {
+                        $systemPython = $launcherQuery
+                    }
+                } catch {
+                    Write-Warn "Unable to query the Windows launcher for Python 3.12: $($_.Exception.Message)"
+                }
+            }
         }
     }
 
-    if (-not $pythonVersionText) {
-        $pythonVersionText = (& $systemPython -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")").Trim()
+    if (-not $systemPython) {
+        Write-Err 'Python 3.12 is required. Install Python 3.12 from https://www.python.org/downloads/windows/ and ensure it is available at %LOCALAPPDATA%\Programs\Python\Python312\python.exe or via the "py -3.12" launcher.'
+        exit 1
+    }
+
+    $pythonVersionText = (& $systemPython -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")").Trim()
+    & $systemPython -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)" *> $null
+    if ($LASTEXITCODE -ne 0) {
+        if (-not $pythonVersionText) { $pythonVersionText = 'unknown' }
+        Write-Err "Python $pythonVersionText detected, but Python 3.12 is required. Install Python 3.12 from https://www.python.org/downloads/windows/."
+        exit 1
     }
 
     Write-Info "Using Python $pythonVersionText at $systemPython"
